@@ -46,9 +46,9 @@ Cutting Security Alert Noise with SLM
 - Benchmark dataset: https://owasp.org/www-project-benchmark
 
 - Initial plan
-    - Use CodeQL to generate initial alerts - JSON output
-    - Run DeepSeek-Coder-V2-Lite (16B) or Qwen 2.5 Coder (14B) - specialized for security code analysis.
-    - Triage with Agents using SLM: An AI agent using the SARIF parser to read CodeQL outputs and feed relevant code snippets to an SLM to filter 
+    - Use CodeQL to generate initial alerts - SARIF output
+    - SLMs: DeepSeek-Coder-V2-Lite (16B) or Qwen 2.5 Coder (14B) - specialized for security code analysis.
+    - Triage with Agents using these SLMs: An AI agent using the SARIF parser to read CodeQL outputs and feed relevant code snippets to an SLM to filter 
     - Benchmark
     
 - Other tools (exploration):
