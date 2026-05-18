@@ -13,7 +13,7 @@ def main() -> None:
     ap.add_argument(
         "--src",
         type=Path,
-        help="RQ1 triage folder (default: sibling SAST_paper_artifacts/RQ1/triage-owasp-benchmark)",
+        help="RQ1 triage folder (default: sibling SAST-paper-artifacts/RQ1/triage-owasp-benchmark)",
     )
     ap.add_argument(
         "--out",
@@ -26,7 +26,7 @@ def main() -> None:
     sast_root = Path(__file__).resolve().parent.parent
     src = args.src
     if src is None:
-        src = sast_root.parent / "SAST_paper_artifacts" / "RQ1" / "triage-owasp-benchmark"
+        src = sast_root.parent / "SAST-paper-artifacts" / "RQ1" / "triage-owasp-benchmark"
 
     src = src.expanduser().resolve()
     out = args.out.expanduser().resolve()
