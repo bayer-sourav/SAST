@@ -1,6 +1,6 @@
 # RQ1 benchmark (CodeQL-only, local Qwen)
 
-Assumes this repo (`SAST`) sits next to `SAST_paper_artifacts` (sibling under the same parent folder).
+Assumes this repo (`SAST`) sits next to `SAST-Paper-Artifacts` (sibling under the same parent folder).
 
 If **BenchmarkJava** is also a sibling (`Projects/SAST`, `Projects/BenchmarkJava`, …), you can **omit `--repo`**; scripts use `../BenchmarkJava` when that folder contains `case["file"]`.
 
@@ -76,6 +76,6 @@ Existing run directories are skipped.
 
 ## Notes
 
-- `make_task.py` and `openhands_config.toml` are reused from `SAST_paper_artifacts/Evaluation Framework` (override with `--eval-framework`).
+- `make_task.py` and `openhands_config.toml` are reused from `SAST-Paper-Artifacts/Evaluation Framework` (override with `--eval-framework`).
 - Chat server does not support streaming; it parses Qwen ``<tool_call>...</tool_call>`` into OpenAI `tool_calls` when present.
 - Qwen profiles: see `models/qwen/runner.py` module docstring.

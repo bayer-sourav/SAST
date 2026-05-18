@@ -54,14 +54,14 @@ def main() -> None:
         "--eval-framework",
         type=Path,
         default=None,
-        help="Folder containing make_task.py (default: ../SAST_paper_artifacts/Evaluation Framework)",
+        help="Folder containing make_task.py (default: ../SAST-Paper-Artifacts/Evaluation Framework)",
     )
     args = ap.parse_args()
 
     sast_root = Path(__file__).resolve().parent.parent
     eval_fw = args.eval_framework
     if eval_fw is None:
-        eval_fw = sast_root.parent / "SAST_paper_artifacts" / "Evaluation Framework"
+        eval_fw = sast_root.parent / "SAST-Paper-Artifacts" / "Evaluation Framework"
     eval_fw = eval_fw.expanduser().resolve()
     make_task = eval_fw / "make_task.py"
     if not make_task.is_file():

@@ -158,7 +158,7 @@ def main() -> None:
     sast_root = Path(__file__).resolve().parent.parent
     eval_fw = args.eval_framework
     if eval_fw is None:
-        eval_fw = sast_root.parent / "SAST_paper_artifacts" / "Evaluation Framework"
+        eval_fw = sast_root.parent / "SAST-Paper-Artifacts" / "Evaluation Framework"
     eval_fw = eval_fw.expanduser().resolve()
     if not (eval_fw / "make_task.py").is_file():
         raise SystemExit(f"make_task.py not found under {eval_fw}")

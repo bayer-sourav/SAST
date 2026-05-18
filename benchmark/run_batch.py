@@ -41,7 +41,7 @@ def main() -> None:
 
     sast_root = Path(__file__).resolve().parent.parent
     bench = Path(__file__).resolve().parent
-    eval_fw = args.eval_framework or (sast_root.parent / "SAST_paper_artifacts" / "Evaluation Framework")
+    eval_fw = args.eval_framework or (sast_root.parent / "SAST-Paper-Artifacts" / "Evaluation Framework")
     eval_fw = eval_fw.expanduser().resolve()
     if str(bench) not in sys.path:
         sys.path.insert(0, str(bench))
