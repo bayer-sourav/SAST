@@ -12,12 +12,14 @@ from __future__ import annotations
 
 # Unsloth patches Transformers paths; import it before `torch` when present.
 # A broken Unsloth+torch combo (e.g. torch.int1 on torch<2.6) must not block this module.
+# NotImplementedError: e.g. Apple Silicon / unsupported GPU — unsloth_zoo raises at import.
 try:
     import unsloth  # noqa: F401
-except (ImportError, AttributeError):
-    # AttributeError: e.g. torch.int1 missing when pip unsloth targets torch>=2.6 but torch<2.6 is installed.
+except (ImportError, AttributeError, NotImplementedError):
     pass
 
+import inspect
+import json
 import os
 from typing import Any
 
@@ -59,12 +61,12 @@ def _resolve_ids(profile: str) -> tuple[str, str]:
         u = os.environ.get("QWEN_UNSLOTH_MODEL_ID", _DEFAULT_UNSLOTH_7B)
         h = os.environ.get("QWEN_HF_MODEL_ID", _DEFAULT_HF_7B)
         return u, h
-    if profile == "qwen3_4b_2507":
+    if profile == "qwen3_4b_bnb":
         u = os.environ.get(
-            "QWEN3_4B_2507_UNSLOTH_MODEL_ID",
-            "unsloth/Qwen3-4B-Instruct-2507-unsloth-bnb-4bit",
+            "QWEN3_4B_UNSLOTH_MODEL_ID",
+            "unsloth/Qwen3-4B-unsloth-bnb-4bitt",
         )
-        h = os.environ.get("QWEN3_4B_2507_HF_MODEL_ID", "Qwen/Qwen3-4B-Instruct-2507")
+        h = os.environ.get("QWEN3_4B_HF_MODEL_ID", "Qwen/Qwen3-4B")
         return u, h
     if profile == "qwen3_8b_bnb":
         u = os.environ.get(
@@ -123,8 +125,11 @@ def _load_unsloth(*, use_4bit: bool, unsloth_model_id: str) -> tuple[Any, Any]:
     if _MODEL is not None:
         _drop_qwen_weights()
 
-    import unsloth  # noqa: F401 - ensure patches before FastLanguageModel (lazy path)
-    from unsloth import FastLanguageModel  # type: ignore[import-not-found]
+    try:
+        import unsloth  # noqa: F401 - ensure patches before FastLanguageModel (lazy path)
+        from unsloth import FastLanguageModel  # type: ignore[import-not-found]
+    except (ImportError, AttributeError, NotImplementedError) as exc:
+        raise ImportError(f"Unsloth not usable on this device: {exc}") from exc
 
     log_gpu_status("Qwen Unsloth")
     max_seq = int(os.environ.get("QWEN_MAX_SEQ_LEN", "4096"))
@@ -142,8 +147,74 @@ def _load_unsloth(*, use_4bit: bool, unsloth_model_id: str) -> tuple[Any, Any]:
     return model, tokenizer
 
 
+def _apply_chat_template_maybe_tools(
+    tok: Any, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None
+) -> str:
+    kwargs: dict[str, Any] = {"tokenize": False, "add_generation_prompt": True}
+    if tools:
+        try:
+            if "tools" in inspect.signature(tok.apply_chat_template).parameters:
+                kwargs["tools"] = tools
+        except (TypeError, ValueError):
+            pass
+    return tok.apply_chat_template(messages, **kwargs)
+
+
+def _normalize_chat_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for m in messages:
+        msg = dict(m)
+        c = msg.get("content")
+        if isinstance(c, list):
+            texts: list[str] = []
+            for block in c:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    texts.append(str(block.get("text", "")))
+            msg["content"] = "\n".join(texts) if texts else json.dumps(c)
+        elif c is None:
+            msg["content"] = ""
+        else:
+            msg["content"] = str(c)
+        out.append(msg)
+    return out
+
+
+def _messages_str_only(messages: list[dict[str, Any]]) -> list[dict[str, str]]:
+    return [{"role": str(m.get("role", "user")), "content": str(m.get("content", ""))} for m in messages]
+
+
+def _hf_generate_with_template(
+    hf_id: str,
+    *,
+    cache_key: str,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None,
+    use_4bit: bool,
+) -> str:
+    from core.hf_backend import get_hf_model_and_tokenizer
+
+    model, tokenizer = get_hf_model_and_tokenizer(hf_id, cache_key=cache_key, use_4bit=use_4bit)
+    tok = getattr(tokenizer, "tokenizer", tokenizer)
+    prompt = _apply_chat_template_maybe_tools(tok, messages, tools)
+    device = next(model.parameters()).device
+    inputs = tok(prompt, return_tensors="pt").to(device)
+    gen_kwargs = agent_decoding_kwargs()
+    with torch.inference_mode():
+        out = model.generate(**inputs, **gen_kwargs)
+    input_len = inputs["input_ids"].shape[1]
+    new_tokens = out[0][input_len:]
+    from core.gen_meta import set_gen_meta
+
+    set_gen_meta(int(input_len), int(new_tokens.shape[0]))
+    return tok.decode(new_tokens, skip_special_tokens=True).strip()
+
+
 def _generate_unsloth(
-    messages: list[dict[str, str]], *, use_4bit: bool, unsloth_model_id: str
+    messages: list[dict[str, Any]],
+    *,
+    use_4bit: bool,
+    unsloth_model_id: str,
+    tools: list[dict[str, Any]] | None = None,
 ) -> str:
     model, tokenizer = _load_unsloth(use_4bit=use_4bit, unsloth_model_id=unsloth_model_id)
     # Some Qwen3.5 checkpoints expose a Processor-like object from Unsloth.
@@ -151,11 +222,7 @@ def _generate_unsloth(
     # processor.__call__(prompt, ...) treats prompt as image input.
     tok = getattr(tokenizer, "tokenizer", tokenizer)
 
-    prompt = tok.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,
-    )
+    prompt = _apply_chat_template_maybe_tools(tok, messages, tools)
     device = next(model.parameters()).device
     print(f"[GPU] Qwen generate: first param device={device}")
     inputs = tok(prompt, return_tensors="pt").to(device)
@@ -192,7 +259,7 @@ def generate_tool_selection_raw(
         return _hf_generate(hf_id, messages, use_4bit=use_4bit, cache_key=_hf_cache_key(profile))
 
     try:
-        return _generate_unsloth(messages, use_4bit=use_4bit, unsloth_model_id=unsloth_id)
+        return _generate_unsloth(messages, use_4bit=use_4bit, unsloth_model_id=unsloth_id, tools=None)
     except ImportError:
         print("[Qwen] unsloth not installed; using Hugging Face Transformers.")
     except NotImplementedError as exc:
@@ -214,6 +281,80 @@ def generate_tool_selection_raw(
             print("[Qwen] PyTorch / Unsloth version mismatch is common; try pinned torch or HF-only.")
 
     return _hf_generate(hf_id, messages, use_4bit=use_4bit, cache_key=_hf_cache_key(profile))
+
+
+def generate_from_chat_messages(
+    messages: list[dict[str, Any]],
+    *,
+    use_4bit: bool = True,
+    profile: str = "2_5_7b",
+    tools: list[dict[str, Any]] | None = None,
+) -> str:
+    """Run Qwen on OpenAI-style chat messages (optional OpenAI ``tools`` for ``apply_chat_template``)."""
+    global _ACTIVE_PROFILE
+    if _ACTIVE_PROFILE is not None and _ACTIVE_PROFILE != profile:
+        _drop_qwen_weights()
+    _ACTIVE_PROFILE = profile
+
+    norm = _normalize_chat_messages(messages)
+    unsloth_id, hf_id = _resolve_ids(profile)
+
+    if not torch.cuda.is_available():
+        print(
+            "[Qwen] torch.cuda.is_available() is False — using Hugging Face path "
+            "(tools in template only if tokenizer supports ``tools=``)."
+        )
+        if tools:
+            return _hf_generate_with_template(
+                hf_id,
+                cache_key=_hf_cache_key(profile),
+                messages=norm,
+                tools=tools,
+                use_4bit=use_4bit,
+            )
+        return _hf_generate(
+            hf_id,
+            _messages_str_only(norm),
+            use_4bit=use_4bit,
+            cache_key=_hf_cache_key(profile),
+        )
+
+    try:
+        return _generate_unsloth(norm, use_4bit=use_4bit, unsloth_model_id=unsloth_id, tools=tools)
+    except ImportError:
+        print("[Qwen] unsloth not installed; using Hugging Face Transformers.")
+    except NotImplementedError as exc:
+        print(f"[Qwen] Unsloth needs a working GPU ({exc}); using Hugging Face Transformers.")
+    except Exception as exc:
+        err = str(exc)
+        print(f"[Qwen] Unsloth failed ({type(exc).__name__}: {exc}).")
+        if torch.cuda.is_available() and cuda_error_suggests_poisoned_context(exc):
+            print(
+                "[Qwen] Poisoned CUDA context — restart Python before other GPU models."
+            )
+            raise RuntimeError(
+                "CUDA context invalid after a device-side assert; restart Python before using GPU models."
+            ) from exc
+        print("[Qwen] Falling back to Hugging Face Transformers.")
+        if "download" in err.lower() or "force download" in err.lower():
+            print("[Qwen] Check disk space, HF_TOKEN / huggingface-cli login, and hub cache.")
+        if "register_constant" in err or "_pytree" in err:
+            print("[Qwen] PyTorch / Unsloth version mismatch is common; try pinned torch or HF-only.")
+
+    if tools:
+        return _hf_generate_with_template(
+            hf_id,
+            cache_key=_hf_cache_key(profile),
+            messages=norm,
+            tools=tools,
+            use_4bit=use_4bit,
+        )
+    return _hf_generate(
+        hf_id,
+        _messages_str_only(norm),
+        use_4bit=use_4bit,
+        cache_key=_hf_cache_key(profile),
+    )
 
 
 def run_tool_selection(

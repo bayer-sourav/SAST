@@ -1,6 +1,4 @@
-# SAST
-Cutting Security Alert Noise with SLM
-
+Cutting Security Alert Noise with SLM — see [benchmark/README.md](benchmark/README.md) for RQ1 CodeQL-only runs (local Qwen + optional OpenHands).
 
 ## Report
 - Paper: https://arxiv.org/pdf/2601.22952v1
@@ -64,6 +62,13 @@ Cutting Security Alert Noise with SLM
 
 - Questions:
     - how is the current workflow?
+        - CodeQL Scan -> runn SLM/Agentic Scan -> manual review
     - the benchmark numbers?
     - deployment?
-    - 
+    - Are we expected to predict CWE?
+    - Classes: 
+        - Bayer policy, 
+        - TP, 
+        - FP 
+        - Boarderline TP/FP -> TP
+        - etc.
