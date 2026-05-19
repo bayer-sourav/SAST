@@ -10,13 +10,7 @@ Menu profiles (see main.py):
 
 from __future__ import annotations
 
-# Unsloth patches Transformers paths; import it before `torch` when present.
-# A broken Unsloth+torch combo (e.g. torch.int1 on torch<2.6) must not block this module.
-# NotImplementedError: e.g. Apple Silicon / unsupported GPU — unsloth_zoo raises at import.
-try:
-    import unsloth  # noqa: F401
-except (ImportError, AttributeError, NotImplementedError):
-    pass
+# Unsloth is imported lazily in _load_unsloth so HF fallback is not patched on import failure.
 
 import inspect
 import json
@@ -64,7 +58,7 @@ def _resolve_ids(profile: str) -> tuple[str, str]:
     if profile == "qwen3_4b_bnb":
         u = os.environ.get(
             "QWEN3_4B_UNSLOTH_MODEL_ID",
-            "unsloth/Qwen3-4B-unsloth-bnb-4bitt",
+            "unsloth/Qwen3-4B-unsloth-bnb-4bit",
         )
         h = os.environ.get("QWEN3_4B_HF_MODEL_ID", "Qwen/Qwen3-4B")
         return u, h
@@ -73,14 +67,14 @@ def _resolve_ids(profile: str) -> tuple[str, str]:
             "QWEN3_8B_UNSLOTH_MODEL_ID",
             "unsloth/Qwen3-8B-unsloth-bnb-4bit",
         )
-        h = os.environ.get("QWEN3_8B_HF_MODEL_ID", "Qwen/Qwen3-8B-Instruct")
+        h = os.environ.get("QWEN3_8B_HF_MODEL_ID", "Qwen/Qwen3-8B")
         return u, h
     if profile == "qwen3_14b_bnb":
         u = os.environ.get(
             "QWEN3_14B_UNSLOTH_MODEL_ID",
             "unsloth/Qwen3-14B-unsloth-bnb-4bit",
         )
-        h = os.environ.get("QWEN3_14B_HF_MODEL_ID", "Qwen/Qwen3-14B-Instruct")
+        h = os.environ.get("QWEN3_14B_HF_MODEL_ID", "Qwen/Qwen3-14B")
         return u, h
     if profile == "qwen3_5_9b_bnb":
         u = os.environ.get(
@@ -128,7 +122,7 @@ def _load_unsloth(*, use_4bit: bool, unsloth_model_id: str) -> tuple[Any, Any]:
     try:
         import unsloth  # noqa: F401 - ensure patches before FastLanguageModel (lazy path)
         from unsloth import FastLanguageModel  # type: ignore[import-not-found]
-    except (ImportError, AttributeError, NotImplementedError) as exc:
+    except (ImportError, AttributeError, NameError, NotImplementedError) as exc:
         raise ImportError(f"Unsloth not usable on this device: {exc}") from exc
 
     log_gpu_status("Qwen Unsloth")
@@ -151,6 +145,11 @@ def _apply_chat_template_maybe_tools(
     tok: Any, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None
 ) -> str:
     kwargs: dict[str, Any] = {"tokenize": False, "add_generation_prompt": True}
+    try:
+        if "enable_thinking" in inspect.signature(tok.apply_chat_template).parameters:
+            kwargs["enable_thinking"] = False
+    except (TypeError, ValueError):
+        pass
     if tools:
         try:
             if "tools" in inspect.signature(tok.apply_chat_template).parameters:

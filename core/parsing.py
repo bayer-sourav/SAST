@@ -319,6 +319,43 @@ def extract_json_object(text: str) -> dict:
         raise ValueError(f"Invalid JSON between first '{{' and last '}}': {exc}") from exc
 
 
+_TRIAGE_LABELS = frozenset({"TP", "FP", "UNKNOWN"})
+
+
+def extract_triage_result(text: str) -> dict:
+    """
+    Parse SAST triage JSON from model output.
+
+    Prefer the last valid object with label TP|FP|UNKNOWN (models may emit draft JSON
+    inside thinking blocks and a final JSON after).
+    """
+    cleaned = _strip_redacted_thinking((text or "").strip())
+    if not cleaned:
+        raise ValueError("Empty model output")
+
+    candidates: list[dict] = []
+    i = 0
+    while i < len(cleaned):
+        if cleaned[i] != "{":
+            i += 1
+            continue
+        sl = _first_balanced_object_slice(cleaned, i)
+        if not sl:
+            i += 1
+            continue
+        parsed = _try_parse_json_object(sl, ctx="triage candidate")
+        if parsed is not None:
+            lbl = str(parsed.get("label", "")).strip().upper()
+            if lbl in _TRIAGE_LABELS:
+                candidates.append(parsed)
+        i += len(sl)
+
+    if candidates:
+        return candidates[-1]
+
+    return extract_json_object(text)
+
+
 def _raw_preview(text: str, *, limit: int = 2000) -> str:
     s = (text or "").strip()
     if not s:

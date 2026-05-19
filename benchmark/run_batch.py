@@ -9,6 +9,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+VALID_LABELS = frozenset({"TP", "FP", "UNKNOWN"})
+
 
 def _case_id(eval_fw: Path, case_path: Path) -> str:
     sys.path.insert(0, str(eval_fw))
@@ -32,6 +34,33 @@ def main() -> None:
     ap.add_argument("--llm-model", default="local-qwen", help="LLM_MODEL for --agent openhands")
     ap.add_argument("--llm-provider", default="openai")
     ap.add_argument("--max-cases", type=int, default=None)
+    ap.add_argument(
+        "--runs-root",
+        type=Path,
+        default=Path("runs"),
+        help="Root for run artifacts (default: ./runs)",
+    )
+    ap.add_argument(
+        "--retry-missing",
+        action="store_true",
+        help="Re-run cases without a valid agent-llm-triage-result.json label",
+    )
+    ap.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-run even if run directory exists",
+    )
+    ap.add_argument(
+        "--retry-wrong",
+        action="store_true",
+        help="Re-run cases whose label differs from --gold (requires --gold)",
+    )
+    ap.add_argument(
+        "--gold",
+        choices=("FP", "TP"),
+        default=None,
+        help="Gold label for --retry-wrong and passed to run_llm_local.py",
+    )
     ap.add_argument(
         "--eval-framework",
         type=Path,
@@ -58,10 +87,29 @@ def main() -> None:
     for case_path in files:
         cid = _case_id(eval_fw, case_path)
         model_key = args.profile if args.agent == "llm" else args.llm_model
-        run_dir = Path.cwd() / "runs" / _safe_model_dir(model_key) / args.agent / cid
-        if run_dir.exists():
-            print(f"[skip] {cid}")
-            continue
+        runs_root = args.runs_root.expanduser().resolve()
+        run_dir = runs_root / _safe_model_dir(model_key) / args.agent / cid
+        result_path = run_dir / "agent-llm-triage-result.json"
+        lbl: str | None = None
+        if result_path.is_file():
+            try:
+                data = json.loads(result_path.read_text(encoding="utf-8"))
+                lbl = str(data.get("label", "")).strip().upper()
+            except Exception:
+                lbl = None
+
+        if run_dir.exists() and not args.force:
+            if args.retry_wrong and args.gold:
+                gold_u = args.gold.strip().upper()
+                if lbl in VALID_LABELS and lbl == gold_u:
+                    print(f"[skip] {cid} (correct {lbl})")
+                    continue
+            elif not args.retry_missing:
+                print(f"[skip] {cid}")
+                continue
+            elif lbl in VALID_LABELS and not args.retry_wrong:
+                print(f"[skip] {cid} (valid result)")
+                continue
 
         case = json.loads(case_path.read_text(encoding="utf-8"))
         repo = _repo.resolve_benchmark_java_root(sast_root, case, args.repo)
@@ -81,6 +129,8 @@ def main() -> None:
                 "--run-dir",
                 str(run_dir),
             ]
+            if args.gold:
+                cmd.extend(["--gold", args.gold])
         else:
             cmd = [
                 sys.executable,
