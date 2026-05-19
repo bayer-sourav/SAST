@@ -45,7 +45,7 @@ Cutting Security Alert Noise with SLM — see [benchmark/README.md](benchmark/RE
 
 - Initial plan
     - Use CodeQL to generate initial alerts - SARIF output
-    - SLMs: DeepSeek-Coder-V2-Lite (16B) or Qwen 2.5 Coder (14B) - specialized for security code analysis.
+    - SLMs: Qwen3 (4B, 8B, 14B), DeepSeek-Coder-V2-Lite (16B), Qwen 2.5 Coder (14B) - specialized for security code analysis.
     - Triage with Agents using these SLMs: An AI agent using the SARIF parser to read CodeQL outputs and feed relevant code snippets to an SLM to filter 
     - Benchmark
     
@@ -62,13 +62,26 @@ Cutting Security Alert Noise with SLM — see [benchmark/README.md](benchmark/RE
 
 - Questions:
     - how is the current workflow?
-        - CodeQL Scan -> runn SLM/Agentic Scan -> manual review
+        - CodeQL Scan -> run SLM/Agentic Scan -> manual review?
+    - input to codeQl? - multiple files
     - the benchmark numbers?
     - deployment?
-    - Are we expected to predict CWE?
+        - need to create a stack (cloud formation) to integrate
+        - where to deploy SLMs? - 
+            - need to be hosted in the same env 
+            - what inferencing tech?
+        - fine tuning?
+    - Are we expected to predict CWE? Not really
     - Classes: 
         - Bayer policy, 
         - TP, 
         - FP 
         - Boarderline TP/FP -> TP
         - etc.
+    - languages
+        - NodeJS is most prominant
+        - JAVA, GO are the other languages
+    - Richa to provide a sample CodeQL output as input to our solution
+    - timeslot for recurring meeting
+
+    
