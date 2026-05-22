@@ -134,7 +134,10 @@ Host qwen-ec2
     1. Click the Green/Blue Remote Status Indicator in the absolute bottom-left corner of Cursor, select Connect to Host..., and click qwen-ec2.
     2. Select File > Open Folder and accept the default path /home/ec2-user.
     3. Workspace Upload: Drag and drop your local repository folder from your local desktop file manager directly into the left-hand Cursor file tree explorer interface.
-
+        - Or, SSH to Github (Recommended): 
+            1. Generate a key on the EC2 instance: ssh-keygen -t ed25519 -C "your_email@example.com"
+            2. Copy the public key: cat ~/.ssh/id_ed25519.pub.
+            3. Add this key to your GitHub SSH Settings or as a SSH Key in your specific repository.
     4. Executing Qwen3 Optimized Inference
 Unsloth enables 4-bit quantization layout profiles to drastically lower hardware overhead.
 Recommended Model Mapping (48GB VRAM Ceiling)
