@@ -211,3 +211,34 @@ To audit VRAM footprint allocations dynamically while evaluating different model
 ```bash
 watch -n 0.5 nvidia-smi
 ```
+
+
+## presentation
+- dataset
+- metrics
+    - FPRR 
+    - VDR 
+        - correct TP / Total TP
+    - SRS
+    - F1
+
+## next steps; [Plan](docs/EXPERIMENT_PLAN_SUMMARY.md):
+- less focus on agents - OpenHands
+- Bigger models - 4B, 8B, 14B, 32B
+    - Qwen
+    - Gemma
+    - qwen coder
+    - deepseek coder 
+- few-shot (1, 3, 5, 10 examples)/TP and FP
+- with and without thinking
+- fine-tuning (without thinking)
+- create experimental plan
+    - benchmark dataset - OWASPJava
+    - metrics
+        - FPRR 
+        - VDR 
+            - correct TP / Total TP
+        - SRS
+        - F1
+    - models
+    - table for presentation (model, metrics, )
