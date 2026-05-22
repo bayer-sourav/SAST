@@ -20,7 +20,7 @@ from typing import Any
 import torch
 from langchain_core.tools import BaseTool
 
-from core.generation_defaults import agent_decoding_kwargs
+from core.generation_defaults import agent_decoding_kwargs, cap_max_new_tokens, model_max_seq_len
 from core.gpu_info import cuda_error_suggests_poisoned_context, log_gpu_status
 from core.parsing import parse_tool_selection
 from core.prompts import tool_selection_chat_messages
@@ -33,6 +33,16 @@ _TOKENIZER: Any = None
 _LOADED_4BIT: bool | None = None
 _LOADED_UNSLOTH_ID: str | None = None
 _ACTIVE_PROFILE: str | None = None
+
+# Profiles using Qwen3 chat templates (enable_thinking / thinking blocks).
+QWEN3_PROFILES = frozenset(
+    {
+        "qwen3_4b_bnb",
+        "qwen3_8b_bnb",
+        "qwen3_14b_bnb",
+        "qwen3_coder_30b_bnb",
+    }
+)
 
 
 def _drop_qwen_weights() -> None:
@@ -58,30 +68,30 @@ def _resolve_ids(profile: str) -> tuple[str, str]:
     if profile == "qwen3_4b_bnb":
         u = os.environ.get(
             "QWEN3_4B_UNSLOTH_MODEL_ID",
-            "unsloth/Qwen3-4B-unsloth-bnb-4bit",
+            "unsloth/Qwen3-4B-Instruct-2507-unsloth-bnb-4bit",
         )
-        h = os.environ.get("QWEN3_4B_HF_MODEL_ID", "Qwen/Qwen3-4B")
+        h = os.environ.get("QWEN3_4B_HF_MODEL_ID", "Qwen/Qwen3-4B-Instruct-2507")
         return u, h
     if profile == "qwen3_8b_bnb":
         u = os.environ.get(
             "QWEN3_8B_UNSLOTH_MODEL_ID",
             "unsloth/Qwen3-8B-unsloth-bnb-4bit",
         )
-        h = os.environ.get("QWEN3_8B_HF_MODEL_ID", "Qwen/Qwen3-8B")
+        h = os.environ.get("QWEN3_8B_HF_MODEL_ID", "Qwen/Qwen3-8B-Instruct")
         return u, h
     if profile == "qwen3_14b_bnb":
         u = os.environ.get(
             "QWEN3_14B_UNSLOTH_MODEL_ID",
             "unsloth/Qwen3-14B-unsloth-bnb-4bit",
         )
-        h = os.environ.get("QWEN3_14B_HF_MODEL_ID", "Qwen/Qwen3-14B")
+        h = os.environ.get("QWEN3_14B_HF_MODEL_ID", "Qwen/Qwen3-14B-Instruct")
         return u, h
-    if profile == "qwen3_5_9b_bnb":
+    if profile == "qwen3_coder_30b_bnb":
         u = os.environ.get(
-            "QWEN3_5_9B_UNSLOTH_MODEL_ID",
-            "unsloth/Qwen3.5-9B",
+            "QWEN3_CODER_30B_UNSLOTH_MODEL_ID",
+            "unsloth/Qwen3-Coder-30B-A3B-Instruct",
         )
-        h = os.environ.get("QWEN3_5_9B_HF_MODEL_ID", "Qwen/Qwen3.5-9B")
+        h = os.environ.get("QWEN3_CODER_30B_HF_MODEL_ID", "Qwen/Qwen3-Coder-30B-A3B-Instruct")
         return u, h
     raise ValueError(f"unknown Qwen profile {profile!r}")
 
@@ -126,7 +136,7 @@ def _load_unsloth(*, use_4bit: bool, unsloth_model_id: str) -> tuple[Any, Any]:
         raise ImportError(f"Unsloth not usable on this device: {exc}") from exc
 
     log_gpu_status("Qwen Unsloth")
-    max_seq = int(os.environ.get("QWEN_MAX_SEQ_LEN", "4096"))
+    max_seq = int(os.environ.get("QWEN_MAX_SEQ_LEN", "32768"))
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=unsloth_model_id,
         max_seq_length=max_seq,
@@ -141,15 +151,43 @@ def _load_unsloth(*, use_4bit: bool, unsloth_model_id: str) -> tuple[Any, Any]:
     return model, tokenizer
 
 
+def _prepare_messages_for_thinking(
+    messages: list[dict[str, Any]],
+    profile: str,
+    *,
+    enable_thinking: bool,
+) -> list[dict[str, Any]]:
+    """Qwen3 soft switch: append /no_think on the last user turn when thinking is off."""
+    if profile not in QWEN3_PROFILES or enable_thinking:
+        return messages
+    out: list[dict[str, Any]] = [dict(m) for m in messages]
+    for i in range(len(out) - 1, -1, -1):
+        if out[i].get("role") == "user":
+            content = str(out[i].get("content", ""))
+            if "/no_think" not in content and "/think" not in content:
+                out[i]["content"] = content.rstrip() + "\n/no_think"
+            break
+    return out
+
+
 def _apply_chat_template_maybe_tools(
-    tok: Any, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None
+    tok: Any,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None,
+    *,
+    enable_thinking: bool = False,
+    profile: str | None = None,
 ) -> str:
     kwargs: dict[str, Any] = {"tokenize": False, "add_generation_prompt": True}
-    try:
-        if "enable_thinking" in inspect.signature(tok.apply_chat_template).parameters:
-            kwargs["enable_thinking"] = False
-    except (TypeError, ValueError):
-        pass
+    # Unsloth wraps apply_chat_template (signature hides enable_thinking) but forwards **kwargs.
+    use_thinking_kw = profile in QWEN3_PROFILES if profile else False
+    if not use_thinking_kw:
+        try:
+            use_thinking_kw = "enable_thinking" in inspect.signature(tok.apply_chat_template).parameters
+        except (TypeError, ValueError):
+            use_thinking_kw = False
+    if use_thinking_kw:
+        kwargs["enable_thinking"] = enable_thinking
     if tools:
         try:
             if "tools" in inspect.signature(tok.apply_chat_template).parameters:
@@ -189,22 +227,30 @@ def _hf_generate_with_template(
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]] | None,
     use_4bit: bool,
+    enable_thinking: bool = False,
+    profile: str | None = None,
 ) -> str:
     from core.hf_backend import get_hf_model_and_tokenizer
 
     model, tokenizer = get_hf_model_and_tokenizer(hf_id, cache_key=cache_key, use_4bit=use_4bit)
     tok = getattr(tokenizer, "tokenizer", tokenizer)
-    prompt = _apply_chat_template_maybe_tools(tok, messages, tools)
+    prompt = _apply_chat_template_maybe_tools(
+        tok, messages, tools, enable_thinking=enable_thinking, profile=profile
+    )
     device = next(model.parameters()).device
     inputs = tok(prompt, return_tensors="pt").to(device)
-    gen_kwargs = agent_decoding_kwargs()
+    input_len = int(inputs["input_ids"].shape[1])
+    gen_kwargs = cap_max_new_tokens(
+        agent_decoding_kwargs(enable_thinking=enable_thinking),
+        input_token_len=input_len,
+        max_seq_len=model_max_seq_len(),
+    )
     with torch.inference_mode():
         out = model.generate(**inputs, **gen_kwargs)
-    input_len = inputs["input_ids"].shape[1]
     new_tokens = out[0][input_len:]
     from core.gen_meta import set_gen_meta
 
-    set_gen_meta(int(input_len), int(new_tokens.shape[0]))
+    set_gen_meta(input_len, int(new_tokens.shape[0]))
     return tok.decode(new_tokens, skip_special_tokens=True).strip()
 
 
@@ -214,6 +260,7 @@ def _generate_unsloth(
     use_4bit: bool,
     unsloth_model_id: str,
     tools: list[dict[str, Any]] | None = None,
+    enable_thinking: bool = False,
 ) -> str:
     model, tokenizer = _load_unsloth(use_4bit=use_4bit, unsloth_model_id=unsloth_model_id)
     # Some Qwen3.5 checkpoints expose a Processor-like object from Unsloth.
@@ -221,17 +268,32 @@ def _generate_unsloth(
     # processor.__call__(prompt, ...) treats prompt as image input.
     tok = getattr(tokenizer, "tokenizer", tokenizer)
 
-    prompt = _apply_chat_template_maybe_tools(tok, messages, tools)
+    prompt = _apply_chat_template_maybe_tools(
+        tok,
+        messages,
+        tools,
+        enable_thinking=enable_thinking,
+        profile=_ACTIVE_PROFILE,
+    )
+    if _ACTIVE_PROFILE in QWEN3_PROFILES:
+        print(
+            f"[Qwen] chat_template enable_thinking={enable_thinking} "
+            f"(profile={_ACTIVE_PROFILE!r})"
+        )
     device = next(model.parameters()).device
     print(f"[GPU] Qwen generate: first param device={device}")
     inputs = tok(prompt, return_tensors="pt").to(device)
-    gen_kwargs = agent_decoding_kwargs()
+    input_len = int(inputs["input_ids"].shape[1])
+    gen_kwargs = cap_max_new_tokens(
+        agent_decoding_kwargs(enable_thinking=enable_thinking),
+        input_token_len=input_len,
+        max_seq_len=model_max_seq_len(),
+    )
     with torch.inference_mode():
         out = model.generate(**inputs, **gen_kwargs)
-    input_len = inputs["input_ids"].shape[1]
     new_tokens = out[0][input_len:]
     from core.gen_meta import set_gen_meta
-    set_gen_meta(int(input_len), int(new_tokens.shape[0]))
+    set_gen_meta(input_len, int(new_tokens.shape[0]))
     return tok.decode(new_tokens, skip_special_tokens=True).strip()
 
 
@@ -288,6 +350,7 @@ def generate_from_chat_messages(
     use_4bit: bool = True,
     profile: str = "2_5_7b",
     tools: list[dict[str, Any]] | None = None,
+    enable_thinking: bool = False,
 ) -> str:
     """Run Qwen on OpenAI-style chat messages (optional OpenAI ``tools`` for ``apply_chat_template``)."""
     global _ACTIVE_PROFILE
@@ -296,6 +359,7 @@ def generate_from_chat_messages(
     _ACTIVE_PROFILE = profile
 
     norm = _normalize_chat_messages(messages)
+    norm = _prepare_messages_for_thinking(norm, profile, enable_thinking=enable_thinking)
     unsloth_id, hf_id = _resolve_ids(profile)
 
     if not torch.cuda.is_available():
@@ -310,6 +374,8 @@ def generate_from_chat_messages(
                 messages=norm,
                 tools=tools,
                 use_4bit=use_4bit,
+                enable_thinking=enable_thinking,
+                profile=profile,
             )
         return _hf_generate(
             hf_id,
@@ -319,7 +385,13 @@ def generate_from_chat_messages(
         )
 
     try:
-        return _generate_unsloth(norm, use_4bit=use_4bit, unsloth_model_id=unsloth_id, tools=tools)
+        return _generate_unsloth(
+            norm,
+            use_4bit=use_4bit,
+            unsloth_model_id=unsloth_id,
+            tools=tools,
+            enable_thinking=enable_thinking,
+        )
     except ImportError:
         print("[Qwen] unsloth not installed; using Hugging Face Transformers.")
     except NotImplementedError as exc:
@@ -347,6 +419,8 @@ def generate_from_chat_messages(
             messages=norm,
             tools=tools,
             use_4bit=use_4bit,
+            enable_thinking=enable_thinking,
+            profile=profile,
         )
     return _hf_generate(
         hf_id,

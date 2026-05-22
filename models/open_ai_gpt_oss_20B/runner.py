@@ -9,7 +9,7 @@ from typing import Any
 import torch
 from langchain_core.tools import BaseTool
 
-from core.generation_defaults import agent_decoding_kwargs
+from core.generation_defaults import agent_decoding_kwargs, cap_max_new_tokens, model_max_seq_len
 from core.gpu_info import log_gpu_status
 from core.hf_backend import hf_generate_from_messages
 from core.parsing import parse_tool_selection
@@ -37,14 +37,28 @@ _US_MODEL: Any = None
 _US_TOKENIZER: Any = None
 _US_4BIT: bool | None = None
 _US_MODEL_ID: str | None = None
+_UNSLOTH_DISABLED: bool = False  # set after CUDA OOM — use HF only for rest of process
 
 
 def unload_gpt_oss_unsloth() -> None:
     global _US_MODEL, _US_TOKENIZER, _US_4BIT, _US_MODEL_ID
+    if _US_MODEL is not None:
+        try:
+            del _US_MODEL
+        except Exception:
+            pass
+    if _US_TOKENIZER is not None:
+        try:
+            del _US_TOKENIZER
+        except Exception:
+            pass
     _US_MODEL = None
     _US_TOKENIZER = None
     _US_4BIT = None
     _US_MODEL_ID = None
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def _hf_cache_key(model_id: str) -> str:
@@ -96,7 +110,7 @@ def _load_unsloth_gpt_oss(*, use_4bit: bool) -> tuple[Any, Any]:
                 "A10G frequently CUDA-OOMs in Transformers mxfp4 swizzle. Options: "
                 "**GPT_OSS_CPU_LOAD=1** (CPU load + slow inference), **40GB+ GPU**, or use **Qwen (1)** / **Gemma 3 12B (2)**.\n"
             )
-    max_seq = int(os.environ.get("GPT_OSS_MAX_SEQ_LEN", "4096"))
+    max_seq = int(os.environ.get("GPT_OSS_MAX_SEQ_LEN", "32768"))
     extra_kw: dict[str, Any] = {}
     if "gpt-oss" in model_id.lower():
         attn = os.environ.get("GPT_OSS_ATTN_IMPLEMENTATION", "eager").strip()
@@ -127,23 +141,32 @@ def _generate_unsloth(messages: list[dict[str, str]], *, use_4bit: bool) -> str:
     device = next(model.parameters()).device
     print(f"[GPU] GPT-OSS generate: first param device={device}")
     inputs = tokenizer(prompt, return_tensors="pt").to(device)
-    gen_kwargs = agent_decoding_kwargs()
+    input_len = int(inputs["input_ids"].shape[1])
+    gen_kwargs = cap_max_new_tokens(
+        agent_decoding_kwargs(),
+        input_token_len=input_len,
+        max_seq_len=model_max_seq_len(),
+    )
+    gen_kwargs["do_sample"] = False
+    gen_kwargs.pop("temperature", None)
+    gen_kwargs.pop("repetition_penalty", None)
     # Default was use_cache=False to dodge rare attention shape bugs; that makes each decode step
     # recompute the full prompt (O(seq²) per token) — with ~3k tool-catalog tokens × 1024 new
     # tokens it can look “stuck” for tens of minutes. Eager attention + KV cache is the stable default.
     if os.environ.get("GPT_OSS_USE_KV_CACHE", "1").lower() in ("0", "false", "no"):
         gen_kwargs["use_cache"] = False
-    n_in = int(inputs["input_ids"].shape[1])
     mnt = gen_kwargs.get("max_new_tokens", "?")
     print(
-        f"[GPT-OSS] generate: prompt_tokens≈{n_in}, max_new_tokens={mnt} "
+        f"[GPT-OSS] generate: prompt_tokens≈{input_len}, max_new_tokens={mnt} "
         "(first forward may take ~30–120s on A10G; not frozen).",
         flush=True,
     )
     with torch.inference_mode():
         out = model.generate(**inputs, **gen_kwargs)
-    input_len = inputs["input_ids"].shape[1]
     new_tokens = out[0][input_len:]
+    from core.gen_meta import set_gen_meta
+
+    set_gen_meta(input_len, int(new_tokens.shape[0]))
     return tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
 
 
@@ -183,6 +206,69 @@ def generate_tool_selection_raw(
         messages=messages,
         use_4bit=use_4bit,
     )
+
+
+def _cuda_fatal(exc: BaseException) -> bool:
+    s = str(exc).lower()
+    return (
+        "out of memory" in s
+        or "cuda error" in s
+        or "device-side assert" in s
+        or "acceleratorerror" in s
+        or "probability tensor contains" in s
+    )
+
+
+def _generate_via_hf(
+    messages: list[dict[str, str]],
+    *,
+    use_4bit: bool,
+    model_id: str,
+) -> str:
+    unload_gpt_oss_unsloth()
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+    return hf_generate_from_messages(
+        model_id,
+        cache_key=_hf_cache_key(model_id),
+        messages=messages,
+        use_4bit=use_4bit,
+    )
+
+
+def _hf_only_mode() -> bool:
+    return os.environ.get("GPT_OSS_HF_ONLY", "").strip().lower() in ("1", "true", "yes")
+
+
+def generate_from_chat_messages(
+    messages: list[dict[str, str]],
+    *,
+    use_4bit: bool = True,
+    enable_thinking: bool = False,
+) -> str:
+    """Vanilla chat triage. ``enable_thinking`` is ignored for GPT-OSS."""
+    global _UNSLOTH_DISABLED
+    if _hf_only_mode():
+        _UNSLOTH_DISABLED = True
+    if enable_thinking:
+        print("[GPT-OSS] enable_thinking not supported; using standard template.")
+    norm = [{"role": str(m.get("role", "user")), "content": str(m.get("content", ""))} for m in messages]
+    model_id = os.environ.get("GPT_OSS_MODEL_ID", _DEFAULT_MODEL)
+    # After first OOM in this process, skip Unsloth entirely (HF stays cached).
+    if not _UNSLOTH_DISABLED and not _hf_only_mode():
+        try:
+            return _generate_unsloth(norm, use_4bit=use_4bit)
+        except ImportError:
+            print("[GPT-OSS] unsloth not installed; using Hugging Face Transformers.")
+            _UNSLOTH_DISABLED = True
+        except Exception as exc:  # noqa: BLE001
+            print(f"[GPT-OSS] Unsloth load/generate failed ({exc}); using Hugging Face Transformers.")
+            if _cuda_fatal(exc):
+                _UNSLOTH_DISABLED = True
+                print("[GPT-OSS] Unsloth disabled for remainder of this process (CUDA/OOM).")
+    return _generate_via_hf(norm, use_4bit=use_4bit, model_id=model_id)
 
 
 def run_tool_selection(

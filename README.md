@@ -139,7 +139,11 @@ Host qwen-ec2
             2. Copy the public key: cat ~/.ssh/id_ed25519.pub
             3. Add this key to your GitHub SSH Settings or as a SSH Key in your specific repository.
             4. git clone with ssh link
-    4. Executing Qwen3 Optimized Inference
+    4. uv setup
+        1. curl -LsSf https://astral.sh/uv/install.sh | sh
+        2. uv sync
+        3. uv run <your_script.py>
+    5. Executing Qwen3 Optimized Inference
 Unsloth enables 4-bit quantization layout profiles to drastically lower hardware overhead.
 Recommended Model Mapping (48GB VRAM Ceiling)
 

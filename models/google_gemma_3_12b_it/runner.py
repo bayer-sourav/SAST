@@ -50,7 +50,7 @@ def _unsloth_model_id(*, use_4bit: bool) -> str:
 
 def _unsloth_max_seq_length() -> int | None:
     """Optional tighter canvas for 12B only; falls back to GEMMA_UNSLOTH_MAX_SEQ_LEN in backend."""
-    raw = os.environ.get("GEMMA_3_12B_UNSLOTH_MAX_SEQ_LEN", "").strip()
+    raw = os.environ.get("GEMMA_3_12B_UNSLOTH_MAX_SEQ_LEN", "32768").strip()
     if raw:
         return int(raw)
     return None
@@ -126,6 +126,39 @@ def generate_tool_selection_raw(
                 "the license, or unset GEMMA_3_12B_MODEL_ID to use the default Unsloth Hub id."
             )
 
+    from core.gemma3_hf_backend import gemma3_generate_from_messages
+
+    return gemma3_generate_from_messages(
+        hf_id,
+        cache_key="gemma3_12b_it",
+        messages=messages,
+        use_4bit=use_4bit,
+    )
+
+
+def generate_from_chat_messages(
+    messages: list[dict[str, str]],
+    *,
+    use_4bit: bool = True,
+    enable_thinking: bool = False,
+) -> str:
+    """Vanilla chat triage (system + user roles). ``enable_thinking`` is ignored for Gemma 3."""
+    if enable_thinking:
+        print("[Gemma 3 12B] enable_thinking not supported; using standard template.")
+    hf_id = _hf_model_id(use_4bit=use_4bit)
+    if _unsloth_importable():
+        try:
+            from core.gemma3_unsloth_backend import gemma3_unsloth_generate_from_messages
+
+            return gemma3_unsloth_generate_from_messages(
+                cache_key="gemma3_12b_unsloth",
+                model_name=_unsloth_model_id(use_4bit=use_4bit),
+                messages=messages,
+                use_4bit=use_4bit,
+                max_seq_length=_unsloth_max_seq_length(),
+            )
+        except Exception as exc:
+            print(f"[Gemma 3 12B] Unsloth failed ({exc!r}); using Hugging Face.")
     from core.gemma3_hf_backend import gemma3_generate_from_messages
 
     return gemma3_generate_from_messages(

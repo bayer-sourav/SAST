@@ -9,7 +9,7 @@ from typing import Any, NoReturn
 
 import torch
 
-from core.generation_defaults import agent_decoding_kwargs
+from core.generation_defaults import agent_decoding_kwargs, cap_max_new_tokens, model_max_seq_len
 from core.gpu_info import log_gpu_status
 
 _CACHE: dict[str, tuple[Any, Any]] = {}
@@ -297,16 +297,15 @@ def gemma3_generate_from_messages(
     if "attention_mask" not in gen_in:
         gen_in["attention_mask"] = torch.ones_like(gen_in["input_ids"])
 
-    gen_kw = agent_decoding_kwargs()
-    _clamp_input_ids_for_generate(model, gen_in, label="HF-Gemma3")
-
     input_len_pre = int(gen_in["input_ids"].shape[1])
     mpe2 = getattr(cfg, "max_position_embeddings", None) if cfg is not None else None
-    if mpe2 is not None:
-        room = int(mpe2) - input_len_pre - 32
-        mnt = int(gen_kw.get("max_new_tokens", 1024))
-        if room > 0 and mnt > room:
-            gen_kw["max_new_tokens"] = max(16, room)
+    ctx_cap = min(model_max_seq_len(), int(mpe2)) if mpe2 is not None else model_max_seq_len()
+    gen_kw = cap_max_new_tokens(
+        agent_decoding_kwargs(),
+        input_token_len=input_len_pre,
+        max_seq_len=ctx_cap,
+    )
+    _clamp_input_ids_for_generate(model, gen_in, label="HF-Gemma3")
 
     # Transformers 5.x may compile forwards; Dynamo + Gemma3 + bnb can raise InternalTorchDynamoError
     # wrapping a CUDA assert. Disable compile for this call unless opted in.

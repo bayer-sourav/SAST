@@ -47,7 +47,7 @@ def _load_unsloth(*, use_4bit: bool) -> tuple[Any, Any]:
 
     log_gpu_status("LFM2-8B Unsloth")
     model_id = os.environ.get("LFM2_UNSLOTH_MODEL_ID", _DEFAULT_UNSLOTH)
-    max_seq = int(os.environ.get("LFM2_MAX_SEQ_LEN", "4096"))
+    max_seq = int(os.environ.get("LFM2_MAX_SEQ_LEN", "32768"))
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=model_id,
         max_seq_length=max_seq,

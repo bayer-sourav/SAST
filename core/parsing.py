@@ -353,6 +353,26 @@ def extract_triage_result(text: str) -> dict:
     if candidates:
         return candidates[-1]
 
+    # Model may embed Java `{...}` before triage JSON; scan all balanced slices.
+    i = 0
+    while i < len(cleaned):
+        if cleaned[i] != "{":
+            i += 1
+            continue
+        sl = _first_balanced_object_slice(cleaned, i)
+        if not sl:
+            i += 1
+            continue
+        parsed = _try_parse_json_object(sl, ctx="triage fallback scan")
+        if parsed is not None:
+            lbl = str(parsed.get("label", "")).strip().upper()
+            if lbl in _TRIAGE_LABELS:
+                candidates.append(parsed)
+        i += max(1, len(sl))
+
+    if candidates:
+        return candidates[-1]
+
     return extract_json_object(text)
 
 

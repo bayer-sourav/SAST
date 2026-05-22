@@ -18,7 +18,7 @@ from typing import Any
 
 import torch
 
-from core.generation_defaults import agent_decoding_kwargs
+from core.generation_defaults import agent_decoding_kwargs, cap_max_new_tokens, model_max_seq_len
 from core.gpu_info import log_gpu_status
 
 _CACHE: dict[str, tuple[Any, Any]] = {}
@@ -290,7 +290,7 @@ def gemma3_unsloth_generate_from_messages(
     msl = max_seq_length
     if msl is None:
         # Tighter default reduces FastModel internal canvas mismatches that show up as CUDA index asserts.
-        msl = int(os.environ.get("GEMMA_UNSLOTH_MAX_SEQ_LEN", "4096"))
+        msl = int(os.environ.get("GEMMA_UNSLOTH_MAX_SEQ_LEN", "32768"))
     model, tok_or_proc = _load_fastmodel(
         cache_key,
         model_name=model_name,
@@ -303,7 +303,12 @@ def gemma3_unsloth_generate_from_messages(
     # Do not let prompt+gen planning exceed the checkpoint's position table (avoids RoPE/index asserts).
     ctx_cap = min(msl, int(mpe)) if mpe is not None else msl
     inputs = _encode_messages(tok_or_proc, messages, device, max_context_tokens=ctx_cap)
-    gen_kw = agent_decoding_kwargs()
+    input_len = int(inputs["input_ids"].shape[1])
+    gen_kw = cap_max_new_tokens(
+        agent_decoding_kwargs(),
+        input_token_len=input_len,
+        max_seq_len=ctx_cap,
+    )
     t = _text_tokenizer(tok_or_proc)
     if getattr(t, "pad_token_id", None) is not None:
         gen_kw.setdefault("pad_token_id", t.pad_token_id)

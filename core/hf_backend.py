@@ -11,7 +11,7 @@ from typing import Any, NoReturn
 import torch
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
-from core.generation_defaults import agent_decoding_kwargs
+from core.generation_defaults import agent_decoding_kwargs, cap_max_new_tokens, model_max_seq_len
 from core.gpu_info import log_gpu_status
 
 _CACHE: dict[str, tuple[Any, Any]] = {}
@@ -587,17 +587,25 @@ def hf_generate_from_messages(
         inputs["attention_mask"] = torch.ones_like(inputs["input_ids"])
     inputs = inputs.to(device)
 
-    gen_kwargs: dict[str, Any] = dict(dec)
+    input_len = int(inputs["input_ids"].shape[1])
+    gen_kwargs = cap_max_new_tokens(
+        dict(dec),
+        input_token_len=input_len,
+        max_seq_len=model_max_seq_len(),
+    )
 
     # GPT-OSS: only disable KV cache if GPT_OSS_USE_KV_CACHE=0 (debugging rare shape bugs).
     # Default on — off makes long-prompt decode astronomically slow.
     if _is_gpt_oss_model(model_id):
         if os.environ.get("GPT_OSS_USE_KV_CACHE", "1").lower() in ("0", "false", "no"):
             gen_kwargs["use_cache"] = False
-        n_in = int(inputs["input_ids"].shape[1])
+        # Greedy decode; mild repetition_penalty reduces "!!!!" collapse on gpt-oss.
+        gen_kwargs["do_sample"] = False
+        gen_kwargs.pop("temperature", None)
+        gen_kwargs["repetition_penalty"] = 1.08
         mnt = gen_kwargs.get("max_new_tokens", "?")
         print(
-            f"[HF GPT-OSS] generate: prompt_tokens≈{n_in}, max_new_tokens={mnt} "
+            f"[HF GPT-OSS] generate: prompt_tokens≈{input_len}, max_new_tokens={mnt} "
             "(first tokens can be slow on 22GB; wait or lower AGENT_MAX_NEW_TOKENS).",
             flush=True,
         )
@@ -608,10 +616,21 @@ def hf_generate_from_messages(
             message=".*attention mask API under `transformers.modeling_attn_mask_utils`.*",
             category=FutureWarning,
         )
-        with torch.inference_mode():
-            out = model.generate(**inputs, **gen_kwargs)
+        try:
+            with torch.inference_mode():
+                out = model.generate(**inputs, **gen_kwargs)
+        except Exception as gen_exc:
+            if _is_gpt_oss_model(model_id) and (
+                "cuda" in str(gen_exc).lower()
+                or "accelerator" in str(gen_exc).lower()
+                or "assert" in str(gen_exc).lower()
+            ):
+                clear_hf_cache()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+            raise
 
-    input_len = inputs["input_ids"].shape[1]
     new_tokens = out[0][input_len:]
     from core.gen_meta import set_gen_meta
     set_gen_meta(int(input_len), int(new_tokens.shape[0]))

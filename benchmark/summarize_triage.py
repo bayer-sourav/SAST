@@ -22,12 +22,47 @@ def _load_label(result_path: Path) -> str | None:
     return lbl if lbl in VALID_LABELS else None
 
 
+def _f1_for_positive_class(
+    gold: str,
+    dist: Counter[str],
+    *,
+    evaluated: int,
+) -> float:
+    """F1 with positive class = gold (FP-removal or TP-retention task)."""
+    if evaluated <= 0:
+        return 0.0
+    gold = gold.upper()
+    tp = dist.get(gold, 0)
+    pred_pos = tp + sum(dist.get(l, 0) for l in VALID_LABELS if l != gold)
+    fn = sum(dist.get(l, 0) for l in VALID_LABELS if l != gold)
+    precision = tp / pred_pos if pred_pos else 0.0
+    recall = tp / evaluated
+    if precision + recall == 0:
+        return 0.0
+    return 2 * precision * recall / (precision + recall)
+
+
+def _enrich_metrics(base: dict[str, float | int], *, gold: str) -> dict:
+    gold_u = gold.upper()
+    dist = Counter(base.get("distribution") or {})
+    evaluated = int(base["evaluated"])
+    out = dict(base)
+    if gold_u == "FP":
+        out["fprr"] = base["fp_removal_rate"]
+        out["tp_retention_rate"] = base["tp_rate"]
+    else:
+        out["vdr"] = base["tp_rate"]
+        out["fp_removal_rate_alias"] = base["fp_removal_rate"]
+    out["f1"] = _f1_for_positive_class(gold_u, dist, evaluated=evaluated)
+    return out
+
+
 def _metrics_for_cases(
     case_ids: list[str],
     *,
     gold: str,
     predicted: dict[str, str | None],
-) -> dict[str, float | int]:
+) -> dict:
     gold = gold.upper()
     n = len(case_ids)
     correct = 0
@@ -43,7 +78,7 @@ def _metrics_for_cases(
         if pred == gold:
             correct += 1
     evaluated = n - missing
-    return {
+    base = {
         "n_cases": n,
         "evaluated": evaluated,
         "missing": missing,
@@ -56,6 +91,11 @@ def _metrics_for_cases(
         "unknown_rate": (dist.get("UNKNOWN", 0) / evaluated) if evaluated else 0.0,
         "distribution": dict(dist),
     }
+    return _enrich_metrics(base, gold=gold)
+
+
+def _model_row_name(profile: str) -> str:
+    return f"SLM ({profile})"
 
 
 def main() -> None:
@@ -70,13 +110,13 @@ def main() -> None:
         "--runs",
         type=Path,
         default=Path("runs"),
-        help="Runs root (default: ./runs)",
+        help="Runs root containing <profile>/llm/<case_id>/",
     )
     ap.add_argument(
         "--profile",
         action="append",
         dest="profiles",
-        help="Qwen profile dir under runs/ (repeatable). Default: qwen3_4b_bnb qwen3_8b_bnb",
+        help="Model profile dir under runs/ (repeatable). Default: qwen3_4b_bnb qwen3_8b_bnb",
     )
     ap.add_argument("--agent", default="llm")
     ap.add_argument("--max-cases", type=int, default=None)
@@ -87,7 +127,7 @@ def main() -> None:
     case_dir = args.case_dir.expanduser().resolve()
     runs_root = args.runs.expanduser().resolve()
 
-    case_files = sorted(case_dir.glob("*.json"))
+    case_files = sorted(p for p in case_dir.glob("*.json") if p.name != "slice_manifest.json")
     if args.max_cases is not None:
         case_files = case_files[: args.max_cases]
 
@@ -100,10 +140,9 @@ def main() -> None:
     rows: dict[str, dict] = {}
 
     gold_u = args.gold.strip().upper()
-    codeql_label = "TP"  # reported finding = keep alert
+    codeql_label = "TP"
     codeql_pred = {cid: codeql_label for cid in case_ids}
 
-    # CodeQL baseline: tool reported alert → triage treats as "not dismissed" (TP from filter POV)
     rows["CodeQL (no filter)"] = _metrics_for_cases(case_ids, gold=args.gold, predicted=codeql_pred)
 
     for profile in profiles:
@@ -112,31 +151,34 @@ def main() -> None:
         for cid in case_ids:
             result_path = runs_root / model_dir / args.agent / cid / f"agent-{args.agent}-triage-result.json"
             predicted[cid] = _load_label(result_path)
-        rows[f"Qwen ({profile})"] = _metrics_for_cases(case_ids, gold=args.gold, predicted=predicted)
+        rows[_model_row_name(profile)] = _metrics_for_cases(
+            case_ids, gold=args.gold, predicted=predicted
+        )
+        rows[_model_row_name(profile)]["profile"] = profile
 
     print(f"Corpus: {case_dir}")
     print(f"Gold label: {args.gold}  |  Cases: {len(case_ids)}")
     print()
+    metric_col = "FPRR" if gold_u == "FP" else "VDR"
     header = (
-        f"{'System':<28} {'Acc*':>6} {'All':>6} {'Cov':>6} "
-        f"{'FP':>6} {'TP':>5} {'Miss':>5} {'N':>4}"
+        f"{'System':<32} {'Acc*':>6} {'Cov':>6} {metric_col:>6} {'F1':>6} "
+        f"{'Miss':>5} {'N':>4}"
     )
     print(header)
     print("-" * len(header))
     for name, m in rows.items():
+        key_metric = m.get("fprr", m.get("vdr", 0.0))
         print(
-            f"{name:<28} "
+            f"{name:<32} "
             f"{100 * m['accuracy']:5.1f}% "
-            f"{100 * m['accuracy_all']:5.1f}% "
             f"{100 * m['coverage']:5.1f}% "
-            f"{100 * m['fp_removal_rate']:5.1f}% "
-            f"{100 * m['tp_rate']:4.1f}% "
+            f"{100 * key_metric:5.1f}% "
+            f"{100 * m['f1']:5.1f}% "
             f"{m['missing']:5d} "
             f"{m['n_cases']:4d}"
         )
     print()
-    print(f"Gold={gold_u}. Acc*=correct/evaluated; All=correct/N; Cov=evaluated/N.")
-    print("CodeQL baseline = no filtering (keeps every alert as TP). FP/TP columns = model label rates.")
+    print(f"Gold={gold_u}. FPRR/VDR and F1 use positive class = gold label.")
 
     if args.json_out:
         args.json_out.parent.mkdir(parents=True, exist_ok=True)
