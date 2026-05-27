@@ -74,19 +74,56 @@ phase1_apply_token_limits() {
     export QWEN_MAX_SEQ_LEN="${PHASE1_OFF_MAX_SEQ_LEN:-16384}"
   fi
 
-  if [[ "$profile" == "gpt_oss_20b" ]]; then
-    # Try Unsloth once per process; HF after first OOM. Set PHASE1_GPT_OSS_HF_ONLY=1 to skip Unsloth entirely.
-    if [[ "${PHASE1_GPT_OSS_HF_ONLY:-0}" == "1" ]]; then
-      export GPT_OSS_HF_ONLY=1
-    else
-      unset GPT_OSS_HF_ONLY
+  if [[ "$profile" == "qwen3_coder_30b_bnb" ]]; then
+    export QWEN_MAX_SEQ_LEN="${PHASE1_CODER_MAX_SEQ_LEN:-4096}"
+    export QWEN_CODER_MAX_SEQ_LEN="${PHASE1_CODER_MAX_SEQ_LEN:-4096}"
+    export AGENT_MAX_SEQ_LEN="${PHASE1_CODER_AGENT_MAX_SEQ_LEN:-6144}"
+    export AGENT_MAX_NEW_TOKENS="${PHASE1_CODER_MAX_NEW_TOKENS:-2048}"
+    # Local instruct snapshot + HF BnB + CPU offload.
+    # Tokenizer must match instruct weights (unsloth snapshot tokenizer is broken vocab=1).
+    # Do NOT use riomus BnB tokenizer with unsloth weights — produces garbage output.
+    export QWEN3_CODER_USE_LOCAL_SNAPSHOT=1
+    export QWEN3_CODER_SKIP_UNSLOTH=1
+    unset QWEN3_CODER_30B_HF_MODEL_ID
+    unset QWEN3_CODER_LOCAL_SNAPSHOT
+    _coder_tok="${PHASE1_CODER_TOKENIZER_DIR:-}"
+    if [[ -z "$_coder_tok" ]]; then
+      _qwen_hub="$HOME/.cache/huggingface/hub/models--Qwen--Qwen3-Coder-30B-A3B-Instruct/snapshots"
+      if [[ -d "$_qwen_hub" ]]; then
+        _coder_tok="$(find "$_qwen_hub" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort | tail -1)"
+      fi
     fi
-    export GPT_OSS_MAX_SEQ_LEN="${PHASE1_GPT_OSS_MAX_SEQ_LEN:-12288}"
-    export AGENT_MAX_NEW_TOKENS="${PHASE1_GPT_OSS_MAX_NEW_TOKENS:-2048}"
+    if [[ -z "$_coder_tok" || ! -f "$_coder_tok/tokenizer.json" ]]; then
+      _coder_tok="Qwen/Qwen3-Coder-30B-A3B-Instruct"
+    fi
+    export HF_TOKENIZER_MODEL_ID="$_coder_tok"
+    export HF_DEVICE_MAP="${PHASE1_CODER_HF_DEVICE_MAP:-auto}"
+    export HF_MAX_MEMORY="${PHASE1_CODER_HF_MAX_MEMORY:-0:30GiB,cpu:120GiB}"
+    export HF_SKIP_ALLOCATOR_WARMUP="${PHASE1_CODER_SKIP_ALLOCATOR_WARMUP:-1}"
+    export HF_LOCAL_FILES_ONLY="${PHASE1_CODER_HF_LOCAL_ONLY:-1}"
+    export HF_BNB_ALLOW_CPU_OFFLOAD=1
+    export HF_LOW_CPU_MEM_USAGE="${PHASE1_CODER_HF_LOW_CPU_MEM_USAGE:-0}"
+    unset HF_BNB_META_RETRY_CUDA0
+    unset UNSLOTH_DEVICE_MAP
+  fi
+
+  if [[ "$profile" == "gpt_oss_20b" ]]; then
     export PHASE1_GPT_OSS_HF_ONLY="${PHASE1_GPT_OSS_HF_ONLY:-1}"
     export GPT_OSS_HF_ONLY=1
     export AGENT_TEMPERATURE="${PHASE1_GPT_OSS_TEMPERATURE:-0}"
     export AGENT_REPETITION_PENALTY="${PHASE1_GPT_OSS_REPETITION_PENALTY:-1}"
+    unset HF_DEVICE_MAP
+    if [[ "$thinking_flag" == "on" ]]; then
+      # thinking_on: tight GPU caps (CPU path is ~30+ min/case and looks hung). Model ignores thinking anyway.
+      unset GPT_OSS_CPU_LOAD
+      export GPT_OSS_MAX_SEQ_LEN="${PHASE1_GPT_OSS_ON_MAX_SEQ_LEN:-8192}"
+      export AGENT_MAX_SEQ_LEN="${PHASE1_GPT_OSS_ON_AGENT_MAX_SEQ:-8192}"
+      export AGENT_MAX_NEW_TOKENS="${PHASE1_GPT_OSS_ON_MAX_NEW:-512}"
+    else
+      unset GPT_OSS_CPU_LOAD
+      export GPT_OSS_MAX_SEQ_LEN="${PHASE1_GPT_OSS_MAX_SEQ_LEN:-12288}"
+      export AGENT_MAX_NEW_TOKENS="${PHASE1_GPT_OSS_MAX_NEW_TOKENS:-2048}"
+    fi
   fi
 }
 

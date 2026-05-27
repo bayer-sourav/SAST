@@ -98,6 +98,7 @@ run_cell() {
     --profile "$profile" \
     --runs-root "$runs_root/thinking_${thinking_flag}" \
     --gold "$gold" \
+    --retry-missing \
     "${force_args[@]}" \
     "${think_args[@]}" \
     2>&1 | tee -a "$log"
@@ -130,6 +131,10 @@ summarize_track() {
 
 for THINKING in off on; do
   for PROFILE in "${PROFILES[@]}"; do
+    if [[ "$PROFILE" == "qwen3_coder_30b_bnb" && -f "$LOG_DIR/phase1_skip_coder.txt" ]]; then
+      echo "--- SKIP coder ($LOG_DIR/phase1_skip_coder.txt present) ---" | tee -a "$LOG_DIR/phase1_master.log"
+      continue
+    fi
     run_cell "$THINKING" "$PROFILE" FP "$SLICE_FP" "$FP_RUNS"
     run_cell "$THINKING" "$PROFILE" TP "$SLICE_TP" "$TP_RUNS"
   done
@@ -160,6 +165,5 @@ print('Wrote $COMBINED_OUT')
 
 date -Iseconds > "$LOG_DIR/finished_at.txt"
 date -Iseconds > "$LOG_DIR/phase1_matrix_finished.txt"
-uv run python benchmark/report_timing.py --json-out benchmark/phase1_timing_report.json \
-  | tee "$LOG_DIR/timing_final.txt"
+bash ./benchmark/refresh_phase1_summaries.sh >> "$LOG_DIR/phase1_master.log" 2>&1
 echo "=== Phase 1 complete ===" | tee -a "$LOG_DIR/phase1_master.log"

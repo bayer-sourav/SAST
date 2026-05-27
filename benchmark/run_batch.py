@@ -185,6 +185,14 @@ def _main() -> None:
             pb_cmd.extend(["--repo", str(args.repo)])
         print("[batch] prebuilding task.md for all cases (CPU, no model load)...", flush=True)
         subprocess.run(pb_cmd, cwd=str(sast_root), check=False)
+        if args.profile in ("qwen3_coder_30b_bnb", "gpt_oss_20b"):
+            from benchmark.llm_generate import preload_profile
+
+            try:
+                preload_profile(args.profile)
+                print(f"[batch] preload ok for {args.profile!r}", flush=True)
+            except Exception as exc:
+                print(f"[batch] preload failed ({exc}); cases will attempt load anyway.", flush=True)
 
     for case_path in files:
         cid = _case_id(eval_fw, case_path)
@@ -206,12 +214,11 @@ def _main() -> None:
                 if lbl in VALID_LABELS and lbl == gold_u:
                     print(f"[skip] {cid} (correct {lbl})")
                     skipped = True
-            elif not args.retry_missing:
-                print(f"[skip] {cid}")
-                skipped = True
             elif lbl in VALID_LABELS and not args.retry_wrong:
                 print(f"[skip] {cid} (valid result)")
                 skipped = True
+            elif not args.retry_missing:
+                print(f"[run] {cid} (stale run dir, no valid result)", flush=True)
 
         if skipped:
             meta = read_run_meta(run_dir)

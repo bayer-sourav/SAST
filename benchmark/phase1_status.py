@@ -110,13 +110,22 @@ def main() -> None:
         if matrix.is_file():
             print(f"\n--- Results: thinking_{thinking} ---")
             data = json.loads(matrix.read_text())
-            print(f"{'Profile':<28} {'FPRR':>7} {'VDR':>7} {'SRS':>7} {'Cov-FP':>7} {'Cov-TP':>7}")
+            print(
+                f"{'Profile':<28} {'FPRR':>7} {'VDR':>7} {'SRS':>7} "
+                f"{'F1':>7} {'F1-FP':>7} {'F1-TP':>7} {'Cov-FP':>7} {'Cov-TP':>7}"
+            )
             for profile, m in data.get("models", {}).items():
+                f1_fp = float(m.get("f1_fp_track", m.get("fp_track", {}).get("f1", 0.0)))
+                f1_tp = float(m.get("f1_tp_track", m.get("tp_track", {}).get("f1", 0.0)))
+                f1 = float(m.get("f1", 0.5 * (f1_fp + f1_tp)))
                 print(
                     f"{profile:<28} "
                     f"{100 * m['fprr']:6.1f}% "
                     f"{100 * m['vdr']:6.1f}% "
                     f"{100 * m['srs']:6.1f}% "
+                    f"{100 * f1:6.1f}% "
+                    f"{100 * f1_fp:6.1f}% "
+                    f"{100 * f1_tp:6.1f}% "
                     f"{100 * m['fp_track']['coverage']:6.1f}% "
                     f"{100 * m['tp_track']['coverage']:6.1f}%"
                 )

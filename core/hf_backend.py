@@ -15,6 +15,8 @@ from core.generation_defaults import agent_decoding_kwargs, cap_max_new_tokens, 
 from core.gpu_info import log_gpu_status
 
 _CACHE: dict[str, tuple[Any, Any]] = {}
+_BNB_PARAMS_PATCHED = False
+_BNB_QUANT_STATE_PATCHED = False
 
 
 def _is_gpt_oss_model(model_id: str) -> bool:
@@ -50,6 +52,49 @@ def _trust_remote_code_for_model(model_id: str) -> bool:
             "yes",
         )
     return True
+
+
+def _hub_quant_method(model_id: str) -> str:
+    """Return quant method from Hub config when available (e.g. gptq, fp8, bnb)."""
+    try:
+        cfg = AutoConfig.from_pretrained(
+            model_id,
+            trust_remote_code=_trust_remote_code_for_model(model_id),
+        )
+        qc = getattr(cfg, "quantization_config", None)
+        if qc is None:
+            return ""
+        if isinstance(qc, dict):
+            return str(qc.get("quant_method", qc.get("bits", ""))).lower()
+        return type(qc).__name__.lower()
+    except Exception:
+        return ""
+
+
+def _is_prequantized_hub_checkpoint(model_id: str) -> bool:
+    """Hub weights already quantized; do not pass BitsAndBytesConfig on load."""
+    mid = model_id.lower()
+    if any(
+        tag in mid
+        for tag in (
+            "bnb-4bit",
+            "bnb_4bit",
+            "bnb-fp4",
+            "bnb-4b-fused",
+            "bnb-4b",
+            "4b-fused",
+            "-gptq",
+            "/gptq",
+            "gptq-",
+            "-awq",
+            "-fp8",
+            "/fp8",
+            "instruct-fp8",
+        )
+    ):
+        return True
+    qm = _hub_quant_method(model_id)
+    return any(x in qm for x in ("gptq", "awq", "fp8", "bnb", "mxfp4", "compressed"))
 
 
 def _is_native_mxfp4_checkpoint(model_id: str) -> bool:
@@ -133,6 +178,134 @@ def _raise_hf_load_failure(model_id: str, exc: BaseException) -> NoReturn:
     ) from exc
 
 
+def _patch_bnb_quantizer_cpu_offload_validate() -> None:
+    """Allow pre-quantized BnB checkpoints with device_map=auto + CPU layers (transformers 5.x)."""
+    if os.environ.get("HF_BNB_ALLOW_CPU_OFFLOAD", "1").lower() in ("0", "false", "no"):
+        return
+    try:
+        from transformers.quantizers.quantizer_bnb_4bit import Bnb4BitHfQuantizer
+    except ImportError:
+        return
+    if getattr(Bnb4BitHfQuantizer, "_hf_cpu_offload_patched", False):
+        return
+    _orig = Bnb4BitHfQuantizer.validate_environment
+
+    def _patched(self, *args: Any, **kwargs: Any) -> None:
+        try:
+            _orig(self, *args, **kwargs)
+        except ValueError as exc:
+            if "dispatched on the CPU or the disk" not in str(exc):
+                raise
+
+    Bnb4BitHfQuantizer.validate_environment = _patched  # type: ignore[method-assign]
+    Bnb4BitHfQuantizer._hf_cpu_offload_patched = True
+
+
+def _patch_bitsandbytes_params_compat() -> None:
+    """
+    Transformers >=5.x passes `_is_hf_initialized` from old param __dict__ when reconstituting
+    BnB Params4bit/Int8Params; bitsandbytes <0.50 rejects unknown kwargs (HF#43872, bnb#1900).
+    """
+    global _BNB_PARAMS_PATCHED
+    if _BNB_PARAMS_PATCHED:
+        return
+    try:
+        import bitsandbytes as bnb
+    except ImportError:
+        return
+
+    for name in ("Params4bit", "Int8Params"):
+        cls = getattr(bnb.nn, name, None)
+        if cls is None:
+            continue
+        orig_new = cls.__new__
+
+        def _make_patched(orig):
+            def __new__(cls, *args, **kwargs):
+                kwargs.pop("_is_hf_initialized", None)
+                return orig(cls, *args, **kwargs)
+
+            return __new__
+
+        cls.__new__ = _make_patched(orig_new)
+
+    _BNB_PARAMS_PATCHED = True
+
+
+def _patch_bitsandbytes_quant_state_meta_item() -> None:
+    """
+    bitsandbytes QuantState.as_dict() may call Tensor.item() on a meta tensor offset when
+    transformers dispatches 4-bit params through CPU/disk. Patch to materialize a CPU scalar.
+    """
+    global _BNB_QUANT_STATE_PATCHED
+    if _BNB_QUANT_STATE_PATCHED:
+        return
+    try:
+        import bitsandbytes as bnb
+    except ImportError:
+        return
+    qcls = getattr(getattr(bnb, "functional", None), "QuantState", None)
+    if qcls is None or getattr(qcls, "_hf_meta_item_patched", False):
+        return
+    orig_as_dict = qcls.as_dict
+
+    def _patched_as_dict(self, *args: Any, **kwargs: Any):
+        try:
+            return orig_as_dict(self, *args, **kwargs)
+        except RuntimeError as exc:
+            if "meta tensors" not in str(exc).lower() or not hasattr(self, "offset"):
+                raise
+            off = getattr(self, "offset")
+            if not (isinstance(off, torch.Tensor) and getattr(off, "is_meta", False)):
+                raise
+            tmp = torch.zeros((), dtype=off.dtype if off.dtype is not None else torch.float32)
+            self.offset = tmp
+            try:
+                return orig_as_dict(self, *args, **kwargs)
+            finally:
+                self.offset = off
+
+    qcls.as_dict = _patched_as_dict  # type: ignore[assignment]
+
+    def _tensor_to_device(t: Any, device: Any) -> Any:
+        if not isinstance(t, torch.Tensor):
+            return t
+        if getattr(t, "is_meta", False):
+            return t
+        return t.to(device)
+
+    def _patched_to(self, device: Any) -> None:
+        self.code = _tensor_to_device(self.code, device)
+        self.absmax = _tensor_to_device(self.absmax, device)
+        if self.nested:
+            self.offset = _tensor_to_device(self.offset, device)
+            self.state2.absmax = _tensor_to_device(self.state2.absmax, device)
+            self.state2.code = _tensor_to_device(self.state2.code, device)
+
+    qcls.to = _patched_to  # type: ignore[assignment]
+    qcls._hf_meta_item_patched = True
+    qcls._hf_meta_to_patched = True
+    _BNB_QUANT_STATE_PATCHED = True
+
+
+def _patch_transformers_skip_allocator_warmup() -> None:
+    """Skip post-load cudaMalloc warmup (OOMs on 44GB GPUs when MoE+BnB fills VRAM)."""
+    if os.environ.get("HF_SKIP_ALLOCATOR_WARMUP", "").lower() not in ("1", "true", "yes"):
+        return
+    try:
+        import transformers.modeling_utils as mu
+    except ImportError:
+        return
+    if getattr(mu, "_hf_skip_warmup_patched", False):
+        return
+
+    def _noop_warmup(*_args: Any, **_kwargs: Any) -> None:
+        print("[HF] Skipping caching_allocator_warmup (HF_SKIP_ALLOCATOR_WARMUP=1).")
+
+    mu.caching_allocator_warmup = _noop_warmup  # type: ignore[assignment]
+    mu._hf_skip_warmup_patched = True
+
+
 def _patch_transformers_remote_code_compat() -> None:
     """
     Transformers 5.x removed helpers that older Hub `trust_remote_code` modules still import
@@ -157,11 +330,21 @@ def get_hf_model_and_tokenizer(
     use_4bit: bool = False,
 ) -> tuple[Any, Any]:
     native_mxfp4 = _is_native_mxfp4_checkpoint(model_id)
+    prequantized = _is_prequantized_hub_checkpoint(model_id)
+    mid = model_id.lower()
+    prequantized_bnb = prequantized and any(
+        tag in mid
+        for tag in ("bnb-4bit", "bnb_4bit", "bnb-fp4", "bnb-4b-fused", "bnb-4b", "4b-fused")
+    )
     use_bnb = (
         use_4bit
         and torch.cuda.is_available()
         and not native_mxfp4
+        and not prequantized
     )
+    if prequantized and use_4bit:
+        qm = _hub_quant_method(model_id) or ("bnb" if prequantized_bnb else "hub")
+        print(f"[HF] Pre-quantized checkpoint ({qm}); loading without BitsAndBytesConfig.")
     if use_4bit and native_mxfp4:
         print(
             "[HF] This checkpoint uses native MXFP4 on the Hub; loading without bitsandbytes "
@@ -175,11 +358,16 @@ def get_hf_model_and_tokenizer(
         "true",
         "yes",
     )
-    slot_suffix = (
-        "mxfp4_cpu"
-        if mxfp4_on_cpu
-        else ("mxfp4" if native_mxfp4 else ("bnb4" if use_bnb else "fp"))
-    )
+    if mxfp4_on_cpu:
+        slot_suffix = "mxfp4_cpu"
+    elif native_mxfp4:
+        slot_suffix = "mxfp4"
+    elif prequantized:
+        slot_suffix = "gptq" if "gptq" in mid or "gptq" in _hub_quant_method(model_id) else "pq4"
+    elif use_bnb:
+        slot_suffix = "bnb4"
+    else:
+        slot_suffix = "fp"
     trust_rc = _trust_remote_code_for_model(model_id)
     tr_tag = "trc1" if trust_rc else "trc0"
     slot = f"{cache_key}:{slot_suffix}:{tr_tag}"
@@ -187,6 +375,10 @@ def get_hf_model_and_tokenizer(
         return _CACHE[slot]
 
     _patch_transformers_remote_code_compat()
+    _patch_transformers_skip_allocator_warmup()
+    _patch_bnb_quantizer_cpu_offload_validate()
+    _patch_bitsandbytes_params_compat()
+    _patch_bitsandbytes_quant_state_meta_item()
     log_gpu_status(f"loading HF model_id={model_id!r} cache={slot!r}")
     if not trust_rc:
         print(
@@ -194,8 +386,24 @@ def get_hf_model_and_tokenizer(
             "Set QWEN_HF_TRUST_REMOTE_CODE=1 if your checkpoint needs custom Hub code."
         )
 
-    tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=trust_rc)
-    device_map = os.environ.get("HF_DEVICE_MAP", "auto")
+    tok_id = os.environ.get("HF_TOKENIZER_MODEL_ID", "").strip() or model_id
+    if tok_id != model_id:
+        print(f"[HF] Tokenizer from {tok_id!r} (weights from {model_id!r}).")
+    tok_kw: dict[str, Any] = {"trust_remote_code": trust_rc}
+    if os.environ.get("HF_LOCAL_FILES_ONLY", "").lower() in ("1", "true", "yes"):
+        tok_kw["local_files_only"] = True
+    tok = AutoTokenizer.from_pretrained(tok_id, **tok_kw)
+    device_map = os.environ.get("HF_DEVICE_MAP", "").strip() or "auto"
+    max_mem_env = os.environ.get("HF_MAX_MEMORY", "").strip()
+    if (
+        prequantized
+        and use_4bit
+        and not native_mxfp4
+        and device_map == "auto"
+        and not max_mem_env
+    ):
+        device_map = "cuda:0"
+        print("[HF] Pre-quantized model: default device_map='cuda:0' (L40S 44GB).")
     if mxfp4_on_cpu:
         device_map = "cpu"
         print(
@@ -213,11 +421,19 @@ def get_hf_model_and_tokenizer(
                 "wheel that matches your driver. Override with HF_DEVICE_MAP if needed."
             )
 
+    low_cpu_mem_usage = os.environ.get("HF_LOW_CPU_MEM_USAGE", "1").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
     load_kw: dict[str, Any] = {
         "trust_remote_code": trust_rc,
         "device_map": device_map,
-        "low_cpu_mem_usage": True,
+        "low_cpu_mem_usage": low_cpu_mem_usage,
     }
+    if os.environ.get("HF_LOCAL_FILES_ONLY", "").lower() in ("1", "true", "yes"):
+        load_kw["local_files_only"] = True
+        print("[HF] local_files_only=True (use existing hub cache; no re-download).")
 
     if use_bnb:
         print("[HF] Using bitsandbytes 4-bit (NF4) load.")
@@ -242,11 +458,31 @@ def get_hf_model_and_tokenizer(
     if not use_bnb and not native_mxfp4:
         load_kw["dtype"] = _dtype()
 
+    max_mem_env = os.environ.get("HF_MAX_MEMORY", "").strip()
+    if max_mem_env:
+        max_memory: dict[str, str] = {}
+        for part in max_mem_env.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            key, _, val = part.partition(":")
+            key = key.strip()
+            val = val.strip()
+            if key.isdigit():
+                max_memory[int(key)] = val
+            else:
+                max_memory[key] = val
+        if max_memory:
+            load_kw["max_memory"] = max_memory
+            print(f"[HF] max_memory={max_memory}")
+
     dm = str(device_map).strip().lower()
     if dm == "auto":
         offload = _default_offload_folder()
         Path(offload).mkdir(parents=True, exist_ok=True)
         load_kw["offload_folder"] = offload
+    elif dm.startswith("cuda"):
+        load_kw.pop("offload_folder", None)
 
     # Attention: GPT-OSS stability; CPU-only: avoid flash/triton import paths in Qwen2 etc.
     # ("Could not import module 'Qwen2ForCausalLM'" often masks a failed flash/triton dep).
@@ -308,7 +544,51 @@ def get_hf_model_and_tokenizer(
 
     if model is None and load_error is not None:
         blob = _aggregate_exception_text(load_error)
-        if used_bnb and (
+        if used_bnb and "_is_hf_initialized" in blob:
+            print(
+                "[HF] BnB Params4bit/Int8Params rejected _is_hf_initialized "
+                "(transformers 5.x + bitsandbytes <0.50); retrying after compat patch."
+            )
+            _patch_bitsandbytes_params_compat()
+            load_error = None
+            try:
+                model = AutoModelForCausalLM.from_pretrained(model_id, **load_kw)
+            except Exception as exc2:
+                load_error = exc2
+        if model is None and load_error is not None:
+            blob = _aggregate_exception_text(load_error)
+        if (
+            model is None
+            and load_error is not None
+            and used_bnb
+            and ("meta tensor" in blob or "cannot be called on meta tensors" in blob)
+            and os.environ.get("HF_BNB_META_RETRY_CUDA0", "0").lower() in ("1", "true", "yes")
+        ):
+            print(
+                "[HF] BnB load hit meta-tensor dispatch; retrying on cuda:0 without CPU offload "
+                "(set HF_BNB_META_RETRY_CUDA0=0 to disable)."
+            )
+            load_kw.pop("offload_folder", None)
+            load_kw.pop("max_memory", None)
+            load_kw["device_map"] = "cuda:0"
+            if load_kw.get("quantization_config") is not None:
+                qc = load_kw["quantization_config"]
+                if hasattr(qc, "llm_int8_enable_fp32_cpu_offload"):
+                    qc.llm_int8_enable_fp32_cpu_offload = False
+            import gc
+
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+            load_error = None
+            try:
+                model = AutoModelForCausalLM.from_pretrained(model_id, **load_kw)
+            except Exception as exc2:
+                load_error = exc2
+        if model is None and load_error is not None:
+            blob = _aggregate_exception_text(load_error)
+        if model is None and load_error is not None and used_bnb and (
             "qwen2forcausallm" in blob
             or "could not import module" in blob
             or "register_constant" in blob

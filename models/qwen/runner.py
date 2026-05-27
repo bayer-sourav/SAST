@@ -15,6 +15,7 @@ from __future__ import annotations
 import inspect
 import json
 import os
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -92,12 +93,47 @@ def _resolve_ids(profile: str) -> tuple[str, str]:
             "unsloth/Qwen3-Coder-30B-A3B-Instruct",
         )
         h = os.environ.get("QWEN3_CODER_30B_HF_MODEL_ID", "Qwen/Qwen3-Coder-30B-A3B-Instruct")
+        local = os.environ.get("QWEN3_CODER_LOCAL_SNAPSHOT", "").strip()
+        use_local = os.environ.get("QWEN3_CODER_USE_LOCAL_SNAPSHOT", "0").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        if not local and use_local:
+            hub = Path.home() / ".cache/huggingface/hub/models--unsloth--qwen3-coder-30b-a3b-instruct/snapshots"
+            if hub.is_dir():
+                snaps = sorted(p for p in hub.iterdir() if p.is_dir())
+                if snaps:
+                    local = str(snaps[-1])
+        if use_local and local and Path(local).is_dir():
+            h = local
+            print(f"[Qwen] coder_30b HF path={local!r}", flush=True)
         return u, h
     raise ValueError(f"unknown Qwen profile {profile!r}")
 
 
 def _hf_cache_key(profile: str) -> str:
     return f"qwen_hf:{profile}"
+
+
+def preload_qwen_profile(profile: str, *, use_4bit: bool = True) -> None:
+    """Eager HF/Unsloth load so batch cells do not retry load on every case after a failure."""
+    unsloth_id, hf_id = _resolve_ids(profile)
+    skip_unsloth = os.environ.get("QWEN3_CODER_SKIP_UNSLOTH", "0").lower() in ("1", "true", "yes")
+    if profile == "qwen3_coder_30b_bnb" and skip_unsloth:
+        from core.hf_backend import get_hf_model_and_tokenizer
+
+        get_hf_model_and_tokenizer(hf_id, cache_key=_hf_cache_key(profile), use_4bit=use_4bit)
+        print(f"[preload] HF ready for {profile!r}", flush=True)
+        return
+    if torch.cuda.is_available():
+        _load_unsloth(use_4bit=use_4bit, unsloth_model_id=unsloth_id)
+        print(f"[preload] Unsloth ready for {profile!r}", flush=True)
+        return
+    from core.hf_backend import get_hf_model_and_tokenizer
+
+    get_hf_model_and_tokenizer(hf_id, cache_key=_hf_cache_key(profile), use_4bit=use_4bit)
+    print(f"[preload] HF (CPU) ready for {profile!r}", flush=True)
 
 
 def _hf_generate(
@@ -130,19 +166,30 @@ def _load_unsloth(*, use_4bit: bool, unsloth_model_id: str) -> tuple[Any, Any]:
         _drop_qwen_weights()
 
     try:
+        from core.hf_backend import _patch_bnb_quantizer_cpu_offload_validate
+
+        _patch_bnb_quantizer_cpu_offload_validate()
         import unsloth  # noqa: F401 - ensure patches before FastLanguageModel (lazy path)
         from unsloth import FastLanguageModel  # type: ignore[import-not-found]
     except (ImportError, AttributeError, NameError, NotImplementedError) as exc:
         raise ImportError(f"Unsloth not usable on this device: {exc}") from exc
 
     log_gpu_status("Qwen Unsloth")
-    max_seq = int(os.environ.get("QWEN_MAX_SEQ_LEN", "32768"))
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=unsloth_model_id,
-        max_seq_length=max_seq,
-        dtype=None,
-        load_in_4bit=use_4bit,
-    )
+    if "coder" in unsloth_model_id.lower() or "30b" in unsloth_model_id.lower():
+        max_seq = int(os.environ.get("QWEN_CODER_MAX_SEQ_LEN", "4096"))
+    else:
+        max_seq = int(os.environ.get("QWEN_MAX_SEQ_LEN", "32768"))
+    unsloth_kw: dict[str, Any] = {
+        "model_name": unsloth_model_id,
+        "max_seq_length": max_seq,
+        "dtype": None,
+        "load_in_4bit": use_4bit,
+    }
+    dm = os.environ.get("UNSLOTH_DEVICE_MAP", "").strip()
+    if dm:
+        unsloth_kw["device_map"] = dm
+        print(f"[Qwen] Unsloth device_map={dm!r}", flush=True)
+    model, tokenizer = FastLanguageModel.from_pretrained(**unsloth_kw)
     FastLanguageModel.for_inference(model)
     _MODEL, _TOKENIZER = model, tokenizer
     _LOADED_4BIT = use_4bit
@@ -361,6 +408,27 @@ def generate_from_chat_messages(
     norm = _normalize_chat_messages(messages)
     norm = _prepare_messages_for_thinking(norm, profile, enable_thinking=enable_thinking)
     unsloth_id, hf_id = _resolve_ids(profile)
+
+    # MoE 30B: prefer Unsloth 4-bit when allowed; else HF BnB on cuda:0 (see phase1_cell_env.sh).
+    skip_unsloth = os.environ.get("QWEN3_CODER_SKIP_UNSLOTH", "0").lower() in ("1", "true", "yes")
+    if profile == "qwen3_coder_30b_bnb" and skip_unsloth:
+        os.environ.setdefault("HF_LOCAL_FILES_ONLY", "1")
+        if tools:
+            return _hf_generate_with_template(
+                hf_id,
+                cache_key=_hf_cache_key(profile),
+                messages=norm,
+                tools=tools,
+                use_4bit=use_4bit,
+                enable_thinking=enable_thinking,
+                profile=profile,
+            )
+        return _hf_generate(
+            hf_id,
+            _messages_str_only(norm),
+            use_4bit=use_4bit,
+            cache_key=_hf_cache_key(profile),
+        )
 
     if not torch.cuda.is_available():
         print(

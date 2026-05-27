@@ -4,16 +4,6 @@ from __future__ import annotations
 
 from typing import Any
 
-# Ascending parameter size (Phase 1 matrix order).
-PHASE1_PROFILES: tuple[str, ...] = (
-    "qwen3_4b_bnb",
-    "qwen3_8b_bnb",
-    "google_gemma_3_12b_it",
-    "qwen3_14b_bnb",
-    "gpt_oss_20b",
-    "qwen3_coder_30b_bnb",
-)
-
 QWEN_PROFILES = frozenset(
     {
         "2_5_7b",
@@ -36,6 +26,29 @@ def profile_family(profile: str) -> str:
         return "gpt_oss"
     raise ValueError(
         f"unknown profile {profile!r}; expected one of {sorted(QWEN_PROFILES | GEMMA_PROFILES | GPT_PROFILES)}"
+    )
+
+
+def preload_profile(profile: str, *, use_4bit: bool = True) -> None:
+    """Load model weights once before a batch cell (fails fast instead of per-case retry)."""
+    family = profile_family(profile)
+    print(f"[preload] warming profile={profile!r} (family={family})", flush=True)
+    if family == "qwen":
+        from models.qwen.runner import preload_qwen_profile
+
+        preload_qwen_profile(profile, use_4bit=use_4bit)
+        return
+    if family == "gemma":
+        from core.gemma3_hf_backend import get_hf_model_and_tokenizer as gemma_load
+
+        gemma_load("google/gemma-3-12b-it", cache_key="gemma_preload", use_4bit=use_4bit)
+        return
+    from core.hf_backend import get_hf_model_and_tokenizer
+
+    get_hf_model_and_tokenizer(
+        "openai/gpt-oss-20b",
+        cache_key="gpt_oss_preload",
+        use_4bit=use_4bit,
     )
 
 
