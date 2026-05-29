@@ -1,6 +1,34 @@
 # Phase 1 replication runbook
 
-Reproduce the Phase 1 matrix: **50 FP + 50 TP** cases (seed **42**), **5 model profiles** × **thinking off/on**, zero-shot triage.
+## Stage 2 (full corpora + borderline)
+
+**904 FP + 1,373 TP + 200 borderline** · **Qwen 4B/8B/14B** · **thinking off only** · seed **42**
+
+**Labels:** unified prompt via `benchmark/make_task.py` — model outputs **`TP | FP | BL | UNKNOWN`**.  
+Stage 1 artifacts (`FP-runs/phase1_n50/`, `TP-runs/phase1_n50/`) stay **frozen** on the old **3-label** setup; do not mix metrics across stages.
+
+```bash
+bash benchmark/setup_corpora.sh
+uv run python benchmark/build_borderline_cases.py   # if borderline dir missing
+nohup bash benchmark/phases/phase1/stage2/run_phase1_stage2.sh \
+  >> runs/phase1/stage2/logs/master.log 2>&1 &
+uv run python benchmark/phases/phase1/stage2/status_stage2.py
+```
+
+Smoke (3 cases per cell): `PHASE1_STAGE2_SMOKE_MAX=3 bash benchmark/phases/phase1/stage2/run_phase1_stage2.sh`
+
+Fill missing/failed cases (parse errors, no JSON):  
+`uv run python benchmark/phases/phase1/stage2/finish_gaps.py --attempts 3`  
+Refresh summaries only: `bash benchmark/phases/phase1/stage2/refresh_summaries.sh`
+
+Details: [`phases/phase1/stage2/PLAN.md`](phases/phase1/stage2/PLAN.md)
+
+---
+
+## Stage 1 matrix (frozen archive)
+
+Reproduce the Phase 1 matrix: **50 FP + 50 TP** cases (seed **42**), **5 model profiles** × **thinking off/on**, zero-shot triage.  
+**Labels:** **`TP | FP | UNKNOWN` only** (track-specific prompts). Keep as historical baseline; new work uses Stage 2+ **4-label** runs under `runs/phase1/stage2/`.
 
 | Profile | Notes |
 |---------|--------|
@@ -23,7 +51,7 @@ uv sync
 
 Layout (siblings of `SAST/`):
 
-- `SAST-Paper-Artifacts/` — `Evaluation Framework/make_task.py`
+- `benchmark/make_task.py` — unified triage prompt (labels: TP, FP, BL, UNKNOWN)
 - `BenchmarkJava/` — OWASP Benchmark sources (auto-detected as `../BenchmarkJava` when present)
 
 Hardware: **one GPU** per job (e.g. NVIDIA L40S 44GB). Run **one profile cell at a time**; do not parallelize two model loads on the same GPU.

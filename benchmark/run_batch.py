@@ -10,12 +10,14 @@ import sys
 import time
 from pathlib import Path
 
-VALID_LABELS = frozenset({"TP", "FP", "UNKNOWN"})
+_sast_root = Path(__file__).resolve().parent.parent
+if str(_sast_root) not in sys.path:
+    sys.path.insert(0, str(_sast_root))
+from benchmark.triage_labels import VALID_LABELS  # noqa: E402
 
 
-def _case_id(eval_fw: Path, case_path: Path) -> str:
-    sys.path.insert(0, str(eval_fw))
-    from make_task import stable_case_id  # type: ignore[import-not-found]
+def _case_id(case_path: Path) -> str:
+    from benchmark.make_task import stable_case_id
 
     case = json.loads(case_path.read_text(encoding="utf-8"))
     return stable_case_id(case)
@@ -110,7 +112,7 @@ def _main() -> None:
     )
     ap.add_argument(
         "--gold",
-        choices=("FP", "TP"),
+        choices=("FP", "TP", "BL"),
         default=None,
         help="Gold label for --retry-wrong and passed to run_llm_local.py",
     )
@@ -135,8 +137,8 @@ def _main() -> None:
 
     sast_root = Path(__file__).resolve().parent.parent
     bench = Path(__file__).resolve().parent
-    eval_fw = args.eval_framework or (sast_root.parent / "SAST-Paper-Artifacts" / "Evaluation Framework")
-    eval_fw = eval_fw.expanduser().resolve()
+    if args.eval_framework:
+        print("[batch] warning: --eval-framework is deprecated; using benchmark/make_task.py", flush=True)
     if str(bench) not in sys.path:
         sys.path.insert(0, str(bench))
     import repo_root as _repo  # noqa: E402
@@ -195,7 +197,7 @@ def _main() -> None:
                 print(f"[batch] preload failed ({exc}); cases will attempt load anyway.", flush=True)
 
     for case_path in files:
-        cid = _case_id(eval_fw, case_path)
+        cid = _case_id(case_path)
         model_key = args.profile if args.agent == "llm" else args.llm_model
         run_dir = runs_root / _safe_model_dir(model_key) / args.agent / cid
         result_path = run_dir / "agent-llm-triage-result.json"
@@ -245,7 +247,6 @@ def _main() -> None:
                 profile=args.profile,
                 run_dir=run_dir,
                 sast_root=sast_root,
-                eval_fw=eval_fw,
                 gold=args.gold,
                 thinking=args.thinking,
                 repo=repo,
@@ -262,8 +263,6 @@ def _main() -> None:
                 str(repo),
                 "--profile",
                 args.profile,
-                "--eval-framework",
-                str(eval_fw),
                 "--run-dir",
                 str(run_dir),
             ]
@@ -282,8 +281,6 @@ def _main() -> None:
                 str(case_path),
                 "--repo",
                 str(repo),
-                "--eval-framework",
-                str(eval_fw),
                 "--llm-model",
                 args.llm_model,
                 "--llm-provider",

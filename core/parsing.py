@@ -319,14 +319,14 @@ def extract_json_object(text: str) -> dict:
         raise ValueError(f"Invalid JSON between first '{{' and last '}}': {exc}") from exc
 
 
-_TRIAGE_LABELS = frozenset({"TP", "FP", "UNKNOWN"})
+_TRIAGE_LABELS = frozenset({"TP", "FP", "BL", "UNKNOWN"})
 
 
 def extract_triage_result(text: str) -> dict:
     """
     Parse SAST triage JSON from model output.
 
-    Prefer the last valid object with label TP|FP|UNKNOWN (models may emit draft JSON
+    Prefer the last valid object with label TP|FP|BL|UNKNOWN (models may emit draft JSON
     inside thinking blocks and a final JSON after).
     """
     cleaned = _strip_redacted_thinking((text or "").strip())
@@ -373,7 +373,28 @@ def extract_triage_result(text: str) -> dict:
     if candidates:
         return candidates[-1]
 
-    return extract_json_object(text)
+    m = re.search(
+        r'"label"\s*:\s*"(TP|FP|BL|UNKNOWN)"',
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    if m:
+        return {
+            "label": m.group(1).upper(),
+            "confidence": "low",
+            "confidence_score": 0.5,
+            "reason": "Recovered label via regex fallback (malformed JSON in model output).",
+            "evidence": [],
+        }
+
+    fallback = extract_json_object(text)
+    lbl = str(fallback.get("label", "")).strip().upper()
+    if lbl not in _TRIAGE_LABELS:
+        raise ValueError(
+            f"No valid triage JSON object found with label in {sorted(_TRIAGE_LABELS)}"
+        )
+    fallback["label"] = lbl
+    return fallback
 
 
 def _raw_preview(text: str, *, limit: int = 2000) -> str:

@@ -1,0 +1,464 @@
+# SAST Unified Security Triage (unified-4label-v1)
+
+## Context
+- **case_id**: `BenchmarkTest01850`
+- **repo_root (host)**: `/home/ec2-user/Projects/BenchmarkJava`
+- **scan_root (relative)**: `.`
+
+## Environment notes
+- You are a pure LLM baseline with no tools.
+- You cannot execute commands; rely solely on the provided prompt text.
+- Do NOT request edits or additional interactions.
+- OUTPUT the JSON result only, with no extra text. You may reason internally first.
+
+
+## Your task
+You are a **security-oriented code reviewer** triaging **one SAST finding** (CodeQL or similar).
+Treat tool messages and raw output as hints only; base your decision on the **shown source** and data/control flow on the **reported path**.
+
+Classify the finding using **exactly one** label:
+
+- **TP** — A **real vulnerability** exists on the reported path (user-controlled or unsafe data can reach a dangerous sink: XSS, injection, path traversal, etc.).
+- **FP** — **Not** a real vulnerability on the reported path (effective mitigation on that path, unreachable code, wrong sink, hardcoded safe value, benign API use).
+- **BL** — **Borderline / ambiguous**: sanitization or encoding may exist but is **incomplete**, on the **wrong path**, or **bypassable**; reasonable reviewers could disagree between TP and FP. Use BL when you cannot defend a clear TP or FP with code evidence.
+- **UNKNOWN** — **Insufficient information** in the snippet to decide (missing file, unclear flow). Do not use UNKNOWN when the shown code is enough to choose TP, FP, or BL.
+
+Output a single JSON object matching this schema:
+
+{
+  "label": "TP|FP|BL|UNKNOWN",
+  "confidence": "high|medium|low",
+  "confidence_score": 0.0,
+  "reason": "short explanation grounded in concrete code evidence",
+  "evidence": [
+    {
+      "file": "path/relative/to/repo",
+      "lines": "Lx-Ly",
+      "note": "what this shows"
+    }
+  ],
+  "agent": "swe-agent|openhands|aider|llm",
+  "case_id": "string"
+}
+
+### Rules (strict)
+1. **READ-ONLY**: Do not edit files or request patches.
+2. Inspect the reported file and lines; follow data flow to the sink referenced by the alert.
+3. Do **not** rely on the SAST message alone; verify impact on the reported path.
+4. Do **not** default to TP or FP; use **BL** when both TP and FP are defensible.
+5. `label` must be exactly **TP**, **FP**, **BL**, or **UNKNOWN**.
+6. `evidence` must include at least one item when label is TP, FP, or BL.
+7. Output **one JSON object only** — no markdown fences, no prose before or after.
+8. Escape inner double quotes in JSON string values, or use backticks inside values.
+
+## Inputs
+
+### File
+/**
+ * OWASP Benchmark Project v1.2
+ *
+ * <p>This file is part of the Open Web Application Security Project (OWASP) Benchmark Project. For
+ * details, please see <a
+ * href="https://owasp.org/www-project-benchmark/">https://owasp.org/www-project-benchmark/</a>.
+ *
+ * <p>The OWASP Benchmark is free software: you can redistribute it and/or modify it under the terms
+ * of the GNU General Public License as published by the Free Software Foundation, version 2.
+ *
+ * <p>The OWASP Benchmark is distributed in the hope that it will be useful, but WITHOUT ANY
+ * WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR
+ * PURPOSE. See the GNU General Public License for more details.
+ *
+ * @author Nick Sanidas
+ * @created 2015
+ */
+package org.owasp.benchmark.testcode;
+
+import java.io.IOException;
+import javax.servlet.ServletException;
+import javax.servlet.annotation.WebServlet;
+import javax.servlet.http.HttpServlet;
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
+
+@WebServlet(value = "/cmdi-02/BenchmarkTest01850")
+public class BenchmarkTest01850 extends HttpServlet {
+
+    private static final long serialVersionUID = 1L;
+
+    @Override
+    public void doGet(HttpServletRequest request, HttpServletResponse response)
+            throws ServletException, IOException {
+        response.setContentType("text/html;charset=UTF-8");
+        javax.servlet.http.Cookie userCookie =
+                new javax.servlet.http.Cookie("BenchmarkTest01850", "ECHOOO");
+        userCookie.setMaxAge(60 * 3); // Store cookie for 3 minutes
+        userCookie.setSecure(true);
+        userCookie.setHttpOnly(true);
+        userCookie.setPath(request.getRequestURI());
+        userCookie.setDomain(new java.net.URL(request.getRequestURL().toString()).getHost());
+        response.addCookie(userCookie);
+        javax.servlet.RequestDispatcher rd =
+                request.getRequestDispatcher("/cmdi-02/BenchmarkTest01850.html");
+        rd.include(request, response);
+    }
+
+    @Override
+    public void doPost(HttpServletRequest request, HttpServletResponse response)
+            throws ServletException, IOException {
+        response.setContentType("text/html;charset=UTF-8");
+
+        javax.servlet.http.Cookie[] theCookies = request.getCookies();
+
+        String param = "noCookieValueSupplied";
+        if (theCookies != null) {
+            for (javax.servlet.http.Cookie theCookie : theCookies) {
+                if (theCookie.getName().equals("BenchmarkTest01850")) {
+                    param = java.net.URLDecoder.decode(theCookie.getValue(), "UTF-8");
+                    break;
+                }
+            }
+        }
+
+        String bar = doSomething(request, param);
+
+        java.util.List<String> argList = new java.util.ArrayList<String>();
+
+        String osName = System.getProperty("os.name");
+        if (osName.indexOf("Windows") != -1) {
+            argList.add("cmd.exe");
+            argList.add("/c");
+        } else {
+            argList.add("sh");
+            argList.add("-c");
+        }
+        argList.add("echo " + bar);
+
+        ProcessBuilder pb = new ProcessBuilder(argList);
+
+        try {
+            Process p = pb.start();
+            org.owasp.benchmark.helpers.Utils.printOSCommandResults(p, response);
+        } catch (IOException e) {
+            System.out.println(
+                    "Problem executing cmdi - java.lang.ProcessBuilder(java.util.List) Test Case");
+            throw new ServletException(e);
+        }
+    } // end doPost
+
+    private static String doSomething(HttpServletRequest request, String param)
+            throws ServletException, IOException {
+
+        String bar;
+
+        // Simple ? condition that assigns param to bar on false condition
+        int num = 106;
+
+        bar = (7 * 42) - num > 200 ? "This should never happen" : param;
+
+        return bar;
+    }
+}
+
+
+### Finding (raw)
+{
+  "tool": [
+    "CodeQL"
+  ],
+  "file": "src/main/java/org/owasp/benchmark/testcode/BenchmarkTest01850.java",
+  "scan_root": ".",
+  "raw_output": {
+    "CodeQL": [
+      {
+        "ruleId": "java/command-line-injection",
+        "ruleIndex": 33,
+        "rule": {
+          "id": "java/command-line-injection",
+          "index": 33
+        },
+        "message": {
+          "text": "This command line depends on a [user-provided value](1)."
+        },
+        "locations": [
+          {
+            "physicalLocation": {
+              "artifactLocation": {
+                "uri": "src/main/java/org/owasp/benchmark/testcode/BenchmarkTest01850.java",
+                "uriBaseId": "%SRCROOT%",
+                "index": 285
+              },
+              "region": {
+                "startLine": 79,
+                "startColumn": 48,
+                "endColumn": 55
+              }
+            }
+          }
+        ],
+        "partialFingerprints": {
+          "primaryLocationLineHash": "3b396bbdf125810f:1",
+          "primaryLocationStartColumnFingerprint": "39"
+        },
+        "codeFlows": [
+          {
+            "threadFlows": [
+              {
+                "locations": [
+                  {
+                    "location": {
+                      "physicalLocation": {
+                        "artifactLocation": {
+                          "uri": "src/main/java/org/owasp/benchmark/testcode/BenchmarkTest01850.java",
+                          "uriBaseId": "%SRCROOT%",
+                          "index": 285
+                        },
+                        "region": {
+                          "startLine": 59,
+                          "startColumn": 56,
+                          "endColumn": 76
+                        }
+                      },
+                      "message": {
+                        "text": "getValue(...) : String"
+                      }
+                    },
+                    "taxa": [
+                      {
+                        "index": 8,
+                        "toolComponent": {
+                          "index": 1
+                        },
+                        "properties": {
+                          "CodeQL/DataflowRole": "source"
+                        }
+                      }
+                    ]
+                  },
+                  {
+                    "location": {
+                      "physicalLocation": {
+                        "artifactLocation": {
+                          "uri": "src/main/java/org/owasp/benchmark/testcode/BenchmarkTest01850.java",
+                          "uriBaseId": "%SRCROOT%",
+                          "index": 285
+                        },
+                        "region": {
+                          "startLine": 59,
+                          "startColumn": 29,
+                          "endColumn": 86
+                        }
+                      },
+                      "message": {
+                        "text": "decode(...) : String"
+                      }
+                    },
+                    "taxa": [
+                      {
+                        "index": 2,
+                        "toolComponent": {
+                          "index": 1
+                        },
+                        "properties": {
+                          "CodeQL/DataflowRole": "step"
+                        }
+                      }
+                    ]
+                  },
+                  {
+                    "location": {
+                      "physicalLocation": {
+                        "artifactLocation": {
+                          "uri": "src/main/java/org/owasp/benchmark/testcode/BenchmarkTest01850.java",
+                          "uriBaseId": "%SRCROOT%",
+                          "index": 285
+                        },
+                        "region": {
+                          "startLine": 65,
+                          "startColumn": 43,
+                          "endColumn": 48
+                        }
+                      },
+                      "message": {
+                        "text": "param : String"
+                      }
+                    }
+                  },
+                  {
+                    "location": {
+                      "physicalLocation": {
+                        "artifactLocation": {
+                          "uri": "src/main/java/org/owasp/benchmark/testcode/BenchmarkTest01850.java",
+                          "uriBaseId": "%SRCROOT%",
+                          "index": 285
+                        },
+                        "region": {
+                          "startLine": 91,
+                          "startColumn": 67,
+                          "endColumn": 79
+                        }
+                      },
+                      "message": {
+                        "text": "param : String"
+                      }
+                    }
+                  },
+                  {
+                    "location": {
+                      "physicalLocation": {
+                        "artifactLocation": {
+                          "uri": "src/main/java/org/owasp/benchmark/testcode/BenchmarkTest01850.java",
+                          "uriBaseId": "%SRCROOT%",
+                          "index": 285
+                        },
+                        "region": {
+                          "startLine": 101,
+                          "startColumn": 16,
+                          "endColumn": 19
+                        }
+                      },
+                      "message": {
+                        "text": "bar : String"
+                      }
+                    }
+                  },
+                  {
+                    "location": {
+                      "physicalLocation": {
+                        "artifactLocation": {
+                          "uri": "src/main/java/org/owasp/benchmark/testcode/BenchmarkTest01850.java",
+                          "uriBaseId": "%SRCROOT%",
+                          "index": 285
+                        },
+                        "region": {
+                          "startLine": 65,
+                          "startColumn": 22,
+                          "endColumn": 49
+                        }
+                      },
+                      "message": {
+                        "text": "doSomething(...) : String"
+                      }
+                    }
+                  },
+                  {
+                    "location": {
+                      "physicalLocation": {
+                        "artifactLocation": {
+                          "uri": "src/main/java/org/owasp/benchmark/testcode/BenchmarkTest01850.java",
+                          "uriBaseId": "%SRCROOT%",
+                          "index": 285
+                        },
+                        "region": {
+                          "startLine": 77,
+                          "startColumn": 21,
+                          "endColumn": 34
+                        }
+                      },
+                      "message": {
+                        "text": "... + ... : String"
+                      }
+                    }
+                  },
+                  {
+                    "location": {
+                      "physicalLocation": {
+                        "artifactLocation": {
+                          "uri": "src/main/java/org/owasp/benchmark/testcode/BenchmarkTest01850.java",
+                          "uriBaseId": "%SRCROOT%",
+                          "index": 285
+                        },
+                        "region": {
+                          "startLine": 77,
+                          "startColumn": 9,
+                          "endColumn": 16
+                        }
+                      },
+                      "message": {
+                        "text": "argList [post update] : ArrayList [<element>] : String"
+                      }
+                    },
+                    "taxa": [
+                      {
+                        "index": 3,
+                        "toolComponent": {
+                          "index": 1
+                        },
+                        "properties": {
+                          "CodeQL/DataflowRole": "step"
+                        }
+                      }
+                    ]
+                  },
+                  {
+                    "location": {
+                      "physicalLocation": {
+                        "artifactLocation": {
+                          "uri": "src/main/java/org/owasp/benchmark/testcode/BenchmarkTest01850.java",
+                          "uriBaseId": "%SRCROOT%",
+                          "index": 285
+                        },
+                        "region": {
+                          "startLine": 79,
+                          "startColumn": 48,
+                          "endColumn": 55
+                        }
+                      },
+                      "message": {
+                        "text": "argList"
+                      }
+                    },
+                    "taxa": [
+                      {
+                        "index": 9,
+                        "toolComponent": {
+                          "index": 1
+                        },
+                        "properties": {
+                          "CodeQL/DataflowRole": "sink"
+                        }
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ],
+        "relatedLocations": [
+          {
+            "id": 1,
+            "physicalLocation": {
+              "artifactLocation": {
+                "uri": "src/main/java/org/owasp/benchmark/testcode/BenchmarkTest01850.java",
+                "uriBaseId": "%SRCROOT%",
+                "index": 285
+              },
+              "region": {
+                "startLine": 59,
+                "startColumn": 56,
+                "endColumn": 76
+              }
+            },
+            "message": {
+              "text": "user-provided value"
+            }
+          },
+          {
+            "physicalLocation": {
+              "artifactLocation": {
+                "uri": "src/main/java/org/owasp/benchmark/testcode/BenchmarkTest01850.java",
+                "uriBaseId": "%SRCROOT%",
+                "index": 285
+              },
+              "region": {
+                "startLine": 59,
+                "startColumn": 56,
+                "endColumn": 76
+              }
+            }
+          }
+        ]
+      }
+    ]
+  }
+}

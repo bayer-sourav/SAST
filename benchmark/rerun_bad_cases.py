@@ -6,9 +6,13 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import sys
 from pathlib import Path
 
-VALID_LABELS = frozenset({"TP", "FP", "UNKNOWN"})
+_sast = Path(__file__).resolve().parent.parent
+if str(_sast) not in sys.path:
+    sys.path.insert(0, str(_sast))
+from benchmark.triage_labels import VALID_LABELS  # noqa: E402
 
 
 def _needs_rerun(case_dir: Path) -> tuple[bool, str]:
@@ -90,7 +94,6 @@ def main() -> None:
     if args.dry_run or not to_run:
         return
 
-    eval_fw = (sast_root.parent / "SAST-Paper-Artifacts" / "Evaluation Framework").resolve()
     if str(sast_root) not in sys.path:
         sys.path.insert(0, str(sast_root))
     from benchmark.run_llm_local import run_triage_case  # noqa: E402
@@ -103,7 +106,6 @@ def main() -> None:
             profile=args.profile,
             run_dir=run_dir.resolve(),
             sast_root=sast_root,
-            eval_fw=eval_fw,
             gold=args.gold,
             thinking=args.thinking,
             quiet=True,

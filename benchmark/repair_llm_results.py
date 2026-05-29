@@ -35,7 +35,7 @@ def main() -> None:
             try:
                 existing = json.loads(out_path.read_text(encoding="utf-8"))
                 lbl = str(existing.get("label", "")).strip().upper()
-                if lbl in {"TP", "FP", "UNKNOWN"}:
+                if lbl in {"TP", "FP", "BL", "UNKNOWN"}:
                     continue
             except json.JSONDecodeError:
                 pass

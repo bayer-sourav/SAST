@@ -39,9 +39,8 @@ def _load_case(case_path: Path) -> Dict[str, Any]:
     return json.loads(case_path.read_text(encoding="utf-8"))
 
 
-def _ensure_case_id(case: Dict[str, Any], eval_fw: Path) -> str:
-    sys.path.insert(0, str(eval_fw))
-    from make_task import stable_case_id  # type: ignore[import-not-found]
+def _ensure_case_id(case: Dict[str, Any]) -> str:
+    from benchmark.make_task import stable_case_id
 
     return stable_case_id(case)
 
@@ -79,7 +78,7 @@ def _extract_last_json_object(text: str) -> Dict[str, Any]:
             obj, _ = decoder.raw_decode(chunk)
             if isinstance(obj, dict) and "label" in obj:
                 lbl = str(obj.get("label", "")).strip().upper()
-                if lbl in {"TP", "FP", "UNKNOWN"}:
+                if lbl in {"TP", "FP", "BL", "UNKNOWN"}:
                     obj["label"] = lbl
                     return obj
         except Exception:
@@ -158,10 +157,11 @@ def main() -> None:
     sast_root = Path(__file__).resolve().parent.parent
     eval_fw = args.eval_framework
     if eval_fw is None:
-        eval_fw = sast_root.parent / "SAST-Paper-Artifacts" / "Evaluation Framework"
+        eval_fw = sast_root / "benchmark"
     eval_fw = eval_fw.expanduser().resolve()
-    if not (eval_fw / "make_task.py").is_file():
-        raise SystemExit(f"make_task.py not found under {eval_fw}")
+    make_task = eval_fw / "make_task.py"
+    if not make_task.is_file():
+        raise SystemExit(f"make_task.py not found: {make_task}")
 
     case_path = args.case.expanduser().resolve()
     case = _load_case(case_path)
@@ -170,7 +170,7 @@ def main() -> None:
         sys.path.insert(0, str(_bench))
     import repo_root as _repo  # noqa: E402
 
-    case_id = _ensure_case_id(case, eval_fw)
+    case_id = _ensure_case_id(case)
     effective_scan_root = case.get("scan_root") or args.scan_root
     repo_root = _repo.resolve_benchmark_java_root(sast_root, case, args.repo)
     _require_repo_file(repo_root, case)
@@ -189,7 +189,7 @@ def main() -> None:
     subprocess.run(
         [
             sys.executable,
-            str(eval_fw / "make_task.py"),
+            str(make_task),
             "--case",
             str(case_path),
             "--repo",
@@ -205,6 +205,10 @@ def main() -> None:
     )
 
     config_src = eval_fw / "openhands_config.toml"
+    if not config_src.exists():
+        config_src = (
+            sast_root.parent / "SAST-Paper-Artifacts" / "Evaluation Framework" / "openhands_config.toml"
+        )
     if not config_src.exists():
         raise FileNotFoundError(f"Missing OpenHands config: {config_src}")
     (run_dir / "config.toml").write_text(config_src.read_text(encoding="utf-8"), encoding="utf-8")

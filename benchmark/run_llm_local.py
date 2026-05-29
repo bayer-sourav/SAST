@@ -13,45 +13,23 @@ from pathlib import Path
 from typing import Any
 
 AGENT_NAME = "llm"
+VALID_LABELS = frozenset({"TP", "FP", "BL", "UNKNOWN"})
 
+# Minimal system message; full triage policy lives in task.md (benchmark/make_task.py).
 _JSON_RULES = """Output requirements (strict):
 - After any internal reasoning, output EXACTLY ONE JSON object matching the schema in the user message.
-- Do NOT duplicate the JSON. Do NOT put JSON inside  or <think> blocks.
+- Do NOT duplicate the JSON. Do NOT put JSON inside redacted_thinking blocks.
 - No markdown code fences. No prose before or after the final JSON object.
 - Set "agent" to "llm" and "case_id" exactly as given in the task.
+- "label" must be one of: TP, FP, BL, UNKNOWN.
 - Use valid JSON only: double-quoted keys/strings; escape inner quotes with backslash.
 """
 
-_PROMPTS: dict[str, tuple[str, str]] = {
-    "FP": (
-        "You are a security-oriented code reviewer performing SAST false-positive triage.\n"
-        + _JSON_RULES
-        + "\nTriage policy:\n"
-        "- Label FP when the alert does NOT reflect a real vulnerability (sanitized input, dead code, wrong sink, benign API use).\n"
-        "- Label TP only if you can cite a concrete exploitable path in the shown code.\n"
-        "- Use UNKNOWN only if the snippet is insufficient; prefer FP or TP when the code is clear.\n",
-        "\n---\nFINAL OUTPUT: One JSON object only. "
-        'Prefer label "FP" when the CodeQL finding is a false alarm on this code.\n',
-    ),
-    "TP": (
-        "You are a security-oriented code reviewer performing SAST true-positive retention triage.\n"
-        + _JSON_RULES
-        + "\nTriage policy:\n"
-        "- These cases are from a known true-vulnerability benchmark: the alert usually reflects a real issue.\n"
-        "- Label TP when user-controlled or unsafe data can reach a dangerous sink (XSS, injection, path traversal, etc.).\n"
-        "- Label FP only with strong code proof (effective encoding, hardcoded safe values, unreachable path).\n"
-        "- Do not dismiss alerts merely because a helper exists; verify it is applied on the reported path.\n",
-        "\n---\nFINAL OUTPUT: One JSON object only. "
-        'Prefer label "TP" when the finding matches an exploitable pattern in the shown code.\n',
-    ),
-}
-
-
-def _prompts_for_gold(gold: str | None) -> tuple[str, str]:
-    key = (gold or "FP").strip().upper()
-    if key not in _PROMPTS:
-        key = "FP"
-    return _PROMPTS[key]
+_SYSTEM_PROMPT = (
+    "You are a security-oriented SAST triage assistant.\n"
+    + _JSON_RULES
+    + "\nFollow the triage policy and label definitions in the user message exactly.\n"
+)
 
 
 def _require_repo_file(repo_root: Path, case: dict[str, Any]) -> None:
@@ -74,6 +52,15 @@ def _extract_json_object(text: str) -> dict[str, Any]:
     return extract_triage_result(text)
 
 
+def _normalize_label(result: dict[str, Any]) -> dict[str, Any]:
+    lbl = str(result.get("label", "")).strip().upper()
+    if lbl not in VALID_LABELS:
+        raise ValueError(f"Invalid triage label: {lbl!r}")
+    out = dict(result)
+    out["label"] = lbl
+    return out
+
+
 def _ensure_paths(sast_root: Path) -> None:
     if str(sast_root) not in sys.path:
         sys.path.insert(0, str(sast_root))
@@ -85,7 +72,6 @@ def run_triage_case(
     profile: str,
     run_dir: Path,
     sast_root: Path,
-    eval_fw: Path,
     gold: str | None = None,
     thinking: bool = False,
     repo: Path | None = None,
@@ -95,28 +81,24 @@ def run_triage_case(
     """
     Run one triage case in-process (model stays loaded across calls in the same process).
 
-    Returns run_meta fields plus ``returncode`` (0 ok, 1 error).
+    ``gold`` is recorded in run_meta for the corpus track (FP/TP/BL); it does not change the prompt.
     """
     t_run_start = time.perf_counter()
     bench = Path(__file__).resolve().parent
-    if str(bench) not in sys.path:
-        sys.path.insert(0, str(bench))
+    if str(bench.parent) not in sys.path:
+        sys.path.insert(0, str(bench.parent))
     from timing import utc_now_iso  # noqa: E402
 
     started_at = utc_now_iso()
-    eval_fw = eval_fw.expanduser().resolve()
-    make_task = eval_fw / "make_task.py"
+    make_task = bench / "make_task.py"
     if not make_task.is_file():
-        raise FileNotFoundError(f"make_task.py not found under {eval_fw}")
+        raise FileNotFoundError(f"make_task.py not found: {make_task}")
 
     case_path = case_path.expanduser().resolve()
     case = json.loads(case_path.read_text(encoding="utf-8"))
-    if str(bench) not in sys.path:
-        sys.path.insert(0, str(bench))
     import repo_root as _repo  # noqa: E402
-
-    sys.path.insert(0, str(eval_fw))
-    from make_task import stable_case_id  # type: ignore[import-not-found]
+    from benchmark.make_task import stable_case_id  # noqa: E402
+    from benchmark.triage_labels import task_markdown_current  # noqa: E402
 
     case_id = stable_case_id(case)
     effective_scan_root = case.get("scan_root") or scan_root
@@ -143,7 +125,7 @@ def run_triage_case(
             "--out",
             str(task_path),
         ]
-        if task_path.is_file() and task_path.stat().st_size > 100:
+        if task_markdown_current(task_path):
             task_sec = 0.0
         else:
             last_err: str | None = None
@@ -161,10 +143,9 @@ def run_triage_case(
             task_sec = time.perf_counter() - t_task_start
 
         task_text = task_path.read_text(encoding="utf-8")
-        system_text, user_suffix = _prompts_for_gold(gold)
         messages: list[dict[str, str]] = [
-            {"role": "system", "content": system_text},
-            {"role": "user", "content": task_text + user_suffix},
+            {"role": "system", "content": _SYSTEM_PROMPT},
+            {"role": "user", "content": task_text},
         ]
 
         _ensure_paths(sast_root)
@@ -203,7 +184,7 @@ def run_triage_case(
         (run_dir / "llm_raw.txt").write_text(raw or "", encoding="utf-8")
 
         try:
-            result = _extract_json_object(raw)
+            result = _normalize_label(_extract_json_object(raw))
         except ValueError as parse_exc:
             if profile != "gpt_oss_20b":
                 raise
@@ -213,7 +194,7 @@ def run_triage_case(
                     "content": (
                         "Your previous reply did not include valid triage JSON. "
                         "Reply with EXACTLY ONE JSON object and no other text. "
-                        'Required keys: "label" (TP|FP|UNKNOWN), "confidence", '
+                        'Required keys: "label" (TP|FP|BL|UNKNOWN), "confidence", '
                         '"confidence_score", "reason", "evidence", "agent", "case_id".'
                     ),
                 }
@@ -222,16 +203,17 @@ def run_triage_case(
             inference_sec = time.perf_counter() - t_infer_start
             combined = (raw or "").rstrip() + "\n\n--- json_retry ---\n\n" + raw_retry
             (run_dir / "llm_raw.txt").write_text(combined, encoding="utf-8")
-            result = _extract_json_object(raw_retry)
-        result.setdefault("agent", AGENT_NAME)
-        result.setdefault("case_id", case_id)
+            result = _normalize_label(_extract_json_object(raw_retry))
+
+        result["agent"] = AGENT_NAME
+        result["case_id"] = case_id
         out_path = run_dir / f"agent-{AGENT_NAME}-triage-result.json"
         out_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
 
         elapsed_sec = time.perf_counter() - t_run_start
         gen = get_gen_meta()
-        inp_tok = gen.get("input_tokens", -1)
-        out_tok = gen.get("output_tokens", -1)
+        inp_tok = int(gen.get("input_tokens") or -1)
+        out_tok = int(gen.get("output_tokens") or -1)
         meta = {
             "profile": profile,
             "thinking": thinking,
@@ -252,16 +234,6 @@ def run_triage_case(
         if not quiet:
             print(json.dumps(result, ensure_ascii=False, indent=2))
             print(f"\n[{AGENT_NAME}] Wrote: {out_path}")
-            tok_msg = ""
-            if meta.get("total_tokens") is not None:
-                tok_msg = (
-                    f" tokens={meta['input_tokens']}+{meta['output_tokens']}"
-                    f"={meta['total_tokens']}"
-                )
-            print(
-                f"[timing] case={case_id} total={elapsed_sec:.1f}s "
-                f"inference={inference_sec:.1f}s task={task_sec:.1f}s{tok_msg}"
-            )
         return meta
     except Exception as exc:
         elapsed_sec = time.perf_counter() - t_run_start
@@ -285,9 +257,6 @@ def run_triage_case(
             for x in ("cuda", "acceleratorerror", "device-side assert", "out of memory")
         ):
             try:
-                bench = Path(__file__).resolve().parent
-                if str(bench) not in sys.path:
-                    sys.path.insert(0, str(bench))
                 from local_model_unload import release_gpu_memory
 
                 release_gpu_memory()
@@ -299,76 +268,38 @@ def run_triage_case(
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--case", required=True, type=Path)
-    ap.add_argument(
-        "--repo",
-        default=None,
-        help="BenchmarkJava root. If omitted, uses ../BenchmarkJava when it contains the case file.",
-    )
+    ap.add_argument("--repo", default=None)
     ap.add_argument("--scan-root", default=".")
-    ap.add_argument(
-        "--profile",
-        default="qwen3_8b_bnb",
-        help="Model profile (Qwen/Gemma/GPT-OSS; see benchmark/llm_generate.py).",
-    )
+    ap.add_argument("--profile", default="qwen3_8b_bnb")
     ap.add_argument("--run-dir", default=None, type=Path)
     ap.add_argument(
-        "--eval-framework",
-        type=Path,
-        default=None,
-        help="Folder containing make_task.py (default: ../SAST-Paper-Artifacts/Evaluation Framework)",
-    )
-    ap.add_argument(
         "--gold",
-        choices=("FP", "TP"),
+        choices=("FP", "TP", "BL"),
         default=None,
-        help="Corpus gold label: tunes triage policy (FP=false-positive filter, TP=retention).",
+        help="Corpus track for run_meta only (prompt is unified).",
     )
-    ap.add_argument(
-        "--thinking",
-        action="store_true",
-        help="Enable model chain-of-thought before final JSON (Qwen3; ignored on Gemma/GPT-OSS).",
-    )
+    ap.add_argument("--thinking", action="store_true")
     args = ap.parse_args()
 
     sast_root = Path(__file__).resolve().parent.parent
-    eval_fw = args.eval_framework
-    if eval_fw is None:
-        eval_fw = sast_root.parent / "SAST-Paper-Artifacts" / "Evaluation Framework"
-
     case_path = args.case.expanduser().resolve()
     case = json.loads(case_path.read_text(encoding="utf-8"))
-    bench = Path(__file__).resolve().parent
-    if str(bench) not in sys.path:
-        sys.path.insert(0, str(bench))
-    import repo_root as _repo  # noqa: E402
-
-    eval_fw = eval_fw.expanduser().resolve()
-    sys.path.insert(0, str(eval_fw))
-    from make_task import stable_case_id  # type: ignore[import-not-found]
+    from benchmark.make_task import stable_case_id  # noqa: E402
 
     case_id = stable_case_id(case)
-    repo_root = _repo.resolve_benchmark_java_root(sast_root, case, args.repo)
-    model_dir = args.profile.replace("/", "_")
-    run_dir = (
-        args.run_dir.expanduser().resolve()
-        if args.run_dir
-        else (Path.cwd() / "runs" / model_dir / AGENT_NAME / case_id)
-    )
-
+    run_dir = args.run_dir or Path(f"runs/llm/{args.profile}/{case_id}")
     meta = run_triage_case(
         case_path=case_path,
         profile=args.profile,
         run_dir=run_dir,
         sast_root=sast_root,
-        eval_fw=eval_fw,
         gold=args.gold,
         thinking=args.thinking,
-        repo=repo_root,
+        repo=args.repo,
         scan_root=args.scan_root,
         quiet=False,
     )
-    if meta.get("returncode", 1) != 0:
-        raise SystemExit(1)
+    raise SystemExit(int(meta.get("returncode", 1)))
 
 
 if __name__ == "__main__":

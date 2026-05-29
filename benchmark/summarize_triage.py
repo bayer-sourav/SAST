@@ -6,9 +6,13 @@ from __future__ import annotations
 import argparse
 import json
 from collections import Counter
+import sys
 from pathlib import Path
 
-VALID_LABELS = frozenset({"TP", "FP", "UNKNOWN"})
+_sast = Path(__file__).resolve().parent.parent
+if str(_sast) not in sys.path:
+    sys.path.insert(0, str(_sast))
+from benchmark.triage_labels import VALID_LABELS  # noqa: E402
 
 
 def _load_label(result_path: Path) -> str | None:
@@ -89,6 +93,7 @@ def _metrics_for_cases(
         "fp_removal_rate": (dist.get("FP", 0) / evaluated) if evaluated else 0.0,
         "tp_rate": (dist.get("TP", 0) / evaluated) if evaluated else 0.0,
         "unknown_rate": (dist.get("UNKNOWN", 0) / evaluated) if evaluated else 0.0,
+        "bl_rate": (dist.get("BL", 0) / evaluated) if evaluated else 0.0,
         "distribution": dict(dist),
     }
     return _enrich_metrics(base, gold=gold)
