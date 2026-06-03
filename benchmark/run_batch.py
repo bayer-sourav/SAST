@@ -35,6 +35,7 @@ def _write_cell_timing(
     agent: str,
     gold: str | None,
     thinking: bool,
+    few_shot: int,
     case_dir: Path,
     cases: list[dict],
     cell_started_at: str,
@@ -50,6 +51,7 @@ def _write_cell_timing(
         "agent": agent,
         "gold": gold,
         "thinking": thinking,
+        "few_shot": few_shot,
         "case_dir": str(case_dir),
         "runs_root": str(runs_root),
         "started_at": cell_started_at,
@@ -85,6 +87,13 @@ def _main() -> None:
         "--thinking",
         action="store_true",
         help="Enable chain-of-thought before JSON (passed to run_llm_local.py)",
+    )
+    ap.add_argument(
+        "--few-shot",
+        type=int,
+        default=0,
+        choices=(0, 3),
+        help="Few-shot exemplars in system prompt (0 or 3).",
     )
     ap.add_argument("--llm-model", default="local-qwen", help="LLM_MODEL for --agent openhands")
     ap.add_argument("--llm-provider", default="openai")
@@ -136,6 +145,12 @@ def _main() -> None:
         os.environ.setdefault("AGENT_MAX_NEW_TOKENS", "2048")
 
     sast_root = Path(__file__).resolve().parent.parent
+    try:
+        from dotenv import load_dotenv
+
+        load_dotenv(sast_root / ".env")
+    except ImportError:
+        pass
     bench = Path(__file__).resolve().parent
     if args.eval_framework:
         print("[batch] warning: --eval-framework is deprecated; using benchmark/make_task.py", flush=True)
@@ -185,7 +200,10 @@ def _main() -> None:
         ]
         if args.repo:
             pb_cmd.extend(["--repo", str(args.repo)])
-        print("[batch] prebuilding task.md for all cases (CPU, no model load)...", flush=True)
+        if args.max_cases is not None:
+            pb_cmd.extend(["--max-cases", str(args.max_cases)])
+        pb_cmd.extend(["--few-shot", str(args.few_shot)])
+        print(f"[batch] prebuilding task.md for {len(files)} cases (CPU, no model load)...", flush=True)
         subprocess.run(pb_cmd, cwd=str(sast_root), check=False)
         if args.profile in ("qwen3_coder_30b_bnb", "gpt_oss_20b"):
             from benchmark.llm_generate import preload_profile
@@ -238,7 +256,9 @@ def _main() -> None:
             continue
 
         case = json.loads(case_path.read_text(encoding="utf-8"))
-        repo = _repo.resolve_benchmark_java_root(sast_root, case, args.repo)
+        repo = _repo.resolve_benchmark_java_root(
+            sast_root, case, args.repo, case_path=case_path
+        )
 
         t_case = time.perf_counter()
         if in_process_llm:
@@ -249,6 +269,7 @@ def _main() -> None:
                 sast_root=sast_root,
                 gold=args.gold,
                 thinking=args.thinking,
+                few_shot=args.few_shot,
                 repo=repo,
                 quiet=True,
             )
@@ -270,6 +291,8 @@ def _main() -> None:
                 cmd.extend(["--gold", args.gold])
             if args.thinking:
                 cmd.append("--thinking")
+            if args.few_shot:
+                cmd.extend(["--few-shot", str(args.few_shot)])
             r = subprocess.run(cmd, cwd=str(sast_root))
             rc = r.returncode
             meta = read_run_meta(run_dir)
@@ -317,6 +340,7 @@ def _main() -> None:
         agent=args.agent,
         gold=args.gold,
         thinking=args.thinking,
+        few_shot=args.few_shot,
         case_dir=case_dir,
         cases=case_timings,
         cell_started_at=cell_started_at,

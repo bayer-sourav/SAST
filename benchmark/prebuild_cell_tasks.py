@@ -18,12 +18,13 @@ def _build_one(
     repo: Path,
     run_dir: Path,
     scan_root: str,
+    few_shot: int,
 ) -> tuple[bool, str]:
     from benchmark.triage_labels import task_markdown_current
 
     run_dir.mkdir(parents=True, exist_ok=True)
     task_path = run_dir / "task.md"
-    if task_markdown_current(task_path):
+    if task_markdown_current(task_path, few_shot=few_shot):
         return True, "cached"
     cmd = [
         sys.executable,
@@ -38,6 +39,8 @@ def _build_one(
         "llm",
         "--out",
         str(task_path),
+        "--few-shot",
+        str(few_shot),
     ]
     last = ""
     for attempt in range(3):
@@ -56,6 +59,8 @@ def main() -> None:
     ap.add_argument("--profile", required=True)
     ap.add_argument("--repo", type=Path, default=None)
     ap.add_argument("--only-missing", action="store_true", help="Skip dirs with current task.md")
+    ap.add_argument("--max-cases", type=int, default=None, help="Only prebuild first N cases (sorted).")
+    ap.add_argument("--few-shot", type=int, default=0, choices=(0, 3))
     args = ap.parse_args()
 
     sast_root = Path(__file__).resolve().parent.parent
@@ -73,16 +78,22 @@ def main() -> None:
     case_dir = args.case_dir.expanduser().resolve()
     llm_root = args.runs_root.expanduser().resolve() / args.profile.replace("/", "_") / "llm"
     files = sorted(p for p in case_dir.glob("*.json") if p.name != "slice_manifest.json")
+    if args.max_cases is not None:
+        files = files[: args.max_cases]
 
     built = cached = failed = 0
     for case_path in files:
         case = json.loads(case_path.read_text(encoding="utf-8"))
         cid = stable_case_id(case)
         run_dir = llm_root / cid
-        if args.only_missing and task_markdown_current(run_dir / "task.md"):
+        if args.only_missing and task_markdown_current(
+            run_dir / "task.md", few_shot=args.few_shot
+        ):
             cached += 1
             continue
-        repo = _repo.resolve_benchmark_java_root(sast_root, case, args.repo)
+        repo = _repo.resolve_benchmark_java_root(
+            sast_root, case, args.repo, case_path=case_path
+        )
         scan = case.get("scan_root") or "."
         ok, msg = _build_one(
             make_task=make_task,
@@ -90,6 +101,7 @@ def main() -> None:
             repo=repo,
             run_dir=run_dir,
             scan_root=str(scan),
+            few_shot=args.few_shot,
         )
         if ok:
             if msg == "built":

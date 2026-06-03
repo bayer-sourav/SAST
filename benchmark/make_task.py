@@ -13,7 +13,7 @@ from typing import Any
 _sast = Path(__file__).resolve().parent.parent
 if str(_sast) not in sys.path:
     sys.path.insert(0, str(_sast))
-from benchmark.triage_labels import TASK_PROMPT_VERSION, TASK_TITLE_MARKER  # noqa: E402
+from benchmark.triage_labels import TASK_TITLE_MARKER, task_prompt_tag  # noqa: E402
 
 DEFAULT_OUTPUT_SCHEMA = {
     "label": "TP|FP|BL|UNKNOWN",
@@ -51,6 +51,8 @@ def build_task_markdown(
     repo_root: Path,
     scan_root: str = ".",
     agent: str = "generic",
+    *,
+    few_shot: int = 0,
 ) -> str:
     cid = stable_case_id(case)
     tool = case.get("tool", "unknown-tool")
@@ -101,13 +103,23 @@ def build_task_markdown(
     finding_json = json.dumps(finding, ensure_ascii=False, indent=2)
     src_text = (repo_root / file_path).read_text(encoding="utf-8")
 
-    return f"""{TASK_TITLE_MARKER} ({TASK_PROMPT_VERSION})
+    few_shot_block = ""
+    if few_shot > 0 and agent == "llm":
+        from benchmark.few_shot import build_few_shot_task_section
+
+        few_shot_block = build_few_shot_task_section(k=few_shot)
+
+    # Do not include repo_root or corpus paths in the prompt (track leakage).
+    context_lines = [f"- **case_id**: `{cid}`"]
+    if agent != "llm":
+        context_lines.append(f"- **scan_root (relative)**: `{effective_scan_root}`")
+    context_block = "\n".join(context_lines)
+
+    return f"""{TASK_TITLE_MARKER} ({task_prompt_tag(few_shot=few_shot)})
 
 ## Context
-- **case_id**: `{cid}`
-- **repo_root (host)**: `{repo_root}`
-- **scan_root (relative)**: `{effective_scan_root}`
-
+{context_block}
+{few_shot_block}
 ## Environment notes
 {env_hint}
 
@@ -157,6 +169,13 @@ def main() -> None:
         choices=["generic", "swe-agent", "openhands", "aider", "llm"],
     )
     ap.add_argument("--out", default="triage_task.md", help="Output task markdown path.")
+    ap.add_argument(
+        "--few-shot",
+        type=int,
+        default=0,
+        choices=(0, 3),
+        help="Include N few-shot exemplars in task body (0 or 3).",
+    )
     ap.add_argument("--print-schema", action="store_true")
     args = ap.parse_args()
 
@@ -170,7 +189,13 @@ def main() -> None:
     out_path = Path(args.out).expanduser().resolve()
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(
-        build_task_markdown(case=case, repo_root=repo_root, scan_root=args.scan_root, agent=args.agent),
+        build_task_markdown(
+            case=case,
+            repo_root=repo_root,
+            scan_root=args.scan_root,
+            agent=args.agent,
+            few_shot=args.few_shot,
+        ),
         encoding="utf-8",
     )
     print(out_path)

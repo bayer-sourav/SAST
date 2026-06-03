@@ -66,6 +66,11 @@ def _ensure_paths(sast_root: Path) -> None:
         sys.path.insert(0, str(sast_root))
 
 
+def _system_prompt() -> str:
+    """JSON/output rules only; few-shot exemplars live in task.md (see make_task --few-shot)."""
+    return _SYSTEM_PROMPT
+
+
 def run_triage_case(
     *,
     case_path: Path,
@@ -74,6 +79,7 @@ def run_triage_case(
     sast_root: Path,
     gold: str | None = None,
     thinking: bool = False,
+    few_shot: int = 0,
     repo: Path | None = None,
     scan_root: str = ".",
     quiet: bool = False,
@@ -98,11 +104,11 @@ def run_triage_case(
     case = json.loads(case_path.read_text(encoding="utf-8"))
     import repo_root as _repo  # noqa: E402
     from benchmark.make_task import stable_case_id  # noqa: E402
-    from benchmark.triage_labels import task_markdown_current  # noqa: E402
+    from benchmark.triage_labels import task_markdown_current, task_prompt_tag  # noqa: E402
 
     case_id = stable_case_id(case)
     effective_scan_root = case.get("scan_root") or scan_root
-    repo_root = _repo.resolve_benchmark_java_root(sast_root, case, repo)
+    repo_root = _repo.resolve_benchmark_java_root(sast_root, case, repo, case_path=case_path)
     _require_repo_file(repo_root, case)
 
     run_dir = run_dir.expanduser().resolve()
@@ -124,8 +130,10 @@ def run_triage_case(
             AGENT_NAME,
             "--out",
             str(task_path),
+            "--few-shot",
+            str(few_shot),
         ]
-        if task_markdown_current(task_path):
+        if task_markdown_current(task_path, few_shot=few_shot):
             task_sec = 0.0
         else:
             last_err: str | None = None
@@ -143,10 +151,21 @@ def run_triage_case(
             task_sec = time.perf_counter() - t_task_start
 
         task_text = task_path.read_text(encoding="utf-8")
+        system_text = _system_prompt()
         messages: list[dict[str, str]] = [
-            {"role": "system", "content": _SYSTEM_PROMPT},
+            {"role": "system", "content": system_text},
             {"role": "user", "content": task_text},
         ]
+        (run_dir / "system_prompt.txt").write_text(system_text, encoding="utf-8")
+        prompt_record = {
+            "few_shot": few_shot,
+            "task_prompt_tag": task_prompt_tag(few_shot=few_shot),
+            "messages": messages,
+        }
+        (run_dir / "prompt_record.json").write_text(
+            json.dumps(prompt_record, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
 
         _ensure_paths(sast_root)
         from core.gen_meta import get_gen_meta, reset_gen_meta
@@ -217,6 +236,7 @@ def run_triage_case(
         meta = {
             "profile": profile,
             "thinking": thinking,
+            "few_shot": few_shot,
             "gold": gold,
             "case_id": case_id,
             "started_at": started_at,
@@ -241,6 +261,7 @@ def run_triage_case(
         meta = {
             "profile": profile,
             "thinking": thinking,
+            "few_shot": few_shot,
             "gold": gold,
             "case_id": case_id,
             "started_at": started_at,
@@ -279,6 +300,13 @@ def main() -> None:
         help="Corpus track for run_meta only (prompt is unified).",
     )
     ap.add_argument("--thinking", action="store_true")
+    ap.add_argument(
+        "--few-shot",
+        type=int,
+        default=0,
+        choices=(0, 3),
+        help="Number of few-shot exemplars in system prompt (0 or 3).",
+    )
     args = ap.parse_args()
 
     sast_root = Path(__file__).resolve().parent.parent
@@ -295,6 +323,7 @@ def main() -> None:
         sast_root=sast_root,
         gold=args.gold,
         thinking=args.thinking,
+        few_shot=args.few_shot,
         repo=args.repo,
         scan_root=args.scan_root,
         quiet=False,

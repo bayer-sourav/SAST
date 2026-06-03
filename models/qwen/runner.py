@@ -6,6 +6,8 @@ Menu profiles (see main.py):
   qwen3_8b_bnb — Qwen3-8B (Unsloth bnb-4bit hub + HF instruct fallback).
   qwen3_14b_bnb — Qwen3-14B (Unsloth bnb-4bit hub + HF instruct fallback).
   qwen3_5_9b_bnb — Qwen3.5-9B (Unsloth 4-bit hub id + HF fallback).
+  qwen3_coder_30b_bnb — Qwen3-Coder-30B-A3B; uses Amazon Bedrock when configured
+    (``OPENAI_BASE_URL`` / ``AWS_BEARER_TOKEN_BEDROCK``), else local Unsloth/HF.
 """
 
 from __future__ import annotations
@@ -34,6 +36,9 @@ _TOKENIZER: Any = None
 _LOADED_4BIT: bool | None = None
 _LOADED_UNSLOTH_ID: str | None = None
 _ACTIVE_PROFILE: str | None = None
+_BEDROCK_CLIENT: Any = None
+
+_DEFAULT_BEDROCK_CODER_MODEL = "qwen.qwen3-coder-30b-a3b-instruct"
 
 # Profiles using Qwen3 chat templates (enable_thinking / thinking blocks).
 QWEN3_PROFILES = frozenset(
@@ -41,6 +46,8 @@ QWEN3_PROFILES = frozenset(
         "qwen3_4b_bnb",
         "qwen3_8b_bnb",
         "qwen3_14b_bnb",
+        "qwen3_5_4b_bnb",
+        "qwen3_5_9b_bnb",
         "qwen3_coder_30b_bnb",
     }
 )
@@ -58,6 +65,163 @@ def unload_qwen() -> None:
     global _ACTIVE_PROFILE
     _drop_qwen_weights()
     _ACTIVE_PROFILE = None
+
+
+def _bedrock_creds() -> tuple[str, str, str]:
+    from benchmark.bedrock_auth import resolve_bedrock_credentials
+
+    base, key, source = resolve_bedrock_credentials()
+    return base, key, source
+
+
+def _bedrock_configured() -> bool:
+    from benchmark.bedrock_auth import bedrock_configured
+
+    return bedrock_configured()
+
+
+def _should_use_bedrock(profile: str) -> bool:
+    """Route qwen3_coder_30b_bnb to Amazon Bedrock (Mantle OpenAI-compatible API)."""
+    if profile != "qwen3_coder_30b_bnb":
+        return False
+    backend = os.environ.get("QWEN3_CODER_BACKEND", "").strip().lower()
+    if backend in ("local", "hf", "unsloth", "gpu"):
+        return False
+    if backend in ("bedrock", "mantle", "aws"):
+        if not _bedrock_configured():
+            raise RuntimeError(
+                "QWEN3_CODER_BACKEND=bedrock but Bedrock is not configured. "
+                "Set OPENAI_BASE_URL (e.g. https://bedrock-mantle.us-east-1.api.aws/v1) "
+                "and OPENAI_API_KEY or AWS_BEARER_TOKEN_BEDROCK."
+            )
+        return True
+    return _bedrock_configured()
+
+
+def _bedrock_model_id() -> str:
+    return os.environ.get("QWEN3_CODER_BEDROCK_MODEL_ID", _DEFAULT_BEDROCK_CODER_MODEL).strip()
+
+
+_BEDROCK_AUTH_SOURCE: str | None = None
+
+
+def _reset_bedrock_client() -> None:
+    global _BEDROCK_CLIENT, _BEDROCK_AUTH_SOURCE
+    _BEDROCK_CLIENT = None
+    _BEDROCK_AUTH_SOURCE = None
+
+
+def _get_bedrock_client(*, api_key: str | None = None, auth_source: str | None = None) -> Any:
+    global _BEDROCK_CLIENT, _BEDROCK_AUTH_SOURCE
+    from benchmark.bedrock_auth import format_bedrock_auth_log
+
+    if _BEDROCK_CLIENT is not None and api_key is None:
+        return _BEDROCK_CLIENT
+
+    from openai import OpenAI
+
+    base, default_key, default_source = _bedrock_creds()
+    key = (api_key or default_key).strip()
+    source = auth_source or default_source
+    if not base or not key:
+        raise RuntimeError(
+            "Bedrock not configured: set OPENAI_BASE_URL (or BEDROCK_MANTLE_BASE_URL) "
+            "and AWS_BEARER_TOKEN_BEDROCK (preferred) or OPENAI_API_KEY."
+        )
+    _BEDROCK_CLIENT = OpenAI(base_url=base, api_key=key)
+    _BEDROCK_AUTH_SOURCE = source
+    print(
+        f"[Qwen] Bedrock client base_url={base!r} model={_bedrock_model_id()!r} "
+        f"{format_bedrock_auth_log(source, key)}",
+        flush=True,
+    )
+    return _BEDROCK_CLIENT
+
+
+def _bedrock_openai_kwargs(*, enable_thinking: bool) -> dict[str, Any]:
+    gen = agent_decoding_kwargs(enable_thinking=enable_thinking)
+    out: dict[str, Any] = {"max_tokens": int(gen.get("max_new_tokens", 2048))}
+    if gen.get("do_sample") and "temperature" in gen:
+        out["temperature"] = float(gen["temperature"])
+    return out
+
+
+def _bedrock_assistant_text(message: Any) -> str:
+    """Normalize Bedrock assistant message to plain text (Qwen tool_call XML when needed)."""
+    content = (getattr(message, "content", None) or "").strip()
+    tool_calls = getattr(message, "tool_calls", None) or []
+    if not tool_calls:
+        return content
+    parts: list[str] = []
+    if content:
+        parts.append(content)
+    for tc in tool_calls:
+        fn = tc.function
+        raw_args = fn.arguments
+        try:
+            args_obj = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+        except json.JSONDecodeError:
+            args_obj = raw_args
+        payload = {"name": fn.name, "arguments": args_obj}
+        parts.append(f"<tool_call>\n{json.dumps(payload, ensure_ascii=False)}\n</tool_call>")
+    return "\n".join(parts).strip()
+
+
+def _bedrock_generate(
+    messages: list[dict[str, Any]],
+    *,
+    tools: list[dict[str, Any]] | None = None,
+    enable_thinking: bool = False,
+) -> str:
+    client = _get_bedrock_client()
+    api_messages = _messages_str_only(messages)
+    kwargs = _bedrock_openai_kwargs(enable_thinking=enable_thinking)
+    create_kw: dict[str, Any] = {
+        "model": _bedrock_model_id(),
+        "messages": api_messages,
+        **kwargs,
+    }
+    if tools:
+        create_kw["tools"] = tools
+    print(
+        f"[Qwen] Bedrock chat.completions n_messages={len(api_messages)} "
+        f"tools={bool(tools)} max_tokens={kwargs.get('max_tokens')}",
+        flush=True,
+    )
+    from benchmark.bedrock_auth import alternate_bedrock_key
+
+    auth_src = _BEDROCK_AUTH_SOURCE or "none"
+    try:
+        resp = client.chat.completions.create(**create_kw)
+    except Exception as exc:
+        err = str(exc).lower()
+        is_auth = "401" in err or "unauthorized" in err or "authentication" in err
+        if is_auth:
+            alt = alternate_bedrock_key(auth_src)  # type: ignore[arg-type]
+            if alt:
+                alt_key, alt_src = alt
+                print(
+                    f"[Qwen] Bedrock auth failed with {auth_src!r}; retrying with {alt_src!r}",
+                    flush=True,
+                )
+                _reset_bedrock_client()
+                client = _get_bedrock_client(api_key=alt_key, auth_source=alt_src)
+                resp = client.chat.completions.create(**create_kw)
+            else:
+                raise
+        else:
+            raise
+    msg = resp.choices[0].message
+    text = _bedrock_assistant_text(msg)
+    usage = getattr(resp, "usage", None)
+    if usage is not None:
+        from core.gen_meta import set_gen_meta
+
+        set_gen_meta(
+            int(getattr(usage, "prompt_tokens", -1) or -1),
+            int(getattr(usage, "completion_tokens", -1) or -1),
+        )
+    return text
 
 
 def _resolve_ids(profile: str) -> tuple[str, str]:
@@ -86,6 +250,20 @@ def _resolve_ids(profile: str) -> tuple[str, str]:
             "unsloth/Qwen3-14B-unsloth-bnb-4bit",
         )
         h = os.environ.get("QWEN3_14B_HF_MODEL_ID", "Qwen/Qwen3-14B-Instruct")
+        return u, h
+    if profile == "qwen3_5_4b_bnb":
+        u = os.environ.get("QWEN3_5_4B_UNSLOTH_MODEL_ID", "unsloth/Qwen3.5-4B")
+        h = os.environ.get(
+            "QWEN3_5_4B_HF_MODEL_ID",
+            "techwithsergiu/Qwen3.5-text-4B-bnb-4bit",
+        )
+        return u, h
+    if profile == "qwen3_5_9b_bnb":
+        u = os.environ.get("QWEN3_5_9B_UNSLOTH_MODEL_ID", "unsloth/Qwen3.5-9B")
+        h = os.environ.get(
+            "QWEN3_5_9B_HF_MODEL_ID",
+            "techwithsergiu/Qwen3.5-text-9B-bnb-4bit",
+        )
         return u, h
     if profile == "qwen3_coder_30b_bnb":
         u = os.environ.get(
@@ -118,6 +296,10 @@ def _hf_cache_key(profile: str) -> str:
 
 def preload_qwen_profile(profile: str, *, use_4bit: bool = True) -> None:
     """Eager HF/Unsloth load so batch cells do not retry load on every case after a failure."""
+    if _should_use_bedrock(profile):
+        _get_bedrock_client()
+        print(f"[preload] Bedrock ready for {profile!r} model={_bedrock_model_id()!r}", flush=True)
+        return
     unsloth_id, hf_id = _resolve_ids(profile)
     skip_unsloth = os.environ.get("QWEN3_CODER_SKIP_UNSLOTH", "0").lower() in ("1", "true", "yes")
     if profile == "qwen3_coder_30b_bnb" and skip_unsloth:
@@ -357,6 +539,14 @@ def generate_tool_selection_raw(
     _ACTIVE_PROFILE = profile
 
     messages = tool_selection_chat_messages(tools, user_message)
+    if _should_use_bedrock(profile):
+        norm = _prepare_messages_for_thinking(
+            _normalize_chat_messages(messages),
+            profile,
+            enable_thinking=False,
+        )
+        return _bedrock_generate(norm, tools=None, enable_thinking=False)
+
     unsloth_id, hf_id = _resolve_ids(profile)
 
     if not torch.cuda.is_available():
@@ -407,6 +597,10 @@ def generate_from_chat_messages(
 
     norm = _normalize_chat_messages(messages)
     norm = _prepare_messages_for_thinking(norm, profile, enable_thinking=enable_thinking)
+
+    if _should_use_bedrock(profile):
+        return _bedrock_generate(norm, tools=tools, enable_thinking=enable_thinking)
+
     unsloth_id, hf_id = _resolve_ids(profile)
 
     # MoE 30B: prefer Unsloth 4-bit when allowed; else HF BnB on cuda:0 (see phase1_cell_env.sh).
