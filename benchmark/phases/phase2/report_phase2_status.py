@@ -32,8 +32,11 @@ from timing import (  # noqa: E402
 from benchmark.triage_labels import VALID_LABELS  # noqa: E402
 from benchmark.summarize_triage import (  # noqa: E402
     _f1_for_positive_class,
+    _metrics_for_cases,
     macro_f1_from_track_f1s,
 )
+
+MANIFEST_PATH = _BENCH / "phases" / "phase2" / "MANIFEST.json"
 
 CORE_PROFILES = (
     "qwen3_4b_bnb",
@@ -42,6 +45,7 @@ CORE_PROFILES = (
     "qwen3_coder_30b_bnb",
 )
 EXTENSION_PROFILES = ("qwen3_5_4b_bnb", "qwen3_5_9b_bnb")
+ALL_PROFILES = CORE_PROFILES + EXTENSION_PROFILES
 TARGET = 200
 TRACKS = {
     "fp": ("FP", _SAST / "runs/phase2/fp"),
@@ -297,7 +301,7 @@ def _profiles_for_config(
         except json.JSONDecodeError:
             comp_data = {}
 
-    for profile in CORE_PROFILES + EXTENSION_PROFILES:
+    for profile in ALL_PROFILES:
         if _slm_row(comp_data, profile) is not None:
             found.append(profile)
             continue
@@ -310,7 +314,7 @@ def _profiles_for_config(
     # preserve order, dedupe
     seen: set[str] = set()
     ordered: list[str] = []
-    for p in CORE_PROFILES + EXTENSION_PROFILES:
+    for p in ALL_PROFILES:
         if p in found and p not in seen:
             seen.add(p)
             ordered.append(p)
@@ -332,6 +336,178 @@ def _status(
     return f"{evaluated} eval"
 
 
+def _load_label(result_path: Path) -> str | None:
+    if not result_path.is_file():
+        return None
+    try:
+        data = json.loads(result_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+    lbl = str(data.get("label", "")).strip().upper()
+    return lbl if lbl in VALID_LABELS else None
+
+
+def _manifest() -> dict:
+    if not MANIFEST_PATH.is_file():
+        return {}
+    try:
+        return json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+
+
+def _manifest_track_key(track_key: str) -> str:
+    return "borderline" if track_key == "bl" else track_key
+
+
+def _case_json_path(corpus_dir: Path, cid: str) -> Path | None:
+    for name in (f"OWASP_{cid}.json", f"{cid}.json"):
+        path = corpus_dir / name
+        if path.is_file():
+            return path
+    return None
+
+
+def _benchmark_gold_label(case: dict) -> str:
+    return "TP" if case.get("benchmark_real_vuln") else "FP"
+
+
+def _predictions_for_cell(
+    track_root: Path,
+    thinking: str,
+    fewshot: int,
+    profile: str,
+    case_ids: list[str],
+) -> dict[str, str | None]:
+    llm_root = (
+        track_root / f"thinking_{thinking}" / f"fewshot_{fewshot}" / profile / "llm"
+    )
+    predicted: dict[str, str | None] = {}
+    for cid in case_ids:
+        predicted[cid] = _load_label(
+            llm_root / cid / "agent-llm-triage-result.json"
+        )
+    return predicted
+
+
+def _borderline_row_from_disk(
+    track_root: Path,
+    thinking: str,
+    fewshot: int,
+    profile: str,
+    corpus_dir: Path,
+    case_ids: list[str],
+) -> dict | None:
+    llm_root = (
+        track_root / f"thinking_{thinking}" / f"fewshot_{fewshot}" / profile / "llm"
+    )
+    if not llm_root.is_dir():
+        return None
+    dist: Counter[str] = Counter()
+    missing = 0
+    lenient_correct = 0
+    bench_agree = 0
+    bl_label = 0
+    evaluated = 0
+    n = len(case_ids)
+    for cid in case_ids:
+        case_path = _case_json_path(corpus_dir, cid)
+        if case_path is None:
+            missing += 1
+            dist["(missing)"] += 1
+            continue
+        try:
+            case = json.loads(case_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            missing += 1
+            dist["(missing)"] += 1
+            continue
+        bench_lbl = _benchmark_gold_label(case)
+        acceptable = set(case.get("acceptable_labels") or ["TP", "FP", "BL"])
+        pred = _load_label(llm_root / cid / "agent-llm-triage-result.json")
+        if pred is None:
+            missing += 1
+            dist["(missing)"] += 1
+            continue
+        evaluated += 1
+        dist[pred] += 1
+        if pred in acceptable:
+            lenient_correct += 1
+        if pred == bench_lbl:
+            bench_agree += 1
+        if pred == "BL":
+            bl_label += 1
+    if evaluated <= 0:
+        return None
+    tp_rate = dist.get("TP", 0) / evaluated
+    fp_rate = dist.get("FP", 0) / evaluated
+    bl_rate = bl_label / evaluated
+    return {
+        "profile": profile,
+        "n_cases": n,
+        "evaluated": evaluated,
+        "missing": missing,
+        "coverage": evaluated / n if n else 0.0,
+        "distribution": dict(dist),
+        "tp_rate": tp_rate,
+        "fp_rate": fp_rate,
+        "bl_rate": bl_rate,
+        "lenient_accuracy": lenient_correct / evaluated,
+        "benchmark_agreement": bench_agree / evaluated,
+        "ambiguity_index": 1.0 - abs(tp_rate - 0.5) * 2,
+        "f1_bl": _f1_for_positive_class("BL", dist, evaluated=evaluated),
+    }
+
+
+def _triage_row_from_disk(
+    track_key: str,
+    track_root: Path,
+    thinking: str,
+    fewshot: int,
+    profile: str,
+    case_ids: list[str],
+    gold: str,
+) -> dict | None:
+    predicted = _predictions_for_cell(
+        track_root, thinking, fewshot, profile, case_ids
+    )
+    if not any(v is not None for v in predicted.values()):
+        return None
+    row = _metrics_for_cases(case_ids, gold=gold, predicted=predicted)
+    if int(row.get("evaluated", 0)) <= 0:
+        return None
+    row["profile"] = profile
+    return row
+
+
+def _comparison_cell_from_disk(
+    track_key: str,
+    track_root: Path,
+    thinking: str,
+    fewshot: int,
+) -> dict:
+    manifest = _manifest()
+    track_info = (manifest.get("tracks") or {}).get(_manifest_track_key(track_key)) or {}
+    case_ids = [str(c) for c in track_info.get("case_ids") or []]
+    if not case_ids:
+        return {}
+    gold = str(track_info.get("gold", track_key.upper())).upper()
+    corpus_dir = Path(str(track_info.get("corpus_dir", "")))
+    out: dict = {}
+    for profile in ALL_PROFILES:
+        if track_key == "bl":
+            row = _borderline_row_from_disk(
+                track_root, thinking, fewshot, profile, corpus_dir, case_ids
+            )
+        else:
+            row = _triage_row_from_disk(
+                track_key, track_root, thinking, fewshot, profile, case_ids, gold
+            )
+        if row:
+            out[f"SLM ({profile})"] = row
+    return out
+
+
 def _load_comparison_cells(summaries_dir: Path) -> dict[tuple[str, str, int], dict]:
     cells: dict[tuple[str, str, int], dict] = {}
     for path in sorted(summaries_dir.glob("comparison_*_test_thinking_*_fewshot_*.json")):
@@ -343,6 +519,20 @@ def _load_comparison_cells(summaries_dir: Path) -> dict[tuple[str, str, int], di
             cells[(track, thinking, fewshot)] = json.loads(path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             continue
+
+    for track_key, (_, track_root) in TRACKS.items():
+        for thinking, fewshot in CONFIGS:
+            key = (track_key, thinking, fewshot)
+            disk = _comparison_cell_from_disk(
+                track_key, track_root, thinking, fewshot
+            )
+            if not disk:
+                continue
+            merged = dict(cells.get(key, {}))
+            for row_key, row in disk.items():
+                if int(row.get("evaluated", 0)) > 0:
+                    merged[row_key] = row
+            cells[key] = merged
     return cells
 
 
@@ -420,6 +610,13 @@ def _merge_matrix(
             "tp_track": tp_m,
         }
         if bl_m:
+            out["borderline"][profile] = bl_m
+
+    for profile in profiles:
+        if profile in out["borderline"]:
+            continue
+        bl_m = bl_rows.get(f"SLM ({profile})")
+        if bl_m and int(bl_m.get("evaluated", 0)) > 0:
             out["borderline"][profile] = bl_m
     return out
 
