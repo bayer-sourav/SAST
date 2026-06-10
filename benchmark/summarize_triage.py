@@ -46,6 +46,22 @@ def _f1_for_positive_class(
     return 2 * precision * recall / (precision + recall)
 
 
+def macro_f1_from_track_f1s(
+    f1_fp: float,
+    f1_tp: float,
+    f1_bl: float | None = None,
+) -> dict[str, float]:
+    """Macro F1 across per-track task F1s (each track uses gold as positive class)."""
+    f1_fp_tp = 0.5 * (f1_fp + f1_tp)
+    parts = [float(f1_fp), float(f1_tp)]
+    if f1_bl is not None:
+        parts.append(float(f1_bl))
+    return {
+        "f1_fp_tp": f1_fp_tp,
+        "macro_f1": sum(parts) / len(parts),
+    }
+
+
 def _enrich_metrics(base: dict[str, float | int], *, gold: str) -> dict:
     gold_u = gold.upper()
     dist = Counter(base.get("distribution") or {})

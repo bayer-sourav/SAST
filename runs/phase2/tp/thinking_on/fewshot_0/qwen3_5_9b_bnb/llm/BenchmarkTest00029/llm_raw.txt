@@ -1,0 +1,603 @@
+The user wants me to classify a CodeQL finding based on the provided Java code snippet.
+
+**Finding Details:**
+- Tool: CodeQL
+- Rule ID: `java/xss`
+- Message: "Cross-site scripting vulnerability due to a [user-provided value](1)."
+- Location: Lines 87-93 in `src/main/java/org/owasp/benchmark/testcode/BenchmarkTest00029.java`.
+- Flow described in raw output: User parameter -> `param` -> `getBytes()` -> `md.update()` -> `md.digest()` -> Base64 encoded -> Written to HTML response via `response.getWriter().println(...)` containing `org.owasp.esapi.ESAPI.encoder().encodeForHTML(...)`.
+
+Wait, let's look closer at the flow description vs the actual code.
+
+**Actual Code Analysis:**
+```java
+// ...
+try {
+    java.util.Properties benchmarkprops = new java.util.Properties();
+    benchmarkprops.load(
+            this.getClass().getClassLoader().getResourceAsStream("benchmark.properties"));
+    String algorithm = benchmarkprops.getProperty("hashAlg1", "SHA512");
+    java.security.MessageDigest md = java.security.MessageDigest.getInstance(algorithm);
+    byte[] input = {(byte) '?'};
+    Object inputParam = param;
+    if (inputParam instanceof String) input = ((String) inputParam).getBytes();
+    if (inputParam instanceof java.io.InputStream) {
+        // ...
+    }
+    md.update(input);
+
+    byte[] result = md.digest();
+    java.io.File fileTarget =
+            new java.io.File(
+                    new java.io.File(org.owasp.benchmark.helpers.Utils.TESTFILES_DIR),
+                    "passwordFile.txt");
+    java.io.FileWriter fw =
+            new java.io.FileWriter(fileTarget, true); // the true will append the new data
+    fw.write(
+            "hash_value="
+                    + org.owasp.esapi.ESAPI.encoder().encodeForBase64(result, true)
+                    + "\n");
+    fw.close();
+    response.getWriter()
+            .println(
+                    "Sensitive value '"
+                            + org.owasp
+                                    .esapi
+                                    .ESAPI
+                                    .encoder()
+                                    .encodeForHTML(new String(input))
+                            + "' hashed and stored<br/>");
+
+} catch (java.security.NoSuchAlgorithmException e) {
+    // ...
+}
+```
+
+**Data Flow:**
+1. Source: `request.getParameterMap()` -> `param` (User Input from query string/form).
+   - Line 44-59 roughly covers getting the parameter.
+2. Processing: `param.getBytes()` converts string to bytes.
+3. Hashing: `MessageDigest` hashes the bytes (`md.update(input)`). This destroys the original character content (XSS payloads like `<script>` tags get mangled into hex-like sequences depending on charset, usually UTF-8).
+4. Storage: The hash result is written to a file (`fw.write`). It uses `encodeForBase64(result, true)`. Base64 encoding does not prevent XSS because it's just binary-to-text encoding. However, this goes to a file, not directly to the browser response. So storage isn't the issue here regarding XSS to the client.
+5. Response Display: `"Sensitive value '" + ESAPI.encoder().encodeForHTML(new String(input)) + "' hashed and stored..."`
+   - Here, `input` comes from the user parameter.
+   - `new String(input)` reconstructs the string from bytes. Note: If the original input was UTF-8 and `getBytes()` used UTF-8, then `new String(bytes)` might decode correctly assuming standard charset. However, `getBytes()` defaults to platform charset unless specified. `new String(byte[])` also uses platform charset. This round-trip might lose characters or change them slightly, but generally preserves the structure.
+   - Crucially, `ESAPI.encoder().encodeForHTML(...)` is called on the reconstructed string before printing to the HTTP response writer.
+
+**Vulnerability Assessment (XSS):**
+- Sink: `HttpServletResponse.getWriter().println(String)` which writes to the HTML body.
+- Sanitization: `org.owasp.esapi.ESAPI.encoder().encodeForHTML(...)`.
+- Does this sanitize effectively? Yes, ESAPI's `encodeForHTML` is designed specifically to encode special characters (`<`, `>`, `&`, `"`) so they don't render as HTML tags in an HTML context.
+- Is there a bypass?
+  - The input flows through hashing (`md.update(input)`), but the XSS check happens on the display line, not the hash line.
+  - Wait, looking closely at the displayed string construction:
+    ```java
+    "Sensitive value '"
+            + org.owasp
+                    .esapi
+                    .ESAPI
+                    .encoder()
+                    .encodeForHTML(new String(input))
+            + "' hashed and stored<br/>";
+    ```
+  - The variable `input` is derived from `param` (user input).
+  - `encodeForHTML` is applied to `new String(input)`.
+  - Since `input` is the byte array representation of the user input, converting it back to a String and then applying `encodeForHTML` should neutralize script tags.
+  - Therefore, the payload reaching the browser is sanitized.
+
+**SAST False Positive Check:**
+- The rule is `java/xss`.
+- The code explicitly calls `ESAPI.encoder().encodeForHTML()` on the user-supplied data before writing it to the HTML response.
+- OWASP ESAPI encoder is considered a robust defense against XSS.
+- Unless there is a known flaw in ESAPI's implementation or configuration, this is a mitigated risk.
+- Given this is the OWASP Benchmark project, these test cases often intentionally implement vulnerabilities to demonstrate them, OR they implement fixes to show how to fix them.
+- Looking at the filename: `BenchmarkTest00029`. Usually, benchmarks contain vulnerable code that needs fixing, or fixed code that demonstrates secure coding.
+- Let's look at the specific logic again.
+- `param` comes from `request.getParameterMap()`.
+- `input` becomes `((String) inputParam).getBytes()`.
+- Later: `new String(input)`.
+- Then: `.encodeForHTML(...)`.
+- Finally printed to `response.getWriter()`.
+
+If `encodeForHTML` is used correctly, XSS is prevented.
+However, sometimes SAST tools flag this pattern even if it looks correct because they detect the usage of `ESAPI.encoder()` generically, or they miss the fact that the data is being sanitized. Or perhaps the SAST tool thinks `encodeForHTML` is insufficient? Unlikely for ESAPI.
+Or maybe the SAST tool flags the usage of `ESAPI.encoder()` as suspicious? No, usually ESAPI is trusted.
+
+Let's consider the possibility of a false positive.
+Why would it be a True Positive?
+Is `encodeForHTML` actually protecting against all XSS vectors?
+It protects against HTML entity injection.
+Does it protect against JavaScript event handlers? Yes, usually encodes `<` and `>`.
+Does it handle attributes? `encodeForHTML` typically handles text nodes. If the input is placed inside an attribute, different encoding might be needed. But here the string is concatenated into a literal string: `"Sensitive value '..."`. This means the user input appears as text content within the HTML, not as an attribute value. Text content requires escaping of `<`, `>`, `&`. `encodeForHTML` does this.
+So, technically, this code *is* secure against XSS.
+
+Therefore, the SAST finding claiming "Cross-site scripting vulnerability" is likely a **False Positive (FP)** because effective mitigation (`encodeForHTML`) is present on the reported path leading to the sink.
+
+Wait, I need to check if the SAST report location matches the secure line.
+Raw output says:
+`startLine`: 87, `endLine`: 93.
+In the provided code block:
+Lines 87-93 correspond to:
+```java
+response.getWriter()
+        .println(
+                "Sensitive value '"
+                        + org.owasp
+                                .esapi
+                                .ESAPI
+                                .encoder()
+                                .encodeForHTML(new String(input))
+                        + "' hashed and stored<br/>");
+```
+Yes, the finding points to the exact line where `encodeForHTML` is used.
+
+Since `encodeForHTML` is a recognized secure practice for preventing XSS in HTML contexts, marking this as a vulnerability is incorrect. It is a False Positive.
+
+Confidence: High. The presence of `ESAPI.encoder().encodeForHTML()` wrapping the user input before rendering to the HTML response is a definitive mitigation strategy for XSS.
+
+Evidence:
+- Line 87-93 shows the user input `param` flowing into `input` and then being passed to `encodeForHTML` before being written to the response.
+- `encodeForHTML` escapes HTML special characters, neutralizing XSS attempts.
+
+Label: FP.
+
+One nuance: Sometimes benchmarks have tests that *intentionally* leave vulnerabilities to be found. But this specific file seems to be implementing a hash function. The title suggests "Benchmark". Often benchmarks contain intentional flaws. However, looking at the code, the developer has added `encodeForHTML`. Why would they add a mitigation if they intended a vulnerability?
+Usually, in the OWASP Benchmark, there are two versions: one vulnerable, one patched.
+If this is the "patched" version, it's FP.
+If this is the "vulnerable" version, why is `encodeForHTML` there? Maybe it's testing if the scanner catches it despite the mitigation? Or maybe the scanner is too aggressive?
+Actually, checking common patterns in OWASP Benchmark:
+There is often a distinction between `BenchmarkTestXXX` (vulnerable) and `BenchmarkTestXXXFixed` (secure).
+Here we have `BenchmarkTest00029`.
+If the code contains `encodeForHTML`, it implies the author tried to mitigate it.
+If the SAST reports it as XSS, it's likely a False Positive because the mitigation is present.
+Sometimes scanners fail to recognize that `encodeForHTML` wraps the sink properly.
+Given the instruction "Do not rely on the SAST message alone; verify impact on the reported path.", verifying the code shows `encodeForHTML` is used. Thus, the risk is mitigated. Hence FP.
+
+Double check: Is there any way `encodeForHTML` fails here?
+`new String(input)` relies on the default charset. If the server locale differs from the client locale, characters might be corrupted, potentially allowing bypass? E.g., if client sends UTF-8, server reads as ISO-8859-1, the bytes become garbage. Then `encodeForHTML` encodes the garbage. When sent back to client expecting UTF-8, the client sees mojibake. While annoying, does it allow `<script>` execution?
+Example: Client sends `<script>alert(1)</script>`.
+Server receives bytes. If charset mismatch, bytes might represent something else.
+But `encodeForHTML` works on the bytes received.
+If the bytes are interpreted differently than expected by the browser, the browser renders what it gets.
+If the browser expects UTF-8 and gets Latin-1, it displays garbled text. Garbled text doesn't trigger scripts easily unless the sequence accidentally forms a valid tag in the target encoding.
+However, `encodeForHTML` ensures that `<` becomes `&lt;`. Even if the rest of the string is mojibaked, the `<` is escaped. So `<script>` becomes `&lt;script&gt;`. The browser won't execute it.
+So the mitigation holds regardless of charset issues regarding the specific characters `<`, `>`, `&`.
+Thus, it remains FP.
+
+Another angle: Is `encodeForHTML` deprecated or insecure?
+ESAPI Encoder is generally considered secure.
+So, Label: FP.
+
+Reasoning summary:
+1. Identify sink: `response.getWriter().println(...)`.
+2. Trace data flow: `param` -> `input` -> `new String(input)` -> `encodeForHTML(...)`.
+3. Evaluate mitigation: `encodeForHTML` escapes HTML entities required to prevent XSS in HTML text content.
+4. Conclusion: Mitigation prevents the vulnerability. SAST finding is a False Positive.
+
+JSON Construction:
+- label: "FP"
+- confidence: "high"
+- confidence_score: 0.95 (or similar high number)
+- reason: Explain that ESAPI.encodeForHTML is used on user input before writing to response, mitigating XSS.
+- agent: "llm"
+- case_id: "BenchmarkTest00029"
+- evidence: Cite lines 87-93 showing the encoding step.
+
+Wait, check the raw output locations again.
+Region startLine 87, endLine 93.
+Matches the println statement.
+Okay.
+
+Final check on instructions:
+- "After any internal reasoning, output EXACTLY ONE JSON object matching the schema in the user message."
+- "Do NOT duplicate the JSON. Do NOT put JSON inside redacted_thinking blocks."
+- "No markdown code fences. No prose before or after the final JSON object."
+
+I will write the JSON now.
+
+```json
+{
+  "label": "FP",
+  "confidence": "high",
+  "confidence_score": 0.95,
+  "reason": "The reported path includes explicit XSS mitigation via org.owasp.esapi.ESAPI.encoder().encodeForHTML() on user-supplied input before writing to the HTTP response. This encoding neutralizes HTML special characters (<, >, &), preventing script injection in the rendered HTML text content.",
+  "evidence": [
+    {
+      "file": "src/main/java/org/owasp/benchmark/testcode/BenchmarkTest00029.java",
+      "lines": "L87-L93",
+      "note": "User input flows through ESAPI.encodeForHTML() before being written to response.getWriter(), ensuring proper HTML entity encoding."
+    }
+  ],
+  "agent": "llm",
+  "case_id": "BenchmarkTest00029"
+}
+```
+
+Wait, I should ensure the JSON syntax is perfect.
+Keys quoted. Strings quoted. Escaped quotes if necessary.
+Looks good.
+
+One detail: `confidence_score` type. Schema says `0.0`. Should be float.
+Schema example: `"confidence_score": 0.0`.
+My draft had `0.95`. That fits.
+
+Check strict rules:
+1. READ-ONLY: OK.
+2. Inspect reported file and lines: Done.
+3. Do not rely on SAST message alone: Verified code has mitigation.
+4. Do not default to TP/FP; use BL when both defensible: Here mitigation is clear, so FP is defensible.
+5. label must be exactly TP, FP, BL, or UNKNOWN: Using FP.
+6. evidence must include at least one item when label is TP, FP, or BL: Included.
+7. Output one JSON object only: Will do.
+8. Escape inner double quotes: Checked.
+
+Ready.
+
+One last check on the code provided in the prompt.
+The prompt provides the full source code.
+Lines 87-93 in the provided text:
+```java
+        response.getWriter()
+                .println(
+                        "Sensitive value '"
+                                + org.owasp
+                                        .esapi
+                                        .ESAPI
+                                        .encoder()
+                                        .encodeForHTML(new String(input))
+                                + "' hashed and stored<br/>");
+```
+Counting lines in the provided snippet:
+The snippet starts with package declaration.
+Line 1: /**
+...
+Line ~20: package org.owasp.benchmark.testcode;
+Line ~25: import ...
+...
+Line ~40: public class BenchmarkTest00029 ...
+Line ~44: @Override
+Line ~47: public void doGet ...
+Line ~50: @Override
+Line ~53: public void doPost ...
+Line ~56: response.setContentType...
+Line ~58: java.util.Map...
+Line ~61: String param = ""...
+Line ~63: if (!map.isEmpty())...
+Line ~66: String[] values...
+Line ~68: if (values != null)...
+Line ~71: try {
+Line ~72: java.util.Properties...
+Line ~78: String algorithm...
+Line ~80: java.security.MessageDigest...
+Line ~81: byte[] input = {(byte) '?'};
+Line ~82: Object inputParam = param;
+Line ~83: if (inputParam instanceof String)...
+Line ~87: md.update(input);
+Line ~90: byte[] result...
+Line ~91: java.io.File fileTarget...
+Line ~94: java.io.FileWriter fw...
+Line ~97: fw.write(
+Line ~98: "hash_value="
+Line ~99: + org.owasp.esapi.ESAPI.encoder().encodeForBase64(result, true)
+Line ~100: + "\n");
+Line ~101: fw.close();
+Line ~102: response.getWriter()
+Line ~103: .println(
+Line ~104: "Sensitive value '"
+Line ~105: + org.owasp
+Line ~106: .esapi
+Line ~107: .ESAPI
+Line ~108: .encoder()
+Line ~109: .encodeForHTML(new String(input))
+Line ~110: + "' hashed and stored<br/>");
+```
+Wait, my manual counting above puts the relevant lines around 102-110.
+The Raw Output says:
+`startLine`: 87, `endLine`: 93.
+And the region in raw output corresponds to:
+```json
+"region": {
+  "startLine": 87,
+  "startColumn": 29,
+  "endLine": 93,
+  "endColumn": 65
+}
+```
+Looking at the provided code block in the prompt:
+Line 87 in the provided text block:
+`md.update(input);` ?
+Let's count carefully from the top of the provided text block.
+1: /**
+2: * OWASP Benchmark v1.2
+3: *
+4: * <p>This file is part of the Open Web Application Security Project (OWASP) Benchmark Project. For
+5: * details, please see <a
+6: * href="https://owasp.org/www-project-benchmark/">https://owasp.org/www-project-benchmark/</a>.
+7: *
+8: * <p>The OWASP Benchmark is free software: you can redistribute it and/or modify it under the terms
+9: * of the GNU General Public License as published by the Free Software Foundation, version 2.
+10: *
+11: * <p>The OWASP Benchmark is distributed in the hope that it will be useful, but WITHOUT ANY
+12: * WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR
+13: * PURPOSE. See the GNU General Public License for more details.
+14: *
+15: * @author Dave Wichers
+16: * @created 2015
+17: */
+18: package org.owasp.benchmark.testcode;
+19: 
+20: import java.io.IOException;
+21: import javax.servlet.ServletException;
+22: import javax.servlet.annotation.WebServlet;
+23: import javax.servlet.http.HttpServlet;
+24: import javax.servlet.http.HttpServletRequest;
+25: import javax.servlet.http.HttpServletResponse;
+26: 
+27: @WebServlet(value = "/hash-00/BenchmarkTest00029")
+28: public class BenchmarkTest00029 extends HttpServlet {
+29: 
+30:     private static final long serialVersionUID = 1L;
+31: 
+32:     @Override
+33:     public void doGet(HttpServletRequest request, HttpServletResponse response)
+34:             throws ServletException, IOException {
+35:         doPost(request, response);
+36:     }
+37: 
+38:     @Override
+39:     public void doPost(HttpServletRequest request, HttpServletResponse response)
+40:             throws ServletException, IOException {
+41:         // some code
+42:         response.setContentType("text/html;charset=UTF-8");
+43: 
+44:         java.util.Map<String, String[]> map = request.getParameterMap();
+45:         String param = "";
+46:         if (!map.isEmpty()) {
+47:             String[] values = map.get("BenchmarkTest00029");
+48:             if (values != null) param = values[0];
+49:         }
+50: 
+51:         try {
+52:             java.util.Properties benchmarkprops = new java.util.Properties();
+53:             benchmarkprops.load(
+54:                     this.getClass().getClassLoader().getResourceAsStream("benchmark.properties"));
+55:             String algorithm = benchmarkprops.getProperty("hashAlg1", "SHA512");
+56:             java.security.MessageDigest md = java.security.MessageDigest.getInstance(algorithm);
+57:             byte[] input = {(byte) '?'};
+58:             Object inputParam = param;
+59:             if (inputParam instanceof String) input = ((String) inputParam).getBytes();
+60:             if (inputParam instanceof java.io.InputStream) {
+61:                 byte[] strInput = new byte[1000];
+62:                 int i = ((java.io.InputStream) inputParam).read(strInput);
+63:                 if (i == -1) {
+64:                     response.getWriter()
+65:                             .println(
+66:                                     "This input source requires a POST, not a GET. Incompatible UI for the InputStream source.");
+67:                     return;
+68:                 }
+69:                 input = java.util.Arrays.copyOf(strInput, i);
+70:             }
+71:             md.update(input);
+72: 
+73:             byte[] result = md.digest();
+74:             java.io.File fileTarget =
+75:                     new java.io.File(
+76:                             new java.io.File(org.owasp.benchmark.helpers.Utils.TESTFILES_DIR),
+77:                             "passwordFile.txt");
+78:             java.io.FileWriter fw =
+79:                     new java.io.FileWriter(fileTarget, true); // the true will append the new data
+80:             fw.write(
+81:                     "hash_value="
+82:                             + org.owasp.esapi.ESAPI.encoder().encodeForBase64(result, true)
+83:                             + "\n");
+84:             fw.close();
+85:             response.getWriter()
+86:                     .println(
+87:                             "Sensitive value '"
+88:                                     + org.owasp
+89:                                             .esapi
+90:                                             .ESAPI
+91:                                             .encoder()
+92:                                             .encodeForHTML(new String(input))
+93:                                     + "' hashed and stored<br/>");
+```
+Ah! My previous manual count was off.
+Line 87 is indeed the start of the `println` call for the sensitive value.
+Line 93 is the closing parenthesis of that `println` call.
+Specifically:
+87: `response.getWriter()`
+88: `.println(`
+89: `"Sensitive value '"`
+90: `+ org.`
+91: `esapi.`
+92: `ESAPI.`
+93: `encoder()`
+Wait, the indentation in the provided text makes it span multiple lines.
+Line 87: `response.getWriter()`
+Line 88: `.println(`
+Line 89: `"Sensitive value '"`
+Line 90: `+ org.`
+Line 91: `esapi.`
+Line 92: `ESAPI.`
+Line 93: `encoder()`
+Wait, looking at the provided text block again.
+Line 87: `response.getWriter()`
+Line 88: `.println(`
+Line 89: `"Sensitive value '"`
+Line 90: `+ org.`
+Line 91: `esapi.`
+Line 92: `ESAPI.`
+Line 93: `encoder()`
+Line 94: `.encodeForHTML(new String(input))` -- wait, in the text provided:
+Line 93 ends with `encodeForHTML(new String(input))`?
+Let's trace the text provided in the prompt exactly.
+Text segment:
+```java
+            response.getWriter()
+                    .println(
+                            "Sensitive value '"
+                                    + org.owasp
+                                            .esapi
+                                            .ESAPI
+                                            .encoder()
+                                            .encodeForHTML(new String(input))
+                                    + "' hashed and stored<br/>");
+```
+In the provided text block:
+Line 87: `response.getWriter()`
+Line 88: `.println(`
+Line 89: `"Sensitive value '"`
+Line 90: `+ org.`
+Line 91: `esapi.`
+Line 92: `ESAPI.`
+Line 93: `encoder()`
+Line 94: `.encodeForHTML(new String(input))`
+Line 95: `+ "' hashed and stored<br/>");`
+Wait, the raw output says `endLine`: 93.
+Maybe the line numbers in the raw output refer to the file index, while the provided text block has been reformatted or numbered differently?
+Actually, the raw output says:
+`startLine`: 87, `endLine`: 93.
+And the region in raw output corresponds to the snippet:
+```json
+"text": "..."
+"region": {
+  "startLine": 87,
+  "startColumn": 29,
+  "endLine": 93,
+  "endColumn": 65
+}
+```
+This region maps to the concatenation expression.
+In the provided text block, the lines match up visually with the raw output indices IF the provided text block is the same file.
+Let's assume the provided text block IS the file content and the line numbers are consistent.
+In the provided text block:
+Line 87: `response.getWriter()`
+Line 88: `.println(`
+Line 89: `"Sensitive value '"`
+Line 90: `+ org.`
+Line 91: `esapi.`
+Line 92: `ESAPI.`
+Line 93: `encoder()`
+Line 94: `.encodeForHTML(new String(input))`
+Line 95: `+ "' hashed and stored<br/>");`
+Wait, if the raw output says `endLine`: 93, but the code clearly continues past 93...
+Perhaps the raw output refers to the logical range including the method chain?
+Regardless, the key point is that `encodeForHTML` is present in the flow.
+Whether it ends at 93 or 95, the mitigation is there.
+The evidence should reference the lines where the mitigation occurs relative to the provided text.
+Based on the visual alignment of the provided text block:
+Lines 87-93 cover the beginning of the print statement up to `encoder()`.
+The critical part is that `encodeForHTML` is invoked.
+Even if the SAST highlights lines 87-93, the code at those lines initiates the sanitization chain.
+The fact that `encodeForHTML` is called confirms the mitigation.
+So I will cite lines 87-93 as requested by the evidence format (matching the finding's location), noting the mitigation.
+
+Wait, looking at the provided text block again.
+Line 93 is `.encodeForHTML(new String(input))`?
+Let's recount the provided text block precisely.
+1..17: Comments
+18: package
+19: empty
+20..25: imports
+26: @WebServlet
+27: public class
+28: empty
+29: serial
+30: empty
+31: @Override
+32: doGet
+33: throws
+34: empty
+35: doPost
+36: throws
+37: empty
+38: @Override
+39: doPost
+40: throws
+41: comment
+42: setContentType
+43: empty
+44: map
+45: param
+46: if
+47: values
+48: if
+49: empty
+50: empty
+51: try
+52: props
+53: load
+54: empty
+55: algo
+56: md
+57: input
+58: inputParam
+59: if
+60: if
+61: strInput
+62: read
+63: if
+64: response
+65: println
+66: "This input..."
+67: return
+68: empty
+69: input copy
+70: empty
+71: md.update
+72: empty
+73: result
+74: fileTarget
+75: new File
+76: new File
+77: passwordFile.txt
+78: FileWriter
+79: new FileWriter
+80: fw.write
+81: "hash_value="
+82: + encodeForBase64
+83: + "\n"
+84: fw.close
+85: response.getWriter
+86: .println
+87: "Sensitive value '"
+88: + org.
+89: esapi.
+90: ESAPI.
+91: encoder()
+92: .encodeForHTML(new String(input))
+93: + "' hashed and stored<br/>");
+```
+Okay, my recount shows `encodeForHTML` is on line 92.
+The raw output says `endLine`: 93.
+This discrepancy suggests the raw output might be referencing a slightly different version or the line numbering in the raw output includes the closing brace/semicolon or counts differently.
+However, since I am basing my decision on the **provided source** and data flow:
+The provided source clearly shows `encodeForHTML` is used.
+The SAST finding claims XSS vulnerability.
+The code implements mitigation.
+Conclusion: FP.
+
+I will formulate the evidence to reflect the provided source lines where the mitigation is visible.
+The finding cites 87-93.
+In the provided text, 87-93 covers the start of the print statement up to the close of the method call chain.
+I will note that the mitigation is present in this range.
+
+Final check on JSON validity.
+Ensure no trailing commas. Ensure strings are double quoted.
+</think>
+
+{
+  "label": "FP",
+  "confidence": "high",
+  "confidence_score": 0.95,
+  "reason": "The reported path includes explicit XSS mitigation via org.owasp.esapi.ESAPI.encoder().encodeForHTML() on user-supplied input before writing to the HTTP response. This encoding neutralizes HTML special characters (<, >, &), preventing script injection in the rendered HTML text content.",
+  "evidence": [
+    {
+      "file": "src/main/java/org/owasp/benchmark/testcode/BenchmarkTest00029.java",
+      "lines": "L87-L93",
+      "note": "User input flows through ESAPI.encodeForHTML() before being written to response.getWriter(), ensuring proper HTML entity encoding."
+    }
+  ],
+  "agent": "llm",
+  "case_id": "BenchmarkTest00029"
+}

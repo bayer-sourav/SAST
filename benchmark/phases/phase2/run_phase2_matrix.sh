@@ -293,4 +293,7 @@ done
 
 summarize_all
 date -Iseconds > "$LOG_DIR/finished_at.txt"
+if [[ -n "${PHASE2_EXTENSION:-}" ]]; then
+  date -Iseconds > "$LOG_DIR/qwen35_finished_at.txt"
+fi
 echo "=== Phase 2 complete ===" | tee -a "$PHASE2_LOG_FILE"

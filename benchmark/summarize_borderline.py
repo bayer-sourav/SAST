@@ -13,6 +13,7 @@ _sast = Path(__file__).resolve().parent.parent
 if str(_sast) not in sys.path:
     sys.path.insert(0, str(_sast))
 from benchmark.triage_labels import VALID_LABELS  # noqa: E402
+from benchmark.summarize_triage import _f1_for_positive_class  # noqa: E402
 
 
 def _load_label(result_path: Path) -> str | None:
@@ -91,6 +92,7 @@ def main() -> None:
             "lenient_accuracy": lenient_correct / evaluated if evaluated else 0.0,
             "benchmark_agreement": bench_agree / evaluated if evaluated else 0.0,
             "ambiguity_index": ambiguity,
+            "f1_bl": _f1_for_positive_class("BL", dist, evaluated=evaluated),
         }
 
     args.json_out.parent.mkdir(parents=True, exist_ok=True)

@@ -1,0 +1,313 @@
+# Phase 2 benchmark report
+
+Generated: 2026-06-05 07:25 UTC
+
+Note: **15 gaps skipped** (per `runs/phase2/logs/gaps_skipped.txt`).
+
+## Legend
+
+- All rates (FPRR, VDR, LenAcc, F1, coverage, label %) use **evaluated cases only**; missing or skipped cases are excluded from denominators.
+- **VDR** is often low on the TP track because gold labels are TP while models frequently predict FP or BL — low recall on the TP slice reflects conservative triage bias, not random error.
+- **SRS** = 0.5×FPRR + 0.5×VDR (FP + TP tracks). **SRS₃** adds borderline **LenAcc**: (FPRR + VDR + LenAcc) / 3 when borderline data exists for the profile.
+- **Macro F1** = mean(F1-FP, F1-TP, F1-BL) when borderline F1 is available; otherwise mean(F1-FP, F1-TP). **F1₂** = 0.5×F1-FP + 0.5×F1-TP (Phase 1 compatible; JSON field `f1`).
+- High FPRR with low VDR yields a moderate **SRS** (~50–65%): strong FP removal alongside weak TP retention.
+
+## Thinking off · Few-shot 0
+
+### Execution Summary
+
+**Timing**
+
+| Category | Model | N eval | Wall | Mean | σ | Median | Mean infer | σ infer |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| FP (200) | qwen3_4b_bnb | 200 | 29.2m | 8.8s | 2.5s | 8.3s | 8.7s | 2.4s |
+| FP (200) | qwen3_8b_bnb | 199 | 21.8m | 6.6s | 5.3s | 5.8s | 6.6s | 5.0s |
+| FP (200) | qwen3_14b_bnb | 200 | 29.3m | 8.8s | 7.2s | 7.8s | 8.8s | 7.0s |
+| FP (200) | qwen3_coder_30b_bnb | 200 | 9.3m | 2.8s | 3.9s | 1.6s | 2.8s | 3.9s |
+| FP (200) | qwen3_5_4b_bnb | 200 | 55.8m | 16.7s | 8.4s | 15.0s | 16.7s | 8.2s |
+| FP (200) | qwen3_5_9b_bnb | 200 | 56.0m | 16.8s | 5.3s | 16.9s | 16.8s | 5.2s |
+| TP (200) | qwen3_4b_bnb | 199 | 30.4m | 9.2s | 2.6s | 8.3s | 9.1s | 2.5s |
+| TP (200) | qwen3_8b_bnb | 197 | 22.5m | 6.8s | 2.3s | 6.5s | 6.8s | 2.1s |
+| TP (200) | qwen3_14b_bnb | 200 | 31.0m | 9.3s | 2.5s | 8.5s | 9.3s | 2.4s |
+| TP (200) | qwen3_coder_30b_bnb | 200 | 11.3m | 3.4s | 4.8s | 1.9s | 3.4s | 4.8s |
+| TP (200) | qwen3_5_4b_bnb | 200 | 52.2m | 15.7s | 3.7s | 15.1s | 15.6s | 3.6s |
+| TP (200) | qwen3_5_9b_bnb | 200 | 1h0m | 18.1s | 7.1s | 16.8s | 18.1s | 7.0s |
+| BL (200) | qwen3_4b_bnb | 199 | 28.5m | 8.6s | 2.6s | 7.8s | 8.6s | 2.5s |
+| BL (200) | qwen3_8b_bnb | 197 | 20.8m | 6.3s | 2.0s | 6.1s | 6.3s | 1.9s |
+| BL (200) | qwen3_14b_bnb | 199 | 31.4m | 9.5s | 3.0s | 8.5s | 9.4s | 2.9s |
+| BL (200) | qwen3_coder_30b_bnb | 200 | 10.1m | 3.0s | 3.5s | 1.6s | 3.0s | 3.5s |
+| BL (200) | qwen3_5_4b_bnb | 200 | 49.1m | 14.7s | 3.7s | 13.8s | 14.7s | 3.5s |
+| BL (200) | qwen3_5_9b_bnb | 200 | 57.5m | 17.3s | 6.7s | 16.4s | 17.2s | 6.6s |
+
+**Tokens**
+
+| Category | Model | N eval | Mean total | σ | Mean in | σ | Mean out | σ |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| FP (200) | qwen3_4b_bnb | 200 | 5059 | 2097.8 | 4814 | 2102.6 | 245 | 61.6 |
+| FP (200) | qwen3_8b_bnb | 199 | 4970 | 2111.4 | 4808 | 2103.2 | 162 | 49.8 |
+| FP (200) | qwen3_14b_bnb | 200 | 5003 | 2095.4 | 4818 | 2102.6 | 185 | 40.4 |
+| FP (200) | qwen3_coder_30b_bnb | 200 | 5098 | 2105.0 | 4814 | 2102.6 | 284 | 50.6 |
+| FP (200) | qwen3_5_4b_bnb | 200 | 5634 | 2398.1 | 5384 | 2397.2 | 250 | 84.3 |
+| FP (200) | qwen3_5_9b_bnb | 200 | 5632 | 2412.7 | 5384 | 2397.2 | 248 | 71.2 |
+| TP (200) | qwen3_4b_bnb | 199 | 5735 | 2175.6 | 5486 | 2181.4 | 249 | 66.7 |
+| TP (200) | qwen3_8b_bnb | 197 | 5665 | 2184.7 | 5493 | 2192.3 | 173 | 51.1 |
+| TP (200) | qwen3_14b_bnb | 200 | 5758 | 2378.4 | 5560 | 2391.1 | 198 | 50.3 |
+| TP (200) | qwen3_coder_30b_bnb | 200 | 5845 | 2395.6 | 5556 | 2391.1 | 289 | 44.6 |
+| TP (200) | qwen3_5_4b_bnb | 200 | 6478 | 2728.4 | 6238 | 2727.6 | 240 | 51.3 |
+| TP (200) | qwen3_5_9b_bnb | 200 | 6505 | 2745.5 | 6238 | 2727.6 | 267 | 105.1 |
+| BL (200) | qwen3_4b_bnb | 199 | 5224 | 2719.9 | 4989 | 2712.7 | 234 | 66.4 |
+| BL (200) | qwen3_8b_bnb | 197 | 5120 | 2707.1 | 4959 | 2702.2 | 162 | 45.4 |
+| BL (200) | qwen3_14b_bnb | 199 | 5198 | 2714.9 | 4993 | 2712.7 | 204 | 54.4 |
+| BL (200) | qwen3_coder_30b_bnb | 200 | 5324 | 2852.8 | 5049 | 2833.1 | 275 | 53.9 |
+| BL (200) | qwen3_5_4b_bnb | 200 | 5906 | 3243.9 | 5673 | 3231.1 | 233 | 46.5 |
+| BL (200) | qwen3_5_9b_bnb | 200 | 5926 | 3278.8 | 5673 | 3231.1 | 253 | 96.4 |
+
+### Results: Thinking off · Few-shot 0
+
+**Summary**
+
+| Profile | FPRR | VDR | SRS | Macro F1 | LenAcc | SRS3 |
+| --- | --- | --- | --- | --- | --- | --- |
+| qwen3_4b_bnb | 94.0% | 31.7% | 62.8% | 41.9% | 100.0% | 75.2% |
+| qwen3_8b_bnb | 97.0% | 14.7% | 55.9% | 39.3% | 93.9% | 68.5% |
+| qwen3_14b_bnb | 100.0% | 8.0% | 54.0% | 36.0% | 100.0% | 69.3% |
+| qwen3_coder_30b_bnb | 92.5% | 37.0% | 64.8% | 45.7% | 92.5% | 74.0% |
+
+**Detail**
+
+| Profile | F1₂ | F1-FP | F1-TP | F1-BL | Cov-FP | Cov-TP | Cov-BL | BenchAg | AmbIdx |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| qwen3_4b_bnb | 62.8% | 94.0% | 31.7% | 0.0% | 100.0% | 99.5% | 99.5% | 50.8% | 0.985 |
+| qwen3_8b_bnb | 55.9% | 97.0% | 14.7% | 6.1% | 99.5% | 98.5% | 98.5% | 68.0% | 0.518 |
+| qwen3_14b_bnb | 54.0% | 100.0% | 8.0% | 0.0% | 100.0% | 100.0% | 99.5% | 86.9% | 0.261 |
+| qwen3_coder_30b_bnb | 64.8% | 92.5% | 37.0% | 7.5% | 100.0% | 100.0% | 100.0% | 40.5% | 0.960 |
+
+### Borderline label distribution
+
+| Profile | TP% | FP% | BL% | distribution note |
+| --- | --- | --- | --- | --- |
+| qwen3_4b_bnb | 49.2% | 50.8% | 0.0% | FP-dominant |
+| qwen3_8b_bnb | 25.9% | 68.0% | 6.1% | FP-dominant |
+| qwen3_14b_bnb | 13.1% | 86.9% | 0.0% | FP-dominant |
+| qwen3_coder_30b_bnb | 52.0% | 40.5% | 7.5% | TP-dominant |
+
+## Thinking off · Few-shot 3
+
+### Execution Summary
+
+**Timing**
+
+| Category | Model | N eval | Wall | Mean | σ | Median | Mean infer | σ infer |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| FP (200) | qwen3_4b_bnb | 200 | 24.9m | 7.5s | 2.4s | 7.0s | 7.5s | 2.3s |
+| FP (200) | qwen3_8b_bnb | 200 | 23.7m | 7.1s | 1.8s | 6.5s | 7.1s | 1.7s |
+| FP (200) | qwen3_14b_bnb | 200 | 32.3m | 9.7s | 2.4s | 9.0s | 9.7s | 2.3s |
+| FP (200) | qwen3_coder_30b_bnb | 200 | 11.5m | 3.5s | 5.0s | 1.5s | 3.5s | 5.0s |
+| FP (200) | qwen3_5_4b_bnb | 200 | 54.6m | 16.4s | 6.4s | 14.8s | 16.4s | 6.3s |
+| FP (200) | qwen3_5_9b_bnb | 200 | 49.3m | 14.8s | 6.2s | 12.8s | 14.8s | 6.2s |
+| TP (200) | qwen3_4b_bnb | 200 | 29.8m | 8.9s | 11.1s | 7.7s | 8.9s | 11.0s |
+| TP (200) | qwen3_8b_bnb | 199 | 25.8m | 7.8s | 2.1s | 7.1s | 7.8s | 2.1s |
+| TP (200) | qwen3_14b_bnb | 199 | 35.1m | 10.6s | 2.8s | 9.8s | 10.6s | 2.7s |
+| TP (200) | qwen3_coder_30b_bnb | 200 | 10.1m | 3.0s | 3.8s | 1.8s | 3.0s | 3.8s |
+| TP (200) | qwen3_5_4b_bnb | 200 | 49.1m | 14.7s | 4.9s | 13.5s | 14.7s | 4.8s |
+| TP (200) | qwen3_5_9b_bnb | 200 | 58.1m | 17.4s | 7.1s | 15.7s | 17.4s | 7.0s |
+| BL (200) | qwen3_4b_bnb | 199 | 26.0m | 7.8s | 2.7s | 7.4s | 7.8s | 2.6s |
+| BL (200) | qwen3_8b_bnb | 199 | 25.3m | 7.6s | 1.8s | 7.3s | 7.6s | 1.7s |
+| BL (200) | qwen3_14b_bnb | 199 | 35.9m | 10.8s | 3.3s | 10.1s | 10.8s | 3.3s |
+| BL (200) | qwen3_coder_30b_bnb | 200 | 10.2m | 3.1s | 3.9s | 1.6s | 3.1s | 3.9s |
+| BL (200) | qwen3_5_4b_bnb | 200 | 53.5m | 16.0s | 17.6s | 13.8s | 16.0s | 17.5s |
+| BL (200) | qwen3_5_9b_bnb | 200 | 52.0m | 15.6s | 5.9s | 13.3s | 15.6s | 5.9s |
+
+**Tokens**
+
+| Category | Model | N eval | Mean total | σ | Mean in | σ | Mean out | σ |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| FP (200) | qwen3_4b_bnb | 200 | 7266 | 2116.7 | 7067 | 2102.6 | 199 | 47.1 |
+| FP (200) | qwen3_8b_bnb | 200 | 7249 | 2110.4 | 7071 | 2102.6 | 178 | 28.9 |
+| FP (200) | qwen3_14b_bnb | 200 | 7260 | 2102.5 | 7071 | 2102.6 | 189 | 27.6 |
+| FP (200) | qwen3_coder_30b_bnb | 200 | 7319 | 2117.4 | 7067 | 2102.6 | 252 | 56.4 |
+| FP (200) | qwen3_5_4b_bnb | 200 | 8019 | 2397.3 | 7777 | 2397.2 | 242 | 90.8 |
+| FP (200) | qwen3_5_9b_bnb | 200 | 7991 | 2408.1 | 7777 | 2397.2 | 214 | 92.2 |
+| TP (200) | qwen3_4b_bnb | 200 | 8046 | 2410.7 | 7809 | 2391.1 | 237 | 284.2 |
+| TP (200) | qwen3_8b_bnb | 199 | 7930 | 2189.6 | 7743 | 2181.4 | 187 | 39.6 |
+| TP (200) | qwen3_14b_bnb | 199 | 7941 | 2179.6 | 7743 | 2181.4 | 198 | 42.5 |
+| TP (200) | qwen3_coder_30b_bnb | 200 | 8067 | 2402.3 | 7809 | 2391.1 | 258 | 55.5 |
+| TP (200) | qwen3_5_4b_bnb | 200 | 8854 | 2737.0 | 8631 | 2727.6 | 223 | 66.7 |
+| TP (200) | qwen3_5_9b_bnb | 200 | 8883 | 2742.6 | 8631 | 2727.6 | 252 | 105.6 |
+| BL (200) | qwen3_4b_bnb | 199 | 7449 | 2729.1 | 7242 | 2712.7 | 206 | 64.9 |
+| BL (200) | qwen3_8b_bnb | 199 | 7430 | 2720.7 | 7246 | 2712.7 | 184 | 30.2 |
+| BL (200) | qwen3_14b_bnb | 199 | 7450 | 2725.8 | 7246 | 2712.7 | 204 | 43.7 |
+| BL (200) | qwen3_coder_30b_bnb | 200 | 7545 | 2847.8 | 7302 | 2833.1 | 243 | 59.1 |
+| BL (200) | qwen3_5_4b_bnb | 200 | 8311 | 3243.9 | 8066 | 3231.1 | 245 | 279.3 |
+| BL (200) | qwen3_5_9b_bnb | 200 | 8295 | 3270.3 | 8066 | 3231.1 | 229 | 87.4 |
+
+### Results: Thinking off · Few-shot 3
+
+**Summary**
+
+| Profile | FPRR | VDR | SRS | Macro F1 | LenAcc | SRS3 |
+| --- | --- | --- | --- | --- | --- | --- |
+| qwen3_4b_bnb | 100.0% | 9.5% | 54.8% | 41.2% | 85.9% | 65.1% |
+| qwen3_8b_bnb | 95.0% | 8.0% | 51.5% | 37.4% | 91.0% | 64.7% |
+| qwen3_14b_bnb | 100.0% | 16.1% | 58.0% | 39.7% | 97.0% | 71.0% |
+| qwen3_coder_30b_bnb | 90.5% | 38.5% | 64.5% | 44.2% | 96.5% | 75.2% |
+
+**Detail**
+
+| Profile | F1₂ | F1-FP | F1-TP | F1-BL | Cov-FP | Cov-TP | Cov-BL | BenchAg | AmbIdx |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| qwen3_4b_bnb | 54.8% | 100.0% | 9.5% | 14.1% | 100.0% | 100.0% | 99.5% | 77.4% | 0.171 |
+| qwen3_8b_bnb | 51.5% | 95.0% | 8.0% | 9.0% | 100.0% | 99.5% | 99.5% | 78.9% | 0.241 |
+| qwen3_14b_bnb | 58.0% | 100.0% | 16.1% | 3.0% | 100.0% | 99.5% | 99.5% | 78.9% | 0.362 |
+| qwen3_coder_30b_bnb | 64.5% | 90.5% | 38.5% | 3.5% | 100.0% | 100.0% | 100.0% | 53.0% | 0.870 |
+
+### Borderline label distribution
+
+| Profile | TP% | FP% | BL% | distribution note |
+| --- | --- | --- | --- | --- |
+| qwen3_4b_bnb | 8.5% | 77.4% | 14.1% | FP-dominant |
+| qwen3_8b_bnb | 12.1% | 78.9% | 9.0% | FP-dominant |
+| qwen3_14b_bnb | 18.1% | 78.9% | 3.0% | FP-dominant |
+| qwen3_coder_30b_bnb | 43.5% | 53.0% | 3.5% | FP-dominant |
+
+## Thinking on · Few-shot 0
+
+### Execution Summary
+
+**Timing**
+
+| Category | Model | N eval | Wall | Mean | σ | Median | Mean infer | σ infer |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| FP (200) | qwen3_4b_bnb | 200 | 30.6m | 9.2s | 2.8s | 8.8s | 9.2s | 2.7s |
+| FP (200) | qwen3_8b_bnb | 200 | 2h41m | 48.3s | 19.1s | 45.0s | 48.3s | 19.1s |
+| FP (200) | qwen3_14b_bnb | 200 | 46.2m | 13.8s | 13.2s | 8.2s | 13.8s | 13.1s |
+| FP (200) | qwen3_coder_30b_bnb | 200 | 7.1m | 2.1s | 3.7s | 1.2s | 2.1s | 3.7s |
+| FP (200) | qwen3_5_4b_bnb | 200 | 4h40m | 1.4m | 35.1s | 1.2m | 1.4m | 35.1s |
+| TP (200) | qwen3_4b_bnb | 200 | 31.8m | 9.5s | 2.7s | 9.0s | 9.5s | 2.7s |
+| TP (200) | qwen3_8b_bnb | 200 | 2h56m | 53.0s | 23.6s | 52.9s | 53.0s | 23.6s |
+| TP (200) | qwen3_14b_bnb | 200 | 39.2m | 11.8s | 12.3s | 8.5s | 11.7s | 12.3s |
+| TP (200) | qwen3_coder_30b_bnb | 200 | 4.8m | 1.4s | 2.6s | 1.1s | 1.4s | 2.6s |
+| BL (200) | qwen3_4b_bnb | 200 | 28.9m | 8.7s | 2.7s | 7.8s | 8.6s | 2.6s |
+| BL (200) | qwen3_8b_bnb | 200 | 2h48m | 50.7s | 25.2s | 48.8s | 50.6s | 25.1s |
+| BL (200) | qwen3_14b_bnb | 200 | 35.8m | 10.8s | 8.4s | 8.5s | 10.7s | 8.4s |
+| BL (200) | qwen3_coder_30b_bnb | 200 | 4.5m | 1.4s | 1.7s | 1.0s | 1.4s | 1.7s |
+
+**Tokens**
+
+| Category | Model | N eval | Mean total | σ | Mean in | σ | Mean out | σ |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| FP (200) | qwen3_4b_bnb | 200 | 5069 | 2098.4 | 4811 | 2102.6 | 258 | 70.8 |
+| FP (200) | qwen3_8b_bnb | 200 | 6170 | 2241.3 | 4811 | 2102.6 | 1359 | 514.6 |
+| FP (200) | qwen3_14b_bnb | 200 | 5123 | 2113.4 | 4811 | 2102.6 | 312 | 297.4 |
+| FP (200) | qwen3_coder_30b_bnb | 200 | 5104 | 2108.2 | 4811 | 2102.6 | 293 | 52.2 |
+| FP (200) | qwen3_5_4b_bnb | 200 | 6707 | 2488.9 | 5378 | 2397.2 | 1329 | 555.7 |
+| TP (200) | qwen3_4b_bnb | 200 | 5818 | 2384.9 | 5553 | 2391.1 | 265 | 70.1 |
+| TP (200) | qwen3_8b_bnb | 200 | 7047 | 2579.1 | 5553 | 2391.1 | 1494 | 621.4 |
+| TP (200) | qwen3_14b_bnb | 200 | 5794 | 2469.8 | 5553 | 2391.1 | 241 | 197.8 |
+| TP (200) | qwen3_coder_30b_bnb | 200 | 5850 | 2390.2 | 5553 | 2391.1 | 297 | 48.5 |
+| BL (200) | qwen3_4b_bnb | 200 | 5289 | 2845.6 | 5046 | 2833.1 | 243 | 68.8 |
+| BL (200) | qwen3_8b_bnb | 200 | 6431 | 3216.3 | 5046 | 2833.1 | 1385 | 661.1 |
+| BL (200) | qwen3_14b_bnb | 200 | 5276 | 2861.0 | 5046 | 2833.1 | 231 | 160.5 |
+| BL (200) | qwen3_coder_30b_bnb | 200 | 5325 | 2851.5 | 5046 | 2833.1 | 280 | 55.1 |
+
+### Results: Thinking on · Few-shot 0
+
+**Summary**
+
+| Profile | FPRR | VDR | SRS | Macro F1 | LenAcc | SRS3 |
+| --- | --- | --- | --- | --- | --- | --- |
+| qwen3_4b_bnb | 95.5% | 21.5% | 58.5% | 39.0% | 100.0% | 72.3% |
+| qwen3_8b_bnb | 82.5% | 54.5% | 68.5% | 46.2% | 98.5% | 78.5% |
+| qwen3_14b_bnb | 98.5% | 11.5% | 55.0% | 36.7% | 100.0% | 70.0% |
+| qwen3_coder_30b_bnb | 91.5% | 37.0% | 64.2% | 46.7% | 88.5% | 72.3% |
+
+**Detail**
+
+| Profile | F1₂ | F1-FP | F1-TP | F1-BL | Cov-FP | Cov-TP | Cov-BL | BenchAg | AmbIdx |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| qwen3_4b_bnb | 58.5% | 95.5% | 21.5% | 0.0% | 100.0% | 100.0% | 100.0% | 62.0% | 0.760 |
+| qwen3_8b_bnb | 68.5% | 82.5% | 54.5% | 1.5% | 100.0% | 100.0% | 100.0% | 14.5% | 0.320 |
+| qwen3_14b_bnb | 55.0% | 98.5% | 11.5% | 0.0% | 100.0% | 100.0% | 100.0% | 84.5% | 0.310 |
+| qwen3_coder_30b_bnb | 64.2% | 91.5% | 37.0% | 11.5% | 100.0% | 100.0% | 100.0% | 39.5% | 0.980 |
+
+### Borderline label distribution
+
+| Profile | TP% | FP% | BL% | distribution note |
+| --- | --- | --- | --- | --- |
+| qwen3_4b_bnb | 38.0% | 62.0% | 0.0% | FP-dominant |
+| qwen3_8b_bnb | 84.0% | 14.5% | 1.5% | TP-dominant |
+| qwen3_14b_bnb | 15.5% | 84.5% | 0.0% | FP-dominant |
+| qwen3_coder_30b_bnb | 49.0% | 39.5% | 11.5% | mixed |
+
+## Thinking on · Few-shot 3
+
+### Execution Summary
+
+**Timing**
+
+| Category | Model | N eval | Wall | Mean | σ | Median | Mean infer | σ infer |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| FP (200) | qwen3_4b_bnb | 200 | 27.8m | 8.3s | 3.1s | 8.0s | 8.3s | 3.0s |
+| FP (200) | qwen3_8b_bnb | 200 | 2h46m | 49.9s | 22.0s | 45.9s | 49.9s | 22.0s |
+| FP (200) | qwen3_14b_bnb | 200 | 59.9m | 18.0s | 21.0s | 9.2s | 18.0s | 21.0s |
+| FP (200) | qwen3_coder_30b_bnb | 200 | 4.6m | 1.4s | 1.3s | 1.1s | 1.4s | 1.3s |
+| FP (200) | qwen3_5_4b_bnb | 53 | 1h44m | 2.0m | 1.4m | 1.3m | 2.0m | 1.4m |
+| TP (200) | qwen3_4b_bnb | 200 | 31.3m | 9.4s | 3.1s | 9.0s | 9.4s | 3.1s |
+| TP (200) | qwen3_8b_bnb | 200 | 3h29m | 1.0m | 32.1s | 56.0s | 1.0m | 32.1s |
+| TP (200) | qwen3_14b_bnb | 200 | 1h24m | 25.3s | 30.6s | 10.1s | 25.3s | 30.6s |
+| TP (200) | qwen3_coder_30b_bnb | 200 | 5.0m | 1.5s | 1.9s | 1.1s | 1.5s | 1.9s |
+| BL (200) | qwen3_4b_bnb | 200 | 36.2m | 10.9s | 30.5s | 7.9s | 10.8s | 30.5s |
+| BL (200) | qwen3_8b_bnb | 200 | 3h13m | 58.0s | 33.1s | 46.3s | 57.9s | 33.1s |
+| BL (200) | qwen3_14b_bnb | 200 | 1h40m | 30.1s | 28.9s | 13.4s | 30.1s | 28.9s |
+| BL (200) | qwen3_coder_30b_bnb | 200 | 4.6m | 1.4s | 1.6s | 1.0s | 1.4s | 1.6s |
+
+**Tokens**
+
+| Category | Model | N eval | Mean total | σ | Mean in | σ | Mean out | σ |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| FP (200) | qwen3_4b_bnb | 200 | 7288 | 2115.6 | 7064 | 2102.6 | 224 | 70.2 |
+| FP (200) | qwen3_8b_bnb | 200 | 8401 | 2254.0 | 7064 | 2102.6 | 1338 | 543.8 |
+| FP (200) | qwen3_14b_bnb | 200 | 7401 | 2338.7 | 7064 | 2102.6 | 337 | 341.0 |
+| FP (200) | qwen3_coder_30b_bnb | 200 | 7309 | 2114.7 | 7064 | 2102.6 | 245 | 55.9 |
+| FP (200) | qwen3_5_4b_bnb | 53 | 9155 | 2821.2 | 7252 | 2338.3 | 1902 | 1330.0 |
+| TP (200) | qwen3_4b_bnb | 200 | 8057 | 2390.9 | 7806 | 2391.1 | 251 | 74.5 |
+| TP (200) | qwen3_8b_bnb | 200 | 9417 | 2674.8 | 7806 | 2391.1 | 1611 | 720.4 |
+| TP (200) | qwen3_14b_bnb | 200 | 8261 | 2683.1 | 7806 | 2391.1 | 455 | 505.7 |
+| TP (200) | qwen3_coder_30b_bnb | 200 | 8066 | 2403.8 | 7806 | 2391.1 | 260 | 55.9 |
+| BL (200) | qwen3_4b_bnb | 200 | 7574 | 2985.0 | 7299 | 2833.1 | 275 | 569.3 |
+| BL (200) | qwen3_8b_bnb | 200 | 8796 | 3235.6 | 7299 | 2833.1 | 1497 | 771.3 |
+| BL (200) | qwen3_14b_bnb | 200 | 7876 | 3009.5 | 7299 | 2833.1 | 577 | 504.8 |
+| BL (200) | qwen3_coder_30b_bnb | 200 | 7541 | 2856.8 | 7299 | 2833.1 | 242 | 58.0 |
+
+### Results: Thinking on · Few-shot 3
+
+**Summary**
+
+| Profile | FPRR | VDR | SRS | Macro F1 | LenAcc | SRS3 |
+| --- | --- | --- | --- | --- | --- | --- |
+| qwen3_4b_bnb | 100.0% | 9.5% | 54.8% | 41.5% | 85.0% | 64.8% |
+| qwen3_8b_bnb | 90.0% | 51.0% | 70.5% | 48.5% | 95.5% | 78.8% |
+| qwen3_14b_bnb | 97.5% | 26.0% | 61.7% | 42.3% | 96.5% | 73.3% |
+| qwen3_coder_30b_bnb | 90.0% | 43.0% | 66.5% | 45.5% | 96.5% | 76.5% |
+
+**Detail**
+
+| Profile | F1₂ | F1-FP | F1-TP | F1-BL | Cov-FP | Cov-TP | Cov-BL | BenchAg | AmbIdx |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| qwen3_4b_bnb | 54.8% | 100.0% | 9.5% | 15.0% | 100.0% | 100.0% | 100.0% | 76.0% | 0.180 |
+| qwen3_8b_bnb | 70.5% | 90.0% | 51.0% | 4.5% | 100.0% | 100.0% | 100.0% | 21.5% | 0.520 |
+| qwen3_14b_bnb | 61.7% | 97.5% | 26.0% | 3.5% | 100.0% | 100.0% | 100.0% | 53.5% | 0.860 |
+| qwen3_coder_30b_bnb | 66.5% | 90.0% | 43.0% | 3.5% | 100.0% | 100.0% | 100.0% | 45.0% | 0.970 |
+
+### Borderline label distribution
+
+| Profile | TP% | FP% | BL% | distribution note |
+| --- | --- | --- | --- | --- |
+| qwen3_4b_bnb | 9.0% | 76.0% | 15.0% | FP-dominant |
+| qwen3_8b_bnb | 74.0% | 21.5% | 4.5% | TP-dominant |
+| qwen3_14b_bnb | 43.0% | 53.5% | 3.5% | FP-dominant |
+| qwen3_coder_30b_bnb | 51.5% | 45.0% | 3.5% | TP-dominant |
+
+## Extension profiles
+
+**Qwen3.5 extension**: partial or missing cells — qwen3_5_4b_bnb fp think=on fs=3: 53/200; qwen3_5_4b_bnb tp think=on fs=0: no data; qwen3_5_4b_bnb tp think=on fs=3: no data; qwen3_5_4b_bnb bl think=on fs=0: no data; qwen3_5_4b_bnb bl think=on fs=3: no data; qwen3_5_9b_bnb fp think=on fs=0: no data; qwen3_5_9b_bnb fp think=on fs=3: no data; qwen3_5_9b_bnb tp think=on fs=0: no data …

@@ -28,7 +28,8 @@ _JSON_RULES = """Output requirements (strict):
 _SYSTEM_PROMPT = (
     "You are a security-oriented SAST triage assistant.\n"
     + _JSON_RULES
-    + "\nFollow the triage policy and label definitions in the user message exactly.\n"
+    + "\nFollow the triage policy in the user message exactly: assess every CodeQL alert, "
+    "then assign one case-level label.\n"
 )
 
 
