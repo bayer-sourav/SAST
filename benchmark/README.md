@@ -274,7 +274,7 @@ uv run python benchmark/run_openhands.py \
 
 Profiles: `qwen3_4b_bnb`, `qwen3_8b_bnb` (see `models/qwen/runner.py`).
 
-Stack: `uv sync` installs `unsloth`, `transformers` (≤5.5), `torch` (<2.11) per `pyproject.toml`.
+Stack: `uv sync` installs `unsloth`, `transformers` (5.5.x for Gemma 4), `torch` (<2.11) per `pyproject.toml`.
 
 ---
 

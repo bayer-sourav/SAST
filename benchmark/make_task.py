@@ -169,6 +169,7 @@ def build_task_markdown(
     agent: str = "generic",
     *,
     few_shot: int = 0,
+    few_shot_config: str | Path | None = None,
 ) -> str:
     cid = stable_case_id(case)
     tool = case.get("tool", "unknown-tool")
@@ -222,10 +223,12 @@ def build_task_markdown(
     alerts_summary = _format_alerts_summary(alerts, str(file_path or ""))
 
     few_shot_block = ""
+    layout_version = None
     if few_shot > 0 and agent == "llm":
-        from benchmark.few_shot import build_few_shot_task_section
+        from benchmark.few_shot import build_few_shot_task_section, layout_tag_from_config
 
-        few_shot_block = build_few_shot_task_section(k=few_shot)
+        few_shot_block = build_few_shot_task_section(k=few_shot, config_path=few_shot_config)
+        layout_version = layout_tag_from_config(few_shot_config)
 
     # Do not include repo_root or corpus paths in the prompt (track leakage).
     context_lines = [f"- **case_id**: `{cid}`"]
@@ -233,7 +236,7 @@ def build_task_markdown(
         context_lines.append(f"- **scan_root (relative)**: `{effective_scan_root}`")
     context_block = "\n".join(context_lines)
 
-    return f"""{TASK_TITLE_MARKER} ({task_prompt_tag(few_shot=few_shot)})
+    return f"""{TASK_TITLE_MARKER} ({task_prompt_tag(few_shot=few_shot, layout_version=layout_version)})
 
 ## Context
 {context_block}
@@ -344,11 +347,19 @@ def main() -> None:
         "--few-shot",
         type=int,
         default=0,
-        choices=(0, 3),
-        help="Include N few-shot exemplars in task body (0 or 3).",
+        help="Include N few-shot exemplars in task body (0 or configured exemplar count).",
+    )
+    ap.add_argument(
+        "--few-shot-config",
+        default=None,
+        help="Few-shot config name (e.g. v2_3shot_2tp_fp) or path to JSON. "
+        "Default: few_shot_examples.json or SAST_FEWSHOT_CONFIG env.",
     )
     ap.add_argument("--print-schema", action="store_true")
     args = ap.parse_args()
+    from benchmark.few_shot import validate_few_shot_k
+
+    validate_few_shot_k(args.few_shot, args.few_shot_config)
 
     if args.print_schema:
         print(json.dumps({"case_id": "BenchmarkTest00001", "tool": ["CodeQL"], "file": "src/Foo.java"}, indent=2))
@@ -366,6 +377,7 @@ def main() -> None:
             scan_root=args.scan_root,
             agent=args.agent,
             few_shot=args.few_shot,
+            few_shot_config=args.few_shot_config,
         ),
         encoding="utf-8",
     )

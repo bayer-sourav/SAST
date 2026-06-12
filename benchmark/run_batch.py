@@ -92,8 +92,12 @@ def _main() -> None:
         "--few-shot",
         type=int,
         default=0,
-        choices=(0, 3),
-        help="Few-shot exemplars in system prompt (0 or 3).",
+        help="Few-shot exemplars in task body (0 or configured exemplar count).",
+    )
+    ap.add_argument(
+        "--few-shot-config",
+        default=None,
+        help="Few-shot config name or path (see benchmark/few_shot_configs/manifest.json).",
     )
     ap.add_argument("--llm-model", default="local-qwen", help="LLM_MODEL for --agent openhands")
     ap.add_argument("--llm-provider", default="openai")
@@ -136,6 +140,9 @@ def _main() -> None:
         help="Spawn a new Python process per case (reloads model each time). Default: in-process batch.",
     )
     args = ap.parse_args()
+    from benchmark.few_shot import validate_few_shot_k
+
+    validate_few_shot_k(args.few_shot, args.few_shot_config)
 
     if args.profile == "gpt_oss_20b":
         import os
@@ -203,6 +210,8 @@ def _main() -> None:
         if args.max_cases is not None:
             pb_cmd.extend(["--max-cases", str(args.max_cases)])
         pb_cmd.extend(["--few-shot", str(args.few_shot)])
+        if args.few_shot_config:
+            pb_cmd.extend(["--few-shot-config", str(args.few_shot_config)])
         print(f"[batch] prebuilding task.md for {len(files)} cases (CPU, no model load)...", flush=True)
         subprocess.run(pb_cmd, cwd=str(sast_root), check=False)
         if args.profile in ("qwen3_coder_30b_bnb", "gpt_oss_20b"):
@@ -270,6 +279,7 @@ def _main() -> None:
                 gold=args.gold,
                 thinking=args.thinking,
                 few_shot=args.few_shot,
+                few_shot_config=args.few_shot_config,
                 repo=repo,
                 quiet=True,
             )
@@ -293,6 +303,8 @@ def _main() -> None:
                 cmd.append("--thinking")
             if args.few_shot:
                 cmd.extend(["--few-shot", str(args.few_shot)])
+            if args.few_shot_config:
+                cmd.extend(["--few-shot-config", str(args.few_shot_config)])
             r = subprocess.run(cmd, cwd=str(sast_root))
             rc = r.returncode
             meta = read_run_meta(run_dir)

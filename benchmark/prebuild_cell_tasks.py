@@ -19,12 +19,17 @@ def _build_one(
     run_dir: Path,
     scan_root: str,
     few_shot: int,
+    few_shot_config: str | None = None,
 ) -> tuple[bool, str]:
+    from benchmark.few_shot import layout_tag_from_config
     from benchmark.triage_labels import task_markdown_current
 
+    layout_version = layout_tag_from_config(few_shot_config) if few_shot > 0 else None
     run_dir.mkdir(parents=True, exist_ok=True)
     task_path = run_dir / "task.md"
-    if task_markdown_current(task_path, few_shot=few_shot):
+    if task_markdown_current(
+        task_path, few_shot=few_shot, layout_version=layout_version
+    ):
         return True, "cached"
     cmd = [
         sys.executable,
@@ -42,6 +47,8 @@ def _build_one(
         "--few-shot",
         str(few_shot),
     ]
+    if few_shot_config:
+        cmd.extend(["--few-shot-config", str(few_shot_config)])
     last = ""
     for attempt in range(3):
         proc = subprocess.run(cmd, capture_output=True, text=True)
@@ -60,8 +67,15 @@ def main() -> None:
     ap.add_argument("--repo", type=Path, default=None)
     ap.add_argument("--only-missing", action="store_true", help="Skip dirs with current task.md")
     ap.add_argument("--max-cases", type=int, default=None, help="Only prebuild first N cases (sorted).")
-    ap.add_argument("--few-shot", type=int, default=0, choices=(0, 3))
+    ap.add_argument("--few-shot", type=int, default=0)
+    ap.add_argument("--few-shot-config", default=None)
     args = ap.parse_args()
+    from benchmark.few_shot import layout_tag_from_config, validate_few_shot_k
+
+    validate_few_shot_k(args.few_shot, args.few_shot_config)
+    layout_version = (
+        layout_tag_from_config(args.few_shot_config) if args.few_shot > 0 else None
+    )
 
     sast_root = Path(__file__).resolve().parent.parent
     bench = Path(__file__).resolve().parent
@@ -87,7 +101,9 @@ def main() -> None:
         cid = stable_case_id(case)
         run_dir = llm_root / cid
         if args.only_missing and task_markdown_current(
-            run_dir / "task.md", few_shot=args.few_shot
+            run_dir / "task.md",
+            few_shot=args.few_shot,
+            layout_version=layout_version,
         ):
             cached += 1
             continue
@@ -102,6 +118,7 @@ def main() -> None:
             run_dir=run_dir,
             scan_root=str(scan),
             few_shot=args.few_shot,
+            few_shot_config=args.few_shot_config,
         )
         if ok:
             if msg == "built":

@@ -173,12 +173,43 @@ def _text_tokenizer(tok_or_proc: Any) -> Any:
     return inner if inner is not None else tok_or_proc
 
 
+def _apply_chat_template_kwargs(tok: Any, *, enable_thinking: bool) -> dict[str, Any]:
+    """Build apply_chat_template kwargs; pass enable_thinking only when supported (Gemma 4)."""
+    kw: dict[str, Any] = {"tokenize": False, "add_generation_prompt": True}
+    try:
+        params = inspect.signature(tok.apply_chat_template).parameters
+    except (TypeError, ValueError):
+        return kw
+    if "enable_thinking" in params:
+        kw["enable_thinking"] = enable_thinking
+    return kw
+
+
+def _maybe_gemma4_chat_template(tok_or_proc: Any, model_name: str) -> Any:
+    """Install Unsloth gemma-4 chat template when loading Gemma 4 checkpoints."""
+    if "gemma-4" not in model_name.lower():
+        return tok_or_proc
+    try:
+        from unsloth.chat_templates import get_chat_template  # type: ignore[import-not-found]
+
+        t = _text_tokenizer(tok_or_proc)
+        updated = get_chat_template(t, chat_template="gemma-4")
+        if getattr(tok_or_proc, "tokenizer", None) is not None:
+            tok_or_proc.tokenizer = updated
+            return tok_or_proc
+        return updated
+    except Exception as exc:
+        print(f"[Gemma Unsloth] gemma-4 chat template setup skipped: {exc!r}", flush=True)
+        return tok_or_proc
+
+
 def _encode_messages(
     tok_or_proc: Any,
     messages: list[dict[str, str]],
     device: torch.device,
     *,
     max_context_tokens: int,
+    enable_thinking: bool = False,
 ) -> dict[str, Any]:
     """
     Match Qwen Unsloth: chat_template → string prompt → tokenizer(..., return_tensors='pt').
@@ -195,8 +226,7 @@ def _encode_messages(
 
     prompt = t.apply_chat_template(
         messages,
-        tokenize=False,
-        add_generation_prompt=True,
+        **_apply_chat_template_kwargs(t, enable_thinking=enable_thinking),
     )
     # Same call shape as Qwen runner (truncation keeps long tool catalogs inside a safe window).
     enc = t(prompt, return_tensors="pt", truncation=True, max_length=max_prompt_len)
@@ -268,6 +298,7 @@ def _load_fastmodel(
         # fp16/bf16 path only when neither 4- nor 8-bit BnB.
         fm_kw["load_in_16bit"] = not use_4bit and not use_8bit
     model, tokenizer = FastModel.from_pretrained(**fm_kw)
+    tokenizer = _maybe_gemma4_chat_template(tokenizer, model_name)
     model.eval()
     _CACHE[slot] = (model, tokenizer)
     _LOADED_4BIT[slot] = use_4bit or use_8bit
@@ -285,6 +316,7 @@ def gemma3_unsloth_generate_from_messages(
     messages: list[dict[str, str]],
     use_4bit: bool,
     max_seq_length: int | None = None,
+    enable_thinking: bool = False,
 ) -> str:
     _warn_wrong_gemma_cache_env_once()
     msl = max_seq_length
@@ -302,10 +334,16 @@ def gemma3_unsloth_generate_from_messages(
     mpe = getattr(cfg, "max_position_embeddings", None) if cfg is not None else None
     # Do not let prompt+gen planning exceed the checkpoint's position table (avoids RoPE/index asserts).
     ctx_cap = min(msl, int(mpe)) if mpe is not None else msl
-    inputs = _encode_messages(tok_or_proc, messages, device, max_context_tokens=ctx_cap)
+    inputs = _encode_messages(
+        tok_or_proc,
+        messages,
+        device,
+        max_context_tokens=ctx_cap,
+        enable_thinking=enable_thinking,
+    )
     input_len = int(inputs["input_ids"].shape[1])
     gen_kw = cap_max_new_tokens(
-        agent_decoding_kwargs(),
+        agent_decoding_kwargs(enable_thinking=enable_thinking),
         input_token_len=input_len,
         max_seq_len=ctx_cap,
     )

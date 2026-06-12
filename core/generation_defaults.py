@@ -47,6 +47,21 @@ def cap_max_new_tokens(
     return gen_kwargs
 
 
+def apply_triage_run_token_limits(*, thinking: bool) -> None:
+    """Phase-2-style decode caps so thinking runs do not budget ~32k new tokens per case."""
+    if thinking:
+        os.environ.setdefault("AGENT_MAX_SEQ_LEN", os.environ.get("PHASE2_ON_MAX_SEQ_LEN", "32768"))
+        os.environ.setdefault("AGENT_MAX_NEW_TOKENS", os.environ.get("PHASE2_ON_MAX_NEW_TOKENS", "8192"))
+        os.environ.setdefault(
+            "AGENT_MAX_NEW_TOKENS_THINKING",
+            os.environ.get("PHASE2_ON_MAX_NEW_TOKENS_THINKING", "8192"),
+        )
+        os.environ.setdefault("QWEN_MAX_SEQ_LEN", os.environ.get("PHASE2_ON_MAX_SEQ_LEN", "32768"))
+    else:
+        os.environ.setdefault("AGENT_MAX_SEQ_LEN", os.environ.get("PHASE2_OFF_MAX_SEQ_LEN", "16384"))
+        os.environ.setdefault("AGENT_MAX_NEW_TOKENS", os.environ.get("PHASE2_OFF_MAX_NEW_TOKENS", "4096"))
+
+
 def agent_decoding_kwargs(*, enable_thinking: bool = False) -> dict[str, Any]:
     """
     Decoding kwargs for triage JSON generation.

@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
 _DEFAULT_EXAMPLES = Path(__file__).resolve().parent / "few_shot_examples.json"
+_CONFIGS_DIR = Path(__file__).resolve().parent / "few_shot_configs"
+_MANIFEST = _CONFIGS_DIR / "manifest.json"
 _EXCERPT_PAD_LINES = 18
 _EXCERPT_PAD_LINES_COMPACT = 6
 
@@ -15,16 +18,78 @@ def _sast_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
-def load_few_shot_config(path: Path | None = None) -> dict[str, Any]:
-    p = (path or _DEFAULT_EXAMPLES).expanduser().resolve()
+def _load_manifest() -> dict[str, Any]:
+    if not _MANIFEST.is_file():
+        return {"default": None, "configs": {}}
+    return json.loads(_MANIFEST.read_text(encoding="utf-8"))
+
+
+def resolve_few_shot_config_path(name_or_path: str | Path | None = None) -> Path:
+    """Resolve config name (e.g. v2_3shot_2tp_fp), env SAST_FEWSHOT_CONFIG, or explicit path."""
+    raw = name_or_path if name_or_path is not None else os.environ.get("SAST_FEWSHOT_CONFIG")
+    if raw is None or str(raw).strip() == "":
+        return _DEFAULT_EXAMPLES.resolve()
+    p = Path(str(raw)).expanduser()
+    if p.is_file():
+        return p.resolve()
+    manifest = _load_manifest()
+    configs = manifest.get("configs") or {}
+    key = str(raw).strip()
+    if key not in configs:
+        raise FileNotFoundError(
+            f"unknown few-shot config {key!r}; known: {sorted(configs)} "
+            f"(or pass a path to a JSON file)"
+        )
+    rel = configs[key].get("path") or f"{key}.json"
+    resolved = (_CONFIGS_DIR / rel).resolve()
+    if not resolved.is_file():
+        raise FileNotFoundError(f"few-shot config file missing: {resolved}")
+    return resolved
+
+
+def layout_tag_from_config(path: Path | None = None) -> str:
+    cfg = load_few_shot_config(path)
+    tag = str(cfg.get("layout_tag") or "").strip()
+    if tag:
+        return tag
+    manifest = _load_manifest()
+    for _name, meta in (manifest.get("configs") or {}).items():
+        rel = meta.get("path")
+        if rel and (_CONFIGS_DIR / rel).resolve() == (path or _DEFAULT_EXAMPLES).resolve():
+            return str(meta.get("layout_tag") or "v2")
+    return "v2"
+
+
+def load_few_shot_config(path: Path | str | None = None) -> dict[str, Any]:
+    p = resolve_few_shot_config_path(path)
     if not p.is_file():
         raise FileNotFoundError(f"few-shot config not found: {p}")
     return json.loads(p.read_text(encoding="utf-8"))
 
 
-def few_shot_case_ids(path: Path | None = None) -> frozenset[str]:
+def few_shot_case_ids(path: Path | str | None = None) -> frozenset[str]:
     cfg = load_few_shot_config(path)
     return frozenset(str(e["case_id"]) for e in cfg.get("exemplars") or [])
+
+
+def configured_few_shot_k(path: Path | str | None = None) -> int:
+    """Number of frozen exemplars in the active few-shot config."""
+    cfg = load_few_shot_config(path)
+    return len(cfg.get("exemplars") or [])
+
+
+def few_shot_arg_choices(path: Path | str | None = None) -> tuple[int, ...]:
+    """Valid --few-shot values: 0 (zero-shot) or full exemplar count."""
+    k = configured_few_shot_k(path)
+    return (0, k) if k > 0 else (0,)
+
+
+def validate_few_shot_k(k: int, path: Path | str | None = None) -> int:
+    choices = few_shot_arg_choices(path)
+    if k not in choices:
+        opts = ", ".join(str(c) for c in choices)
+        raise ValueError(f"few-shot k={k} invalid; expected one of: {opts}")
+    return k
 
 
 def _all_alert_regions(case: dict[str, Any]) -> list[dict[str, int]]:
@@ -113,7 +178,7 @@ def _format_alerts_assessed(ex: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def build_few_shot_task_section(*, k: int, config_path: Path | None = None) -> str:
+def build_few_shot_task_section(*, k: int, config_path: Path | str | None = None) -> str:
     """Markdown block inserted after **Your task** when k > 0 (visible in task.md)."""
     if k <= 0:
         return ""
@@ -131,7 +196,9 @@ def build_few_shot_task_section(*, k: int, config_path: Path | None = None) -> s
         "These worked examples show **how to apply** the per-alert procedure above. "
         "They are **not** the case you are scoring. **Do not** match by superficial similarity "
         "(e.g. `encodeForHTML` present, `doSomething` helper, or list/map in the path). "
-        "Re-derive each alert's **resolved sink value** from the **current** case inputs below.\n",
+        f"Examples are ordered **{' → '.join(str(ex.get('gold_track') or ex.get('slot') or '?') for ex in exemplars)}** "
+        "(VDR-first). Re-derive each alert's **resolved sink value** from the **current** "
+        "case inputs below.\n",
     ]
 
     for i, ex in enumerate(exemplars, start=1):

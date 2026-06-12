@@ -81,6 +81,7 @@ def run_triage_case(
     gold: str | None = None,
     thinking: bool = False,
     few_shot: int = 0,
+    few_shot_config: str | Path | None = None,
     repo: Path | None = None,
     scan_root: str = ".",
     quiet: bool = False,
@@ -94,7 +95,10 @@ def run_triage_case(
     bench = Path(__file__).resolve().parent
     if str(bench.parent) not in sys.path:
         sys.path.insert(0, str(bench.parent))
+    from core.generation_defaults import apply_triage_run_token_limits  # noqa: E402
     from timing import utc_now_iso  # noqa: E402
+
+    apply_triage_run_token_limits(thinking=thinking)
 
     started_at = utc_now_iso()
     make_task = bench / "make_task.py"
@@ -106,8 +110,10 @@ def run_triage_case(
     import repo_root as _repo  # noqa: E402
     from benchmark.make_task import stable_case_id  # noqa: E402
     from benchmark.triage_labels import task_markdown_current, task_prompt_tag  # noqa: E402
+    from benchmark.few_shot import layout_tag_from_config  # noqa: E402
 
     case_id = stable_case_id(case)
+    layout_version = layout_tag_from_config(few_shot_config) if few_shot > 0 else None
     effective_scan_root = case.get("scan_root") or scan_root
     repo_root = _repo.resolve_benchmark_java_root(sast_root, case, repo, case_path=case_path)
     _require_repo_file(repo_root, case)
@@ -134,7 +140,11 @@ def run_triage_case(
             "--few-shot",
             str(few_shot),
         ]
-        if task_markdown_current(task_path, few_shot=few_shot):
+        if few_shot_config is not None:
+            task_cmd.extend(["--few-shot-config", str(few_shot_config)])
+        if task_markdown_current(
+            task_path, few_shot=few_shot, layout_version=layout_version
+        ):
             task_sec = 0.0
         else:
             last_err: str | None = None
@@ -160,7 +170,10 @@ def run_triage_case(
         (run_dir / "system_prompt.txt").write_text(system_text, encoding="utf-8")
         prompt_record = {
             "few_shot": few_shot,
-            "task_prompt_tag": task_prompt_tag(few_shot=few_shot),
+            "few_shot_config": str(few_shot_config) if few_shot_config else None,
+            "task_prompt_tag": task_prompt_tag(
+                few_shot=few_shot, layout_version=layout_version
+            ),
             "messages": messages,
         }
         (run_dir / "prompt_record.json").write_text(
@@ -185,10 +198,10 @@ def run_triage_case(
             chars = {c for c in head if not c.isspace()}
             return len(chars) <= 3
 
-        def _gpt_json_retry(msgs: list[dict[str, str]], *, max_new: str) -> str:
+        def _json_retry(msgs: list[dict[str, str]], *, max_new: str) -> str:
             prev = os.environ.get("AGENT_MAX_NEW_TOKENS")
             os.environ["AGENT_MAX_NEW_TOKENS"] = max_new
-            print(f"[llm] gpt_oss_20b JSON retry max_new_tokens={max_new}", flush=True)
+            print(f"[llm] JSON retry max_new_tokens={max_new}", flush=True)
             reset_gen_meta()
             out = generate_triage(msgs, profile, thinking=thinking, use_4bit=True)
             if prev is not None:
@@ -199,31 +212,29 @@ def run_triage_case(
 
         raw = generate_triage(messages, profile, thinking=thinking, use_4bit=True)
         if _degenerate(raw) and profile == "gpt_oss_20b":
-            raw = _gpt_json_retry(messages, max_new="1024")
+            raw = _json_retry(messages, max_new="1024")
         inference_sec = time.perf_counter() - t_infer_start
         (run_dir / "llm_raw.txt").write_text(raw or "", encoding="utf-8")
+
+        json_retry_prompt = (
+            "Your previous reply did not include valid triage JSON. "
+            "Reply with EXACTLY ONE JSON object and no other text. "
+            'Required keys: "label" (TP|FP|BL|UNKNOWN), "confidence", '
+            '"confidence_score", "reason", "evidence", "agent", "case_id".'
+        )
 
         try:
             result = _normalize_label(_extract_json_object(raw))
         except ValueError as parse_exc:
-            if profile != "gpt_oss_20b":
-                raise
-            json_msgs = list(messages) + [
-                {
-                    "role": "user",
-                    "content": (
-                        "Your previous reply did not include valid triage JSON. "
-                        "Reply with EXACTLY ONE JSON object and no other text. "
-                        'Required keys: "label" (TP|FP|BL|UNKNOWN), "confidence", '
-                        '"confidence_score", "reason", "evidence", "agent", "case_id".'
-                    ),
-                }
-            ]
-            raw_retry = _gpt_json_retry(json_msgs, max_new="768")
+            json_msgs = list(messages) + [{"role": "user", "content": json_retry_prompt}]
+            raw_retry = _json_retry(json_msgs, max_new="768")
             inference_sec = time.perf_counter() - t_infer_start
             combined = (raw or "").rstrip() + "\n\n--- json_retry ---\n\n" + raw_retry
             (run_dir / "llm_raw.txt").write_text(combined, encoding="utf-8")
-            result = _normalize_label(_extract_json_object(raw_retry))
+            try:
+                result = _normalize_label(_extract_json_object(raw_retry))
+            except ValueError:
+                raise parse_exc from None
 
         result["agent"] = AGENT_NAME
         result["case_id"] = case_id
@@ -238,6 +249,7 @@ def run_triage_case(
             "profile": profile,
             "thinking": thinking,
             "few_shot": few_shot,
+            "few_shot_config": str(few_shot_config) if few_shot_config else None,
             "gold": gold,
             "case_id": case_id,
             "started_at": started_at,
@@ -263,6 +275,7 @@ def run_triage_case(
             "profile": profile,
             "thinking": thinking,
             "few_shot": few_shot,
+            "few_shot_config": str(few_shot_config) if few_shot_config else None,
             "gold": gold,
             "case_id": case_id,
             "started_at": started_at,
@@ -305,10 +318,17 @@ def main() -> None:
         "--few-shot",
         type=int,
         default=0,
-        choices=(0, 3),
-        help="Number of few-shot exemplars in system prompt (0 or 3).",
+        help="Number of few-shot exemplars in task body (0 or configured exemplar count).",
+    )
+    ap.add_argument(
+        "--few-shot-config",
+        default=None,
+        help="Few-shot config name or path (see benchmark/few_shot_configs/manifest.json).",
     )
     args = ap.parse_args()
+    from benchmark.few_shot import validate_few_shot_k
+
+    validate_few_shot_k(args.few_shot, args.few_shot_config)
 
     sast_root = Path(__file__).resolve().parent.parent
     case_path = args.case.expanduser().resolve()
@@ -325,6 +345,7 @@ def main() -> None:
         gold=args.gold,
         thinking=args.thinking,
         few_shot=args.few_shot,
+        few_shot_config=args.few_shot_config,
         repo=args.repo,
         scan_root=args.scan_root,
         quiet=False,

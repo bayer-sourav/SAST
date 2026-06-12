@@ -15,7 +15,7 @@ QWEN_PROFILES = frozenset(
         "qwen3_coder_30b_bnb",
     }
 )
-GEMMA_PROFILES = frozenset({"google_gemma_3_12b_it"})
+GEMMA_PROFILES = frozenset({"google_gemma_3_12b_it", "gemma_4_e4b_bnb"})
 GPT_PROFILES = frozenset({"gpt_oss_20b"})
 
 
@@ -41,6 +41,11 @@ def preload_profile(profile: str, *, use_4bit: bool = True) -> None:
         preload_qwen_profile(profile, use_4bit=use_4bit)
         return
     if family == "gemma":
+        if profile == "gemma_4_e4b_bnb":
+            from models.gemma_4_e4b_it.runner import preload_gemma4_profile
+
+            preload_gemma4_profile(use_4bit=use_4bit)
+            return
         from core.gemma3_hf_backend import get_hf_model_and_tokenizer as gemma_load
 
         gemma_load("google/gemma-3-12b-it", cache_key="gemma_preload", use_4bit=use_4bit)
@@ -73,6 +78,10 @@ def generate_triage(
             enable_thinking=thinking,
         )
     if family == "gemma":
+        if profile == "gemma_4_e4b_bnb":
+            from models.gemma_4_e4b_it.runner import generate_from_chat_messages as gemma4_generate
+
+            return gemma4_generate(messages, use_4bit=use_4bit, enable_thinking=thinking)
         from models.google_gemma_3_12b_it.runner import generate_from_chat_messages
 
         return generate_from_chat_messages(messages, use_4bit=use_4bit, enable_thinking=thinking)

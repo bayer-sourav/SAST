@@ -255,6 +255,7 @@ def gemma3_generate_from_messages(
     cache_key: str,
     messages: list[dict[str, str]],
     use_4bit: bool = False,
+    enable_thinking: bool = False,
 ) -> str:
     """
     Text-only tool routing: use the same pattern as Qwen (chat template → string prompt → tokenizer),
@@ -268,6 +269,8 @@ def gemma3_generate_from_messages(
     if not hasattr(tok, "apply_chat_template"):
         raise RuntimeError("Gemma tokenizer has no apply_chat_template; upgrade transformers.")
 
+    from core.gemma3_unsloth_backend import _apply_chat_template_kwargs
+
     cfg = getattr(model, "config", None)
     mpe = getattr(cfg, "max_position_embeddings", None) if cfg is not None else None
     max_in_env = int(os.environ.get("GEMMA_HF_MAX_INPUT_TOKENS", "8192"))
@@ -277,8 +280,7 @@ def gemma3_generate_from_messages(
 
     prompt = tok.apply_chat_template(
         messages,
-        tokenize=False,
-        add_generation_prompt=True,
+        **_apply_chat_template_kwargs(tok, enable_thinking=enable_thinking),
     )
     enc = tok(
         prompt,
@@ -301,7 +303,7 @@ def gemma3_generate_from_messages(
     mpe2 = getattr(cfg, "max_position_embeddings", None) if cfg is not None else None
     ctx_cap = min(model_max_seq_len(), int(mpe2)) if mpe2 is not None else model_max_seq_len()
     gen_kw = cap_max_new_tokens(
-        agent_decoding_kwargs(),
+        agent_decoding_kwargs(enable_thinking=enable_thinking),
         input_token_len=input_len_pre,
         max_seq_len=ctx_cap,
     )
