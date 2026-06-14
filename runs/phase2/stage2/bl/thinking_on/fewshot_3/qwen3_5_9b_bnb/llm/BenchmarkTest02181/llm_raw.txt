@@ -1,0 +1,243 @@
+Okay, let me analyze these two alerts carefully according to the strict triage policy.
+
+First, I need to understand the code structure:
+
+```java
+String param = request.getParameter("BenchmarkTest02181");
+if (param == null) param = "";
+
+String bar = doSomething(request, param);
+
+String sql =
+        "SELECT TOP 1 userid from USERS where USERNAME='foo' and PASSWORD='" + bar + "'";
+try {
+    java.util.Map<String, Object> results =
+            org.owasp.benchmark.helpers.DatabaseHelper.JDBCtemplate.queryForMap(sql);
+    response.getWriter().println("Your results are: ");
+
+    response.getWriter()
+            .println(org.owasp.esapi.ESAPI.encoder().encodeForHTML(results.toString()));
+} catch (org.springframework.dao.EmptyResultDataAccessException e) {
+    response.getWriter()
+            .println(
+                    "No results returned for query: "
+                            + org.owasp.esapi.ESAPI.encoder().encodeForHTML(sql));
+} catch (org.springframework.dao.DataAccessException e) {
+    if (org.owasp.benchmark.helpers.DatabaseHelper.hideSQLErrors) {
+        response.getWriter().println("Error processing request.");
+    } else throw new ServletException(e);
+}
+```
+
+And the doSomething method:
+```java
+private static String doSomething(HttpServletRequest request, String param)
+        throws ServletException, IOException {
+
+    String bar = param;
+
+    return bar;
+}
+```
+
+Now let me assess each alert:
+
+**Alert 1: java/xss**
+- Sink location: L62-L63 (the print statement with encodeForHTML)
+- Looking at the codeFlow: getParameter → param → bar → doSomething → sql → encodeForHTML → ... + ...
+
+Wait, I need to look at what actually gets printed. The xss rule looks at HTML output sinks. Let me examine the actual sink expressions:
+
+In the try block:
+```java
+response.getWriter()
+        .println(org.owasp.esapi.ESAPI.encoder().encodeForHTML(results.toString()));
+```
+
+This encodes the results.toString(), not the raw sql! So the xss sink here is printing encoded results, not the raw SQL.
+
+But wait, there's also the catch block:
+```java
+catch (EmptyResultDataAccessException e) {
+    response.getWriter()
+            .println(
+                    "No results returned for query: "
+                            + org.owasp.esapi.ESAPI.encoder().encodeForHTML(sql));
+}
+```
+
+Here, the sql IS being encoded before printing. But the question is: does the user input actually reach the SQL string?
+
+Looking at the code:
+```java
+String bar = doSomething(request, param);
+// doSomething just returns param directly
+String bar = param;
+```
+
+So bar = param (user input). Then:
+```java
+String sql = "SELECT TOP 1 userid from USERS where USERNAME='foo' and PASSWORD='" + bar + "'";
+```
+
+The sql string DOES contain the user input (bar = param). 
+
+However, looking at the xss sink at L62-L63, what's actually being printed there? It's `results.toString()` which is the result of the database query, NOT the original sql string. The sql itself isn't being printed directly in the success path - only the query results are printed, and those results come from the database, not from user input.
+
+But wait, there's also the EmptyResultDataAccessException catch block where sql IS printed (with encoding). And the DataAccessException catch block might print error messages too.
+
+Let me reconsider the xss alert scope. The alert says the sink is at L62-L63. Looking at the code:
+```java
+response.getWriter()
+        .println(org.owasp.esapi.ESAPI.encoder().encodeForHTML(results.toString()));
+```
+
+This is printing `results.toString()`, not the raw sql. The sql variable itself isn't being printed here - only the query results are. So for the xss rule specifically about HTML output, we need to determine if user input reaches the HTML output.
+
+Actually, looking more carefully at the code flow:
+1. User provides param
+2. bar = param (direct pass-through)
+3. sql = "..." + bar + "..." (user input in SQL string)
+4. Results from queryForMap(sql) - this queries the DB using the potentially vulnerable sql
+5. results.toString() is printed with HTML encoding
+
+The issue is whether the xss rule considers this vulnerable. The user input goes into the SQL query, but what gets printed to HTML is the RESULT of that query, not the SQL itself. However, if someone injects malicious content into the SQL, could they control what gets returned? That's a different attack vector than XSS.
+
+For XSS specifically, we're concerned about user input appearing in HTML output. In this case, the results come from the database, not directly from user input. Unless the database has been compromised or the injection allows arbitrary data retrieval...
+
+Actually, thinking about this more carefully: if an attacker can perform SQL injection, they could potentially extract sensitive data from the database. But that's SQL injection, not XSS. The XSS concern would be if user input appears directly in HTML output.
+
+In this code, the direct HTML output is `results.toString()`, which comes from the database query results, not from user input directly. So technically, the xss alert might be a false positive because the user input isn't directly reaching the HTML output - it's going through the database layer.
+
+However, there's nuance here. Even though the immediate sink is `results.toString()`, if the SQL injection succeeds, the results themselves could contain user-controllable data extracted from the database. But that's really about SQL injection consequences, not classic XSS.
+
+Given the strict interpretation required:
+- For xss: Does user input reach the HTML output directly? No, it goes through the database query results.
+- BUT: The CodeQL alert flags this as xss. Why? Because CodeQL traces the data flow and sees user input eventually affecting what's printed.
+
+Actually, looking at the code again, I notice something important. The xss sink is marked at L62-L63, which prints `results.toString()`. But the real question is: is `results` attacker-controllable?
+
+If an attacker performs SQL injection successfully, they could retrieve arbitrary data from the database. That retrieved data becomes part of `results`, which then gets printed. So indirectly, user input CAN affect what's printed to HTML.
+
+However, for a proper XSS analysis, we typically want to know if user input appears UNENCODED in HTML output. Here, `results.toString()` is wrapped in `encodeForHTML()`, so whatever data comes out should be HTML-encoded.
+
+But wait - what if the SQL injection allows retrieving script tags or other dangerous content? The encoder would handle that. So the xss risk might be mitigated by the encoding.
+
+Let me think about this differently. According to the triage policy:
+- For xss: if codeFlow shows reach to HTML response sink, treat that as the sink context - don't dismiss because taint passed through cookies, headers, or session APIs without re-checking what reaches the HTML sink lines.
+
+So I need to verify: what actually reaches the HTML sink? Is it attacker-controllable?
+
+Looking at the code:
+```java
+String sql = "SELECT TOP 1 userid from USERS where USERNAME='foo' and PASSWORD='" + bar + "'";
+...
+response.getWriter()
+        .println(org.owasp.esapi.ESAPI.encoder().encodeForHTML(results.toString()));
+```
+
+The `results` come from querying the database with `sql`. If SQL injection works, `results` could contain attacker-specified data. Then `results.toString()` is HTML-encoded before printing.
+
+So the question becomes: does the encoding protect against XSS? Yes, `encodeForHTML()` should encode special characters like `<`, `>`, `&`, etc., preventing them from executing as HTML/JS.
+
+Therefore, for the xss alert:
+- User input reaches the SQL string (vulnerable to SQL injection)
+- Query results depend on that SQL
+- Results are HTML-encoded before printing
+- So the HTML output should be safe from XSS
+
+This suggests the xss alert might be a FALSE POSITIVE because the encoding protects the output.
+
+But wait, I need to be careful. The policy says:
+"Do not label alert-FP because encodeForHTML, ESAPI, or similar appears in the codeFlow when steps 2-3 show attacker-controlled data is still the resolved sink value — prefer alert-TP in that case."
+
+Hmm, but in this case, the resolved sink value IS the encoded results, which should be safe. The encoding happens BEFORE printing.
+
+Actually, let me reconsider. The key insight from the policy examples:
+- In Example 1 (TP), the xss alert was marked FP because encoding was applied at the sink
+- In Example 2 (FP), the xss alert was marked FP because the resolved sink value was a constant
+
+So for xss, if encoding is properly applied at the point where data reaches HTML output, it should be FP.
+
+In this code:
+```java
+response.getWriter()
+        .println(org.owasp.esapi.ESAPI.encoder().encodeForHTML(results.toString()));
+```
+
+The `results.toString()` is wrapped in `encodeForHTML()`, so the HTML output is encoded. This means the xss alert should be FP.
+
+However, I need to verify that ALL data reaching the sink is encoded. What if some parts aren't? Looking at the code, everything printed to the writer goes through either:
+1. `results.toString()` -> encoded
+2. Error messages (which appear to be literals)
+
+So yes, the xss alert should be FP because the resolved sink value (encoded results) is protected.
+
+**Alert 2: java/sql-injection**
+- Sink location: L52 (the sql string construction)
+- CodeFlow: getParameter → param → bar → doSomething → sql
+
+Looking at the code:
+```java
+String bar = doSomething(request, param);
+// doSomething just returns param directly
+String bar = param;
+
+String sql = "SELECT TOP 1 userid from USERS where USERNAME='foo' and PASSWORD='" + bar + "'";
+```
+
+User input (param) flows directly to bar, which flows directly to sql. There's NO sanitization between param and sql. The sql string concatenates user input directly into the SQL query.
+
+This is a TRUE POSITIVE for SQL injection because:
+1. User input reaches the SQL string
+2. No encoding/sanitization occurs before the SQL string is constructed
+3. The SQL string is then used in a database query
+
+So Alert 2 is definitely TP.
+
+Since Alert 2 is TP, the case-level label should be TP regardless of Alert 1's status.
+
+Now let me finalize my assessment:
+
+**Alert 1 (java/xss):** FP - The resolved sink value is `results.toString()` which is HTML-encoded before printing. User input affects the database query results, but those results are encoded before HTML output.
+
+**Alert 2 (java/sql-injection):** TP - User input flows directly to the SQL string without any sanitization.
+
+**Case-level label:** TP (because at least one alert is TP)
+
+Wait, but I need to reconsider the xss alert more carefully. Let me trace through the exact sink expression:
+
+From the CodeQL alert:
+- Sink: L62-L63
+- From the code:
+```java
+response.getWriter()
+        .println(org.owasp.esapi.ESAPI.encoder().encodeForHTML(results.toString()));
+```
+
+What is `results`? It comes from:
+```java
+java.util.Map<String, Object> results = JDBCtemplate.queryForMap(sql);
+```
+
+So `results` is populated by querying the database with `sql`. If SQL injection succeeds, `results` could contain attacker-controlled data. Then `results.toString()` is converted to a string and HTML-encoded.
+
+The question is: is this truly safe from XSS?
+
+If an attacker can inject SQL to retrieve arbitrary data from the database, that data will appear in `results`, which will be printed as `results.toString()`, which will be HTML-encoded.
+
+HTML encoding converts `<script>` to `&lt;script&gt;`, which prevents execution. So theoretically, this should be safe from XSS.
+
+However, there's a subtlety: what if the attacker can inject JavaScript-like content that survives encoding? Standard HTML encoding handles most cases, but there might be edge cases.
+
+For practical purposes, based on the policy guidance from the examples, if encoding is applied at the sink, it should be considered FP for xss.
+
+So my final assessment:
+- Alert 1 (java/xss): FP - resolved sink value is encoded results
+- Alert 2 (java/sql-injection): TP - user input reaches SQL string without sanitization
+- Case label: TP
+
+Now I need to write the JSON output following the schema.
+</think>
+
+{"label":"TP","confidence":"high","confidence_score":0.9,"reason":"Alert 1 (java/xss): alert-FP — resolved sink value is ESAPI.encoder().encodeForHTML(results.toString()) written to HTML response; encoding is applied at the sink protecting user-controlled data. Alert 2 (java/sql-injection): alert-TP — resolved sink value is sql containing user input (bar=param) with no sanitization before SQL string construction at L52. Case TP: at least one alert-TP.","evidence":[{"file":"src/main/java/org/owasp/benchmark/testcode/BenchmarkTest02181.java","lines":"L62-L63","note":"XSS sink prints encoded results, not raw user input"},{"file":"src/main/java/org/owasp/benchmark/testcode/BenchmarkTest02181.java","lines":"L52","note":"SQL injection sink constructs sql with unsanitized user input (bar=param)"},{"file":"src/main/java/org/owasp/benchmark/testcode/BenchmarkTest02181.java","lines":"L43-L46,71-L76","note":"User input flows directly from param to bar to sql without sanitization"}],"agent":"llm","case_id":"BenchmarkTest02181"}
