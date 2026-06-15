@@ -1,5 +1,7 @@
 # Phase 1 replication runbook
 
+**Closure record (planning → results → Phase 2 handoff):** [`runs/phase1/PHASE1_COMPLETE.md`](../runs/phase1/PHASE1_COMPLETE.md)
+
 ## Stage 2 (full corpora + borderline)
 
 **904 FP + 1,373 TP + 200 borderline** · **Qwen 4B/8B/14B** · **thinking off only** · seed **42**

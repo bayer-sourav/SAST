@@ -241,6 +241,7 @@ Exemplars:  BenchmarkTest02272 (TP, multi-alert)
 
 | Artifact | Path |
 |----------|------|
+| **Phase 2 closure** (Stage 3, lang-agnostic, large-model probes) | `runs/phase2/PHASE2_COMPLETE.md` |
 | Hard-slice archive | `runs/phase2/stage2/SMOKE_ARCHIVE.md` |
 | Stage 2 results | `runs/phase2/stage2/summaries/STAGE2_REPORT.md` |
 | Stage 1 full matrix | `runs/phase2/summaries/PHASE2_TABLES.md` |
