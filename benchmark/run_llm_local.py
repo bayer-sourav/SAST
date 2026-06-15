@@ -82,6 +82,7 @@ def run_triage_case(
     thinking: bool = False,
     few_shot: int = 0,
     few_shot_config: str | Path | None = None,
+    prompt_version: str | None = None,
     repo: Path | None = None,
     scan_root: str = ".",
     quiet: bool = False,
@@ -142,8 +143,13 @@ def run_triage_case(
         ]
         if few_shot_config is not None:
             task_cmd.extend(["--few-shot-config", str(few_shot_config)])
+        if prompt_version is not None:
+            task_cmd.extend(["--prompt-version", str(prompt_version)])
         if task_markdown_current(
-            task_path, few_shot=few_shot, layout_version=layout_version
+            task_path,
+            few_shot=few_shot,
+            layout_version=layout_version,
+            prompt_version=prompt_version,
         ):
             task_sec = 0.0
         else:
@@ -171,8 +177,11 @@ def run_triage_case(
         prompt_record = {
             "few_shot": few_shot,
             "few_shot_config": str(few_shot_config) if few_shot_config else None,
+            "prompt_version": prompt_version,
             "task_prompt_tag": task_prompt_tag(
-                few_shot=few_shot, layout_version=layout_version
+                few_shot=few_shot,
+                layout_version=layout_version,
+                prompt_version=prompt_version,
             ),
             "messages": messages,
         }
@@ -250,6 +259,7 @@ def run_triage_case(
             "thinking": thinking,
             "few_shot": few_shot,
             "few_shot_config": str(few_shot_config) if few_shot_config else None,
+            "prompt_version": prompt_version,
             "gold": gold,
             "case_id": case_id,
             "started_at": started_at,
@@ -276,6 +286,7 @@ def run_triage_case(
             "thinking": thinking,
             "few_shot": few_shot,
             "few_shot_config": str(few_shot_config) if few_shot_config else None,
+            "prompt_version": prompt_version,
             "gold": gold,
             "case_id": case_id,
             "started_at": started_at,
@@ -325,6 +336,11 @@ def main() -> None:
         default=None,
         help="Few-shot config name or path (see benchmark/few_shot_configs/manifest.json).",
     )
+    ap.add_argument(
+        "--prompt-version",
+        default=None,
+        help="Prompt version key (v7-balanced, v8-dual-gate, v9-fprr-first).",
+    )
     args = ap.parse_args()
     from benchmark.few_shot import validate_few_shot_k
 
@@ -346,6 +362,7 @@ def main() -> None:
         thinking=args.thinking,
         few_shot=args.few_shot,
         few_shot_config=args.few_shot_config,
+        prompt_version=args.prompt_version,
         repo=args.repo,
         scan_root=args.scan_root,
         quiet=False,

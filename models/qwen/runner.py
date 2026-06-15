@@ -6,8 +6,11 @@ Menu profiles (see main.py):
   qwen3_8b_bnb — Qwen3-8B (Unsloth bnb-4bit hub + HF instruct fallback).
   qwen3_14b_bnb — Qwen3-14B (Unsloth bnb-4bit hub + HF instruct fallback).
   qwen3_5_9b_bnb — Qwen3.5-9B (Unsloth 4-bit hub id + HF fallback).
+  qwen3_6_27b_bnb — Qwen3.6-27B (Unsloth 4-bit hub id + HF fallback).
+  qwen3_6_35b_a3b_bnb — Qwen3.6-35B-A3B MoE (Unsloth 4-bit hub id + HF fallback).
   qwen3_coder_30b_bnb — Qwen3-Coder-30B-A3B; uses Amazon Bedrock when configured
     (``OPENAI_BASE_URL`` / ``AWS_BEARER_TOKEN_BEDROCK``), else local Unsloth/HF.
+  qwen3_next_80b_bnb — Qwen3-Next-80B-A3B via Amazon Bedrock Mantle.
 """
 
 from __future__ import annotations
@@ -39,6 +42,9 @@ _ACTIVE_PROFILE: str | None = None
 _BEDROCK_CLIENT: Any = None
 
 _DEFAULT_BEDROCK_CODER_MODEL = "qwen.qwen3-coder-30b-a3b-instruct"
+_DEFAULT_BEDROCK_NEXT_80B_MODEL = "qwen.qwen3-next-80b-a3b-instruct"
+
+BEDROCK_PROFILES = frozenset({"qwen3_coder_30b_bnb", "qwen3_next_80b_bnb"})
 
 # Profiles using Qwen3 chat templates (enable_thinking / thinking blocks).
 QWEN3_PROFILES = frozenset(
@@ -48,7 +54,10 @@ QWEN3_PROFILES = frozenset(
         "qwen3_14b_bnb",
         "qwen3_5_4b_bnb",
         "qwen3_5_9b_bnb",
+        "qwen3_6_27b_bnb",
+        "qwen3_6_35b_a3b_bnb",
         "qwen3_coder_30b_bnb",
+        "qwen3_next_80b_bnb",
     }
 )
 
@@ -81,8 +90,8 @@ def _bedrock_configured() -> bool:
 
 
 def _should_use_bedrock(profile: str) -> bool:
-    """Route qwen3_coder_30b_bnb to Amazon Bedrock (Mantle OpenAI-compatible API)."""
-    if profile != "qwen3_coder_30b_bnb":
+    """Route large Qwen profiles to Amazon Bedrock (Mantle OpenAI-compatible API)."""
+    if profile not in BEDROCK_PROFILES:
         return False
     backend = os.environ.get("QWEN3_CODER_BACKEND", "").strip().lower()
     if backend in ("local", "hf", "unsloth", "gpu"):
@@ -99,6 +108,10 @@ def _should_use_bedrock(profile: str) -> bool:
 
 
 def _bedrock_model_id() -> str:
+    if _ACTIVE_PROFILE == "qwen3_next_80b_bnb":
+        return os.environ.get(
+            "QWEN3_NEXT_80B_BEDROCK_MODEL_ID", _DEFAULT_BEDROCK_NEXT_80B_MODEL
+        ).strip()
     return os.environ.get("QWEN3_CODER_BEDROCK_MODEL_ID", _DEFAULT_BEDROCK_CODER_MODEL).strip()
 
 
@@ -265,6 +278,17 @@ def _resolve_ids(profile: str) -> tuple[str, str]:
             "techwithsergiu/Qwen3.5-text-9B-bnb-4bit",
         )
         return u, h
+    if profile == "qwen3_6_27b_bnb":
+        u = os.environ.get("QWEN3_6_27B_UNSLOTH_MODEL_ID", "unsloth/Qwen3.6-27B")
+        h = os.environ.get("QWEN3_6_27B_HF_MODEL_ID", "Qwen/Qwen3.6-27B")
+        return u, h
+    if profile == "qwen3_6_35b_a3b_bnb":
+        u = os.environ.get("QWEN3_6_35B_A3B_UNSLOTH_MODEL_ID", "unsloth/Qwen3.6-35B-A3B")
+        h = os.environ.get("QWEN3_6_35B_A3B_HF_MODEL_ID", "Qwen/Qwen3.6-35B-A3B")
+        return u, h
+    if profile == "qwen3_next_80b_bnb":
+        # Bedrock-only; local ids are unused when Mantle is configured.
+        return "", ""
     if profile == "qwen3_coder_30b_bnb":
         u = os.environ.get(
             "QWEN3_CODER_30B_UNSLOTH_MODEL_ID",
@@ -357,7 +381,8 @@ def _load_unsloth(*, use_4bit: bool, unsloth_model_id: str) -> tuple[Any, Any]:
         raise ImportError(f"Unsloth not usable on this device: {exc}") from exc
 
     log_gpu_status("Qwen Unsloth")
-    if "coder" in unsloth_model_id.lower() or "30b" in unsloth_model_id.lower():
+    ml = unsloth_model_id.lower()
+    if "coder" in ml or "30b" in ml or "27b" in ml or "35b" in ml:
         max_seq = int(os.environ.get("QWEN_CODER_MAX_SEQ_LEN", "4096"))
     else:
         max_seq = int(os.environ.get("QWEN_MAX_SEQ_LEN", "32768"))

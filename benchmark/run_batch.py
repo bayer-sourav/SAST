@@ -99,6 +99,11 @@ def _main() -> None:
         default=None,
         help="Few-shot config name or path (see benchmark/few_shot_configs/manifest.json).",
     )
+    ap.add_argument(
+        "--prompt-version",
+        default=None,
+        help="Prompt version key (v7-balanced, v8-dual-gate, v9-fprr-first).",
+    )
     ap.add_argument("--llm-model", default="local-qwen", help="LLM_MODEL for --agent openhands")
     ap.add_argument("--llm-provider", default="openai")
     ap.add_argument("--max-cases", type=int, default=None)
@@ -212,6 +217,8 @@ def _main() -> None:
         pb_cmd.extend(["--few-shot", str(args.few_shot)])
         if args.few_shot_config:
             pb_cmd.extend(["--few-shot-config", str(args.few_shot_config)])
+        if args.prompt_version:
+            pb_cmd.extend(["--prompt-version", str(args.prompt_version)])
         print(f"[batch] prebuilding task.md for {len(files)} cases (CPU, no model load)...", flush=True)
         subprocess.run(pb_cmd, cwd=str(sast_root), check=False)
         if args.profile in ("qwen3_coder_30b_bnb", "gpt_oss_20b"):
@@ -280,6 +287,7 @@ def _main() -> None:
                 thinking=args.thinking,
                 few_shot=args.few_shot,
                 few_shot_config=args.few_shot_config,
+                prompt_version=args.prompt_version,
                 repo=repo,
                 quiet=True,
             )
@@ -305,6 +313,8 @@ def _main() -> None:
                 cmd.extend(["--few-shot", str(args.few_shot)])
             if args.few_shot_config:
                 cmd.extend(["--few-shot-config", str(args.few_shot_config)])
+            if args.prompt_version:
+                cmd.extend(["--prompt-version", str(args.prompt_version)])
             r = subprocess.run(cmd, cwd=str(sast_root))
             rc = r.returncode
             meta = read_run_meta(run_dir)

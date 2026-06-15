@@ -20,6 +20,7 @@ def _build_one(
     scan_root: str,
     few_shot: int,
     few_shot_config: str | None = None,
+    prompt_version: str | None = None,
 ) -> tuple[bool, str]:
     from benchmark.few_shot import layout_tag_from_config
     from benchmark.triage_labels import task_markdown_current
@@ -28,7 +29,10 @@ def _build_one(
     run_dir.mkdir(parents=True, exist_ok=True)
     task_path = run_dir / "task.md"
     if task_markdown_current(
-        task_path, few_shot=few_shot, layout_version=layout_version
+        task_path,
+        few_shot=few_shot,
+        layout_version=layout_version,
+        prompt_version=prompt_version,
     ):
         return True, "cached"
     cmd = [
@@ -49,6 +53,8 @@ def _build_one(
     ]
     if few_shot_config:
         cmd.extend(["--few-shot-config", str(few_shot_config)])
+    if prompt_version:
+        cmd.extend(["--prompt-version", str(prompt_version)])
     last = ""
     for attempt in range(3):
         proc = subprocess.run(cmd, capture_output=True, text=True)
@@ -69,6 +75,7 @@ def main() -> None:
     ap.add_argument("--max-cases", type=int, default=None, help="Only prebuild first N cases (sorted).")
     ap.add_argument("--few-shot", type=int, default=0)
     ap.add_argument("--few-shot-config", default=None)
+    ap.add_argument("--prompt-version", default=None)
     args = ap.parse_args()
     from benchmark.few_shot import layout_tag_from_config, validate_few_shot_k
 
@@ -104,6 +111,7 @@ def main() -> None:
             run_dir / "task.md",
             few_shot=args.few_shot,
             layout_version=layout_version,
+            prompt_version=args.prompt_version,
         ):
             cached += 1
             continue
@@ -119,6 +127,7 @@ def main() -> None:
             scan_root=str(scan),
             few_shot=args.few_shot,
             few_shot_config=args.few_shot_config,
+            prompt_version=args.prompt_version,
         )
         if ok:
             if msg == "built":

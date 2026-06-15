@@ -1,0 +1,386 @@
+The user wants me to act as a security-oriented SAST triage assistant. I need to analyze two CodeQL alerts for the provided Java file `BenchmarkTest00067.java` and determine the correct case-level label based on specific criteria.
+
+I need to follow these steps for each alert:
+1. Scope the alert (ruleId, sink lines, codeFlow).
+2. Trace to sink expression first.
+3. Resolve sink value (mandatory).
+4. Check for structural FP.
+5. Check mitigation.
+6. Verdict for this alert.
+7. Apply dual-gate calibration (TP gate, FP gate).
+8. Assign case-level label.
+
+Then output the JSON result.
+
+Let's look at the source code provided.
+
+**File:** `src/main/java/org/owasp/benchmark/testcode/BenchmarkTest00067.java`
+
+**Alert 1:** `java/insecure-randomness`
+- **Sink Line:** 118
+- **Sink Expression:** `rememberMeKey`
+- **Code Flow:** `random(...)` -> `Double.toString(value)` -> `substring(2)` -> `rememberMeKey`
+- **Relevant Code Snippet:**
+  ```java
+  double value = java.lang.Math.random();
+  String rememberMeKey = Double.toString(value).substring(2); // Trim off the 0. at the front.
+  ```
+- **Analysis:**
+  - Source: `Math.random()` generates a pseudo-random number between 0.0 and 1.0.
+  - Sink: `rememberMeKey` is assigned the string representation of this random number, trimmed.
+  - Usage: Later in the code (around line 130ish), `rememberMeKey` is stored in a Cookie named `rememberMe` + `testCaseNumber` and also in the Session attribute. The cookie value is printed to the response writer.
+  - Is `Math.random()` considered insecure randomness here? Yes, `java.lang.Math.random()` is known to be cryptographically weak (uses linear congruential generator logic often exposed in JDK implementations). It is explicitly flagged by the rule `java/insecure-randomness`.
+  - Does it feed security-sensitive material? Yes, `rememberMeKey` is used as a token for remembering users ("has been remembered with cookie...").
+  - Therefore, this is likely a True Positive (TP) for `java/insecure-randomness`. The randomness source is weak and it is used for authentication/session management.
+
+**Alert 2:** `java/xss`
+- **Sink Lines:** 128-133
+- **Sink Expression:** `response.getWriter().println(user + " has been remembered with cookie: " + rememberMe.getName() + " whose value is: " + rememberMe.getValue())`
+- **Code Flow:**
+  - Path 1: `getValue(...)` (line 132) -> Sink.
+  - Path 2: `getName(...)` (line 130) -> Sink.
+- **Relevant Code Snippet:**
+  ```java
+  String user = "Doug";
+  String fullClassName = this.getClass().getName();
+  String testCaseNumber =
+          fullClassName.substring(fullClassName.lastIndexOf('.') + 1 + "BenchmarkTest".length());
+  user += testCaseNumber;
+
+  String cookieName = "rememberMe" + testCaseNumber;
+
+  boolean foundUser = false;
+  javax.servlet.http.Cookie[] cookies = request.getCookies();
+  if (cookies != null) {
+      for (int i = 0; !foundUser && i < cookies.length; i++) {
+          javax.servlet.http.Cookie cookie = cookies[i];
+          if (cookieName.equals(cookie.getName())) {
+              if (cookie.getValue().equals(request.getSession().getAttribute(cookieName))) {
+                  foundUser = true;
+              }
+          }
+      }
+  }
+
+  if (foundUser) {
+      response.getWriter().println("Welcome back: " + user + "<br/>");
+  } else {
+      javax.servlet.http.Cookie rememberMe =
+              new javax.servlet.http.Cookie(cookieName, rememberMeKey);
+      // ...
+      response.getWriter()
+              .println(
+                      user
+                              + " has been remembered with cookie: "
+                              + rememberMe.getName()
+                              + " whose value is: "
+                              + rememberMe.getValue()
+                              + "<br/>");
+  }
+  ```
+- **Analysis:**
+  - The sink prints `user` and `rememberMe.getName()` and `rememberMe.getValue()`.
+  - Let's resolve the sink values.
+  - `user` construction: Starts as "Doug", appends `testCaseNumber`. `testCaseNumber` comes from `fullClassName` (static/class level info). So `user` is effectively "Doug" + "BenchmarkTest00067". This is derived from the class name, which is static/hardcoded relative to the benchmark test ID. It is NOT user-controllable input from the HTTP request body/query params directly injected into the username string being printed. Wait, let's check `param`.
+  - `param` is extracted from a cookie named "BenchmarkTest00067".
+  - However, looking closely at the XSS sink:
+    - `user` variable is constructed from `this.getClass().getName()` (static) and appended to "Doug". It does NOT depend on `param` or `request.getParameter`.
+    - `rememberMe` cookie is created with `cookieName` (derived from class name) and `rememberMeKey` (from Math.random).
+    - `rememberMe.getName()` returns `cookieName`. Since `cookieName` is derived from `this.getClass().getName()`, it is static/hardcoded.
+    - `rememberMe.getValue()` returns `rememberMeKey`. As analyzed in Alert 1, `rememberMeKey` comes from `Math.random()`.
+  - So the sink writes: `user` (static-ish) + `rememberMe.getName()` (static-ish) + `rememberMe.getValue()` (from Math.random).
+  - Where does the XSS come from according to CodeQL?
+    - CodeQL says: `getValue(...)` (line 132) flows to sink. And `getName(...)` (line 130) flows to sink.
+    - Let's verify the actual usage in the println statement.
+    - `response.getWriter().println(user + " has been remembered with cookie: " + rememberMe.getName() + " whose value is: " + rememberMe.getValue())`
+    - `rememberMe` is defined just before: `new javax.servlet.http.Cookie(cookieName, rememberMeKey)`.
+    - `cookieName` is `"rememberMe" + testCaseNumber`. `testCaseNumber` is derived from Class Name. Not user input.
+    - `rememberMeKey` is derived from `Math.random()`. Not user input.
+    - `user` is derived from Class Name. Not user input.
+    - So none of the variables printed in that specific block seem to come from the HTTP Request parameters directly. They come from server-side configuration (Class Name) or Server-side RNG.
+    - Wait, the `param` variable is populated from a cookie. But `param` is never used in the `else` block where the XSS sink is located (lines 128-133).
+    - `param` is used in the chain leading up to `g71153` and `bar` (which seems unused in the print statement).
+    - Actually, wait. Look at the code structure again.
+    - There is a `doSomething` call with `g71153` ("barbarians_at_the_gate").
+    - Then there is the `value` calculation.
+    - Then the `foundUser` check.
+    - If `!foundUser` (first time visit), it creates the cookie and prints the welcome message.
+    - The print statement includes `user`, `rememberMe.getName()`, `rememberMe.getValue()`.
+    - None of these seem to take direct user input from the current request. `user` is static. `rememberMe` is created fresh with static name and random value.
+    - So why does CodeQL flag `java/xss`?
+    - Maybe CodeQL traces `getValue` from `request.getCookies()[i].getValue()`?
+    - Let's check the code flow for `getValue`.
+    - Line 132: `+ rememberMe.getValue()`.
+    - `rememberMe` is instantiated at line 128-129: `new javax.servlet.http.Cookie(cookieName, rememberMeKey)`.
+    - `cookieName` is static. `rememberMeKey` is random.
+    - So `rememberMe.getValue()` resolves to `rememberMeKey` (Random).
+    - Is `rememberMeKey` considered user input? No, it's generated by the server.
+    - Is `cookieName` user input? No, it's derived from Class Name.
+    - Is `user` user input? No, it's derived from Class Name.
+    - So the sink expression `user + ... + rememberMe.getName() + ... + rememberMe.getValue()` consists entirely of server-generated/static strings.
+    - User input (`param`) is never injected into this specific print statement.
+    - Therefore, this should be a False Positive (FP). The taint might appear in `param` earlier, but `param` is not propagated to this sink.
+    - Wait, let's check the `if (foundUser)` branch vs `else` branch.
+    - The sink is in the `else` block (lines 128-133).
+    - Inside `else`, `rememberMe` is created locally.
+    - `cookieName` is local/static.
+    - `rememberMeKey` is local/random.
+    - So the sink value is `user` (static) + `cookieName` (static) + `rememberMeKey` (random).
+    - Neither of these is user-controlled input from the client request.
+    - Thus, Alert 2 (`java/xss`) is likely an **alert-FP**.
+
+**Summary of Assessment:**
+- **Alert 1 (`java/insecure-randomness`):**
+  - Sink: `rememberMeKey` (used in Cookie/Session).
+  - Source: `Math.random()`.
+  - Resolution: `rememberMeKey` depends on `Math.random()`.
+  - Risk: Weak randomness used for session tokens is a real security issue (predictable sessions).
+  - Verdict: **alert-TP**.
+- **Alert 2 (`java/xss`):**
+  - Sink: `response.getWriter().println(...rememberMe.getValue()...)`.
+  - Resolved Value: `rememberMe.getValue()` returns `rememberMeKey` (generated from `Math.random`).
+  - User Input Path: `param` is read from cookie, but `param` is NOT used in the `else` block where the sink resides. `param` is used in the `if (foundUser)` block (actually `param` isn't used there either, `user` is used there). Wait, `user` is constructed from Class Name.
+  - Verification: Does `param` reach the sink?
+    - `param` is assigned from `theCookie.getValue()`.
+    - `param` flows into `map71153`, `StringBuilder`, etc.
+    - Eventually `thing.doSomething(g71153)` is called.
+    - BUT, the `println` statement printing the warning message happens in the `else` block (when user is NOT found).
+    - In the `else` block, `rememberMe` is created NEW. Its value is `rememberMeKey`.
+    - `rememberMeKey` comes from `Math.random()`.
+    - `user` comes from Class Name.
+    - So `param` does NOT reach the sink.
+    - Even though `getValue` is traced from `request.getCookies()`, the specific instance `rememberMe` used in the sink is initialized with `rememberMeKey`, not the existing cookie value from the request loop.
+    - Wait, CodeQL might have conflated the `getValue` from the loop (reading existing cookies) with the `getValue` of the newly created `rememberMe` cookie.
+    - Looking at the code:
+      ```java
+      javax.servlet.http.Cookie rememberMe =
+              new javax.servlet.http.Cookie(cookieName, rememberMeKey);
+      // ...
+      response.getWriter()
+              .println(
+                      user
+                              + " has been remembered with cookie: "
+                              + rememberMe.getName()
+                              + " whose value is: "
+                              + rememberMe.getValue()
+                              + "<br/>");
+      ```
+    - Here `rememberMe` refers to the variable declared immediately above.
+    - That variable holds `rememberMeKey`.
+    - `rememberMeKey` is NOT `param`.
+    - So the sink value is `rememberMeKey` (Random).
+    - Is `rememberMeKey` user controlled? No.
+    - So Alert 2 is **alert-FP**.
+
+**Dual-Gate Calibration:**
+- **TP Gate:** At least one alert has a resolved sink value that includes attacker-controlled input.
+  - Alert 1 (`insecure-randomness`): Sink `rememberMeKey` includes `Math.random()` output. While technically "server-controlled" generation, the rule `java/insecure-randomness` flags weak RNG sources regardless of whether they are user-controlled or server-generated, specifically regarding their cryptographic strength for sensitive data like session tokens. The definition of the rule implies that using `Math.random()` for security-critical purposes (like `rememberMeKey`) is a violation. The "attacker-controlled input" requirement in the instructions usually applies to injection attacks (XSS, SQLi). For `insecure-randomness`, the "input" is the entropy source itself. If the instruction says "includes attacker-controlled input", I need to be careful.
+  - Instruction: "**TP gate**: Case **TP** only if **≥1** alert has a **resolved sink value** that **includes attacker-controlled input**..."
+  - Wait, does `Math.random()` count as "attacker-controlled input"? Usually, `Math.random()` is considered a server-side weakness, not attacker-controlled input. Attacker control would mean the attacker dictates the seed or the output.
+  - However, in the context of `java/insecure-randomness`, the vulnerability is that the randomness is predictable. An attacker could potentially predict future outputs if they know the algorithm/state. But strictly speaking, is it "attacker-controlled input"?
+  - Let's re-read the instruction carefully: "Case **TP** only if **≥1** alert has a **resolved sink value** that **includes attacker-controlled input** (request parameter, header, cookie, `getParameter`, etc.) **in the expression passed to the sink API**".
+  - This phrasing suggests that for `insecure-randomness`, we might need the randomness to be driven by user input to be a TP? Or does it mean the sink value must be something the attacker controls?
+  - If `rememberMeKey` is purely server-generated (via `Math.random()`), is it "attacker-controlled"? No.
+  - However, if the rule is about "Insecure randomness", the fact that it IS insecure makes it a TP for that rule type, regardless of who controls the seed?
+  - Let's look at the example provided in the prompt (Example 1).
+    - Alert 1 (`java/xss`): alert-FP (encoded).
+    - Alert 2 (`java/sql-injection`): alert-TP (because `bar` = `param`).
+    - Reason: "Alert 2 (java/sql-injection): alert-TP — resolved sink bar = param...".
+  - This confirms that for `sql-injection`, the sink value MUST include user input (`param`).
+  - Now applying to `insecure-randomness`:
+    - If the sink value is `rememberMeKey` derived from `Math.random()`, does it include "attacker-controlled input"?
+    - `Math.random()` is a standard library function. It is not user input.
+    - However, the rule `java/insecure-randomness` typically triggers when weak RNG is used for security tokens. The risk is prediction, not necessarily direct manipulation by the attacker in the current request.
+    - BUT, if the instruction strictly says "includes attacker-controlled input", then `Math.random()` (server side) might not qualify as "attacker-controlled input".
+    - HOWEVER, usually `java/insecure-randomness` is treated as a TP if the randomness is weak AND used for auth tokens, because the attacker CAN exploit the lack of randomness (even if they don't inject it directly, they can brute-force/predict).
+    - Let's check the instruction wording again: "Case **TP** only if **≥1** alert has a **resolved sink value** that **includes attacker-controlled input** (request parameter, header, cookie, `getParameter`, etc.) **in the expression passed to the sink API**".
+    - This constraint seems very strict. It implies that for `insecure-randomness` to be a TP, the randomness must come from user input? That sounds weird for `java/insecure-randomness`. Usually, `Math.random()` IS the problem, regardless of origin.
+    - Wait, maybe the instruction means "attacker-controlled input" broadly covers things like seeds? Or maybe it distinguishes between "Server Generated Weak Randomness" (which is still a bug) vs "User Controlled Weak Randomness" (which is worse)?
+    - Let's assume the standard interpretation: Using `Math.random()` for session tokens is a vulnerability (TP). The "attacker-controlled input" clause might be a general template for injection flaws, but for randomness, the "input" is the entropy source. If the source is `Math.random()`, it is inherently insecure.
+    - However, if I must adhere strictly to "includes attacker-controlled input", and `Math.random()` is NOT attacker-controlled, then Alert 1 might be FP too?
+    - But `java/insecure-randomness` is specifically about the WEAKNESS of the source. If the source is `Math.random()`, it IS the vulnerability. The "attacker-controlled input" phrase might refer to the sink value containing data that allows the attack (e.g. if the attacker provides the seed).
+    - Given the context of OWASP benchmarks, `Math.random()` usage for session tokens is almost universally considered a TP (vulnerability). The "attacker-controlled input" restriction might be intended for injection vulnerabilities (where the attacker injects payload). For randomness, the "control" is over the quality of the randomness.
+    - Let's look at the specific instruction: "Case **TP** only if **≥1** alert has a **resolved sink value** that **includes attacker-controlled input**...".
+    - If I interpret "attacker-controlled input" literally as "data coming from the client", then `Math.random()` (server) fails this check.
+    - BUT, if I interpret it as "data that enables the attack vector", then `Math.random()` enabling session fixation/prediction counts.
+    - Let's look at the few-shot examples.
+    - Example 1: `java/sql-injection` is TP because `bar = param`. `param` is user input.
+    - Example 2: `java/sql-injection` is FP because `bar = "moresafe"`. Constant.
+    - Example 3: `java/sql-injection` is FP because `bar = "bob"`. Switch constant.
+    - These examples are ALL about Injection (SQL/XSS/LDAP).
+    - My case involves `java/insecure-randomness`.
+    - If I classify `java/insecure-randomness` (using `Math.random()` for session token) as TP, does it fit the "attacker-controlled input" criteria?
+    - Technically, the attacker CANNOT control `Math.random()`.
+    - However, the vulnerability EXISTS because the randomness is INSECURE.
+    - If I mark it as FP, I am saying "Using `Math.random()` for session tokens is safe". That is incorrect security advice.
+    - If I mark it as TP, I am following the spirit of identifying the vulnerability, assuming the "attacker-controlled input" clause is meant to distinguish between "Safe Server Generation" vs "Unsafe Client Injection".
+    - Wait, is `Math.random()` usage considered "attacker-controlled"? No.
+    - Is there a way `Math.random()` becomes attacker-controlled? No.
+    - Perhaps the instruction implies that ONLY if the sink value is attacker-controlled (e.g. user input) should it be TP. If it's just server-side weak randomness, maybe it falls into BL or UNKNOWN?
+    - OR, perhaps the instruction assumes that `java/insecure-randomness` alerts are generally TP unless proven otherwise (e.g. deterministic constants).
+    - Let's reconsider the instruction: "Case **TP** only if **≥1** alert has a **resolved sink value** that **includes attacker-controlled input**".
+    - If `rememberMeKey` is purely `Math.random()`, it does NOT include attacker-controlled input.
+    - So strictly speaking, Alert 1 might be **alert-FP** (structurally safe from injection perspective?) or **alert-BL**?
+    - But wait, `java/insecure-randomness` is a rule about the RANDOMNESS SOURCE. The sink is `rememberMeKey`. The source is `Math.random()`.
+    - If the rule fires, it means the analyzer thinks `Math.random()` is bad for this purpose.
+    - If I say it's FP, I'm claiming it's safe.
+    - If I say it's TP, I'm claiming it's vulnerable.
+    - Given the strict instruction "includes attacker-controlled input", I should probably lean towards **BL** or **FP** if the randomness isn't user-driven.
+    - HOWEVER, in many SAST contexts, `java/insecure-randomness` is automatically TP because the weakness itself is the flaw, regardless of origin. The "attacker-controlled input" text might be boilerplate copied from injection rules.
+    - Let's look at the specific text: "Case **TP** only if **≥1** alert has a **resolved sink value** that **includes attacker-controlled input** (request parameter, header, cookie, `getParameter`, etc.) **in the expression passed to the sink API**".
+    - This looks like a hard constraint. If the sink value is `Math.random()`, it does not include request parameter/header/etc.
+    - So Alert 1 should be **alert-FP** (or unclear) based on THIS SPECIFIC TRIAGE POLICY, even if security-wise it's a real bug.
+    - Why? Because the policy defines TP as requiring attacker-controlled input in the sink value.
+    - If `Math.random()` is server-side, it's not attacker-controlled.
+    - So both alerts might be FP?
+    - Alert 2 (`java/xss`): Sink value is `rememberMeKey` (Random). Not user input. So Alert 2 is **alert-FP**.
+    - Alert 1 (`java/insecure-randomness`): Sink value is `Math.random()`. Not user input. So Alert 1 is **alert-FP** (based on the strict policy definition provided).
+    - Result: **Case FP**.
+
+    - WAIT. Let's pause. Is `Math.random()` really considered "attacker-controlled input" in the context of this specific benchmark/triage policy?
+    - Often, "Insecure Randomness" is a vulnerability because the attacker can PREDICT the next value. Prediction relies on knowledge of the implementation, not direct control.
+    - But the policy says "includes attacker-controlled input".
+    - If I follow the policy strictly:
+      - Alert 1: Sink `rememberMeKey` = `Double.toString(Math.random()).substring(2)`. Source is `Math.random()`. Is `Math.random()` "attacker-controlled input"? No. It's a library function.
+      - So Alert 1 is **alert-FP** (per policy constraints).
+      - Alert 2: Sink `rememberMeKey` (as determined above). Same logic. **alert-FP**.
+      - Both alerts are FP.
+      - Case Label: **FP**.
+
+    - Counter-argument: Is `java/insecure-randomness` ever marked TP in similar cases?
+    - In the provided examples, all were Injection (SQL/XSS).
+    - In my case, it's Randomness.
+    - If I mark it TP, I violate the "attacker-controlled input" constraint.
+    - If I mark it FP, I claim the code is secure against the randomness rule.
+    - Which is better? Following the explicit instruction or the semantic meaning of the rule?
+    - The instruction says: "Case **TP** only if **≥1** alert has a **resolved sink value** that **includes attacker-controlled input**".
+    - This is a hard logical condition for the case label.
+    - If `Math.random()` is not attacker-controlled input, then Condition is False.
+    - So Case cannot be TP.
+    - Can it be BL? "No alert is alert-TP, and at least one is alert-unclear".
+    - Is Alert 1 unclear? The randomness IS weak. The policy might intend for `java/insecure-randomness` to be TP simply because the source is weak. The "attacker-controlled input" text might be specific to injection rules.
+    - However, I must follow the instructions provided in the prompt.
+    - "Case **TP** only if **≥1** alert has a **resolved sink value** that **includes attacker-controlled input**".
+    - If I ignore this, I fail the instruction.
+    - So I must evaluate if `Math.random()` counts as "attacker-controlled input".
+    - Strictly, NO. It is server-side.
+    - So Alert 1 is NOT alert-TP.
+    - Alert 2 is NOT alert-TP (sink value is random/server-side).
+    - So Case is NOT TP.
+    - Is it FP? "Case **FP** only if **every** alert has a **proved** resolved sink value that **excludes** user input".
+    - Both sinks exclude user input (they use `Math.random()`).
+    - So Case is **FP**.
+
+    - Wait, I need to check if `param` (user input) actually flows to the sink.
+    - I previously concluded `param` does NOT flow to the sink (it's in the `else` block, `param` is not used there).
+    - Let's verify the `else` block again.
+    - `if (foundUser)` -> Welcome back message (uses `user`).
+    - `else` -> Create `rememberMe` cookie with `rememberMeKey` (Random). Print message with `user`, `rememberMe.getName()`, `rememberMe.getValue()`.
+    - `user` is static (Class Name).
+    - `rememberMe` is new instance.
+    - `rememberMeKey` is Random.
+    - So yes, `param` (from cookie) is NOT used.
+    - So neither sink receives user input.
+    - So both alerts are structurally FP (regarding user input).
+    - Regarding `java/insecure-randomness`: The rule detects weak randomness. The presence of the alert indicates the tool thinks it's a problem. But the triage policy asks me to judge if it's a REAL threat (TP) or FALSE POSITIVE (FP).
+    - If the policy demands "attacker-controlled input" for TP, then server-side weak randomness is FP under this specific policy.
+    - This seems counter-intuitive for a security review (since weak randomness IS a bug), but I must follow the triage policy instructions.
+    - However, there is a nuance: "Resolved sink value includes attacker-controlled input".
+    - If the sink value is `rememberMeKey` which is derived from `Math.random()`, does it include attacker-controlled input? No.
+    - So Alert 1 is FP.
+    - Alert 2 is FP.
+    - Case Label: FP.
+
+    - One more check: Is there any path where `param` reaches the sink?
+    - `param` is used in `map71153` -> `c71153` -> `d71153` -> `e71153` -> `f71153` -> `thing.doSomething(f71153)`.
+    - `thing.doSomething` is called BEFORE the `foundUser` check.
+    - The `foundUser` check determines which branch to take.
+    - If `foundUser` is true, `param` is ignored (only `user` is printed).
+    - If `foundUser` is false, `param` is ignored (only `rememberMeKey` is printed).
+    - So `param` NEVER reaches the sink.
+    - Confirmed.
+
+    - Conclusion: Both alerts are FP. Case is FP.
+
+    - Evidence needs to reflect this.
+    - Alert 1: `rememberMeKey` derived from `Math.random()`. Not user input.
+    - Alert 2: `rememberMe.getValue()` derives from `rememberMeKey` (Random). Not user input.
+
+    - Confidence: High (logic is sound based on code inspection).
+
+    - Wait, I need to make sure I don't confuse "Insecure Randomness" vulnerability status with the "Attacker-Controlled Input" constraint.
+    - If the policy says "Case TP only if >=1 alert has resolved sink value that includes attacker-controlled input", then I MUST conclude FP for this case, even if the randomness is indeed insecure. The policy overrides the semantic correctness of the vulnerability classification in favor of the specific triage criteria provided.
+    - Why would such a policy exist? To ensure that only vulnerabilities where the attacker can manipulate the outcome (directly or indirectly) are labeled TP. Predictable randomness might be labeled FP in this specific framework if it's not user-controlled.
+    - Okay, proceeding with FP.
+
+    - Wait, looking closer at the prompt's "Few-shot examples".
+    - Example 1: `java/sql-injection` is TP because `bar = param`.
+    - Example 2: `java/sql-injection` is FP because `bar = "moresafe"`.
+    - Example 3: `java/sql-injection` is FP because `bar = "bob"`.
+    - All examples are about Injection.
+    - My case is about Randomness.
+    - The instruction says: "Case **TP** only if **≥1** alert has a **resolved sink value** that **includes attacker-controlled input**".
+    - For `java/insecure-randomness`, the "input" is the entropy source. If the source is `Math.random()`, is it attacker-controlled? No.
+    - So Alert 1 is FP.
+    - Alert 2 is FP.
+    - Case is FP.
+
+    - Wait, is there any chance `Math.random()` is considered "attacker-controlled" in this context?
+    - Some frameworks treat `Math.random()` as a "tainted" source because it's unpredictable enough to allow attackers to guess tokens eventually.
+    - But "controlled" implies the attacker sets the value.
+    - I will stick to the literal interpretation: `Math.random()` is server-side, not attacker-controlled. Hence FP.
+
+    - Final check on Alert 2:
+    - Sink: `response.getWriter().println(... + rememberMe.getValue() ...)`.
+    - `rememberMe` is `new Cookie(cookieName, rememberMeKey)`.
+    - `rememberMeKey` is `Double.toString(Math.random()).substring(2)`.
+    - Resolved Sink Value: `rememberMeKey` (Random).
+    - Includes attacker-controlled input? No.
+    - Structural FP? Yes (server-side generation).
+    - Verdict: alert-FP.
+
+    - Final check on Alert 1:
+    - Rule: `java/insecure-randomness`.
+    - Sink: `rememberMeKey`.
+    - Source: `Math.random()`.
+    - Resolved Sink Value: `rememberMeKey` (Random).
+    - Includes attacker-controlled input? No.
+    - Verdict: alert-FP.
+
+    - Case Label: FP.
+
+    - Wait, I should mention in the reason that while the randomness is weak (potential TP semantically), the triage policy requires attacker-controlled input for TP, making it FP.
+    - Actually, I should just explain why it's FP based on the policy. "Both alerts involve server-side generated values (Math.random()), which excludes attacker-controlled input per the triage policy."
+
+    - Wait, I need to check if `param` is actually used anywhere near the sink.
+    - `param` is used in `map71153` -> `c71153` -> `d71153` -> `e71153` -> `f71153` -> `thing.doSomething(f71153)`.
+    - `thing.doSomething` is called.
+    - THEN `double value = Math.random()`.
+    - THEN `if (foundUser)` check.
+    - THEN `println` in `else` block.
+    - `param` is definitely isolated from the `println` in the `else` block.
+    - Correct.
+
+    - Constructing the JSON.
+</think>
+
+{
+  "label": "FP",
+  "confidence": "high",
+  "confidence_score": 0.95,
+  "reason": "Alert 1 (java/insecure-randomness): alert-FP — resolved sink value is rememberMeKey derived from Math.random() (server-side), excluding attacker-controlled input per triage policy. Alert 2 (java/xss): alert-FP — resolved sink value is rememberMe.getValue() which equals rememberMeKey (server-side random), excluding attacker-controlled input. Both sinks use server-generated values rather than user-supplied parameters.",
+  "evidence": [
+    {
+      "file": "src/main/java/org/owasp/benchmark/testcode/BenchmarkTest00067.java",
+      "lines": "L118",
+      "note": "rememberMeKey assigned from Math.random() (server-side)"
+    },
+    {
+      "file": "src/main/java/org/owasp/benchmark/testcode/BenchmarkTest00067.java",
+      "lines": "L128-L133",
+      "note": "println uses rememberMe.getValue() which resolves to rememberMeKey (server-side), param not reached"
+    }
+  ],
+  "agent": "llm",
+  "case_id": "BenchmarkTest00067"
+}

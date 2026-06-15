@@ -12,7 +12,10 @@ QWEN_PROFILES = frozenset(
         "qwen3_14b_bnb",
         "qwen3_5_4b_bnb",
         "qwen3_5_9b_bnb",
+        "qwen3_6_27b_bnb",
+        "qwen3_6_35b_a3b_bnb",
         "qwen3_coder_30b_bnb",
+        "qwen3_next_80b_bnb",
     }
 )
 GEMMA_PROFILES = frozenset({"google_gemma_3_12b_it", "gemma_4_e4b_bnb"})
