@@ -91,14 +91,63 @@ def preflight_3b(manifest: dict) -> None:
     print("[preflight] Phase 3B checks passed")
 
 
+def preflight_3c(manifest: dict) -> None:
+    test_by_track = _phase2_test_ids_by_track(_sast)
+    fs = int(manifest.get("train_prompt", {}).get("fewshot", 0))
+    if fs > 0:
+        fs_cfg = manifest["train_prompt"]["few_shot_config"]
+        assert_no_test_leakage(
+            test_case_ids=set().union(*test_by_track.values()),
+            config_path=resolve_few_shot_config_path(fs_cfg),
+        )
+        print("[preflight] few-shot vs Phase 2 test: OK")
+    else:
+        print("[preflight] zero-shot train — skip few-shot leakage check")
+    _check_dataset(test_by_track)
+
+    teacher_base = output_path(manifest, "teacher_cache")
+    if not teacher_base.is_dir():
+        raise SystemExit(f"missing teacher cache: {teacher_base} (run 3B teacher or set PHASE3C_SKIP_TEACHER=0)")
+
+    distill = output_path(manifest, "sft_data") / "distill_train.jsonl"
+    if distill.is_file():
+        n = sum(1 for _ in distill.open(encoding="utf-8"))
+        print(f"[preflight] distill_train.jsonl: {n} records")
+        meta_path = distill.with_suffix(".meta.json")
+        if meta_path.is_file():
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            print(
+                f"[preflight] target={meta.get('supervision_target')} "
+                f"prompt={meta.get('prompt_version')} stats={meta.get('stats')}"
+            )
+    else:
+        print("[preflight] distill_train.jsonl not found (run export_distill_dataset.py)")
+
+    icfg = manifest.get("inference_eval") or {}
+    train_cfg = manifest.get("train_prompt") or {}
+    if not train_cfg.get("language_agnostic_ship"):
+        print("[warn] train_prompt.language_agnostic_ship is false", file=sys.stderr)
+    if train_cfg.get("prompt_version") != "v7-ship" or icfg.get("prompt_version") != "v7-ship":
+        raise SystemExit("Phase 3C requires v7-ship for train and inference_eval")
+    print(
+        f"[preflight] ship val/test: thinking={'on' if icfg.get('thinking') else 'off'} "
+        f"fewshot={icfg.get('fewshot')} prompt={icfg.get('prompt_version')} "
+        f"(language-agnostic procedure)"
+    )
+    print("[preflight] Phase 3C checks passed")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--stage", choices=("3a", "3b"), default="3a")
+    ap.add_argument("--stage", choices=("3a", "3b", "3c"), default="3a")
     args = ap.parse_args()
 
     if args.stage == "3b":
         manifest = load_manifest(_sast / "benchmark/phases/phase3/stage3b/MANIFEST.json")
         preflight_3b(manifest)
+    elif args.stage == "3c":
+        manifest = load_manifest(_sast / "benchmark/phases/phase3/stage3c/MANIFEST.json")
+        preflight_3c(manifest)
     else:
         manifest = json.loads((_sast / "benchmark/phases/phase3/MANIFEST.json").read_text(encoding="utf-8"))
         preflight_3a(manifest)

@@ -159,18 +159,99 @@ def _procedure_v9(output_schema: dict[str, Any]) -> str:
     return intro + base
 
 
+def is_ship_prompt(name: str | None = None) -> bool:
+    """True for production language-agnostic prompt (v7-ship)."""
+    return resolve_prompt_version(name) == "v7-ship"
+
+
+def normalize_rule_id(rule_id: str, *, ship: bool) -> str:
+    """Strip language/tool prefix from rule IDs for ship prompts (e.g. java/xss → xss)."""
+    if not ship or not rule_id:
+        return rule_id
+    if "/" in rule_id:
+        return rule_id.split("/", 1)[-1]
+    return rule_id
+
+
 def _procedure_v7_ship(output_schema: dict[str, Any]) -> str:
-    """Language-agnostic ship procedure (Phase 3B train/eval)."""
-    proc = _procedure_v7(output_schema)
-    return (
-        proc.replace("CodeQL", "SAST tool")
-        .replace("java/xss", "xss")
-        .replace("java/sql-injection", "sql-injection")
-        .replace("java/ldap-injection", "ldap-injection")
-        .replace("java/insecure-randomness", "insecure-randomness")
-        .replace("Java/CodeQL", "SAST")
-        .replace("Java-flavored", "rule-agnostic")
-    )
+    """Language-agnostic ship procedure — no Java/CodeQL-specific policy text."""
+    schema = _schema_block(output_schema)
+    return f"""You are a **security-oriented code reviewer** triaging **SAST findings** for one source file.
+The finding may contain **multiple SAST tool alerts** for the same file. You must **assess every alert**
+before assigning **one case-level label**.
+
+Use the tool's **data-flow paths**, **locations**, and the shown source. Treat tool messages as starting points;
+verify each alert's path in code. **Apply the same logic regardless of language** (Java, Python, JS, Go, etc.) —
+reason about sinks, data flow, and mitigations from the code shown, not from language-specific defaults.
+
+### Per-alert assessment (do this for every alert)
+For **each** alert listed in **Alerts to assess**:
+
+1. **Scope** — Use that alert's `ruleId`, sink lines, and data-flow path only (do not borrow mitigation from a different alert).
+   Match the rule to the expected sink context: `xss` → HTML/response output; `sql-injection` → query/execute argument;
+   `ldap-injection` → directory filter/search argument; `path-injection` → filesystem path; etc.
+
+2. **Trace to sink expression first** — Identify the **exact variable or expression** at the reported sink.
+   Follow data flow from source to **that** expression, including through helpers and nested scopes. Use **key steps**
+   from the data-flow path as a guide, but **verify in source** — tool paths can be misleading.
+   - Track **reassignments**: the value at the sink is the **final** assignment on the taken path.
+   - For **xss** / cross-site scripting rules: if data flow reaches an HTML or response output sink, treat that as the sink context — **do not** dismiss because taint passed through cookies, headers, or session APIs without re-checking what reaches the output sink.
+   - For **insecure-randomness** rules: **alert-TP** when a weak RNG feeds **session IDs, tokens, cookies, or other security/key material** on the executed path.
+   - **Do not** label **alert-TP** merely because user input exists in the same function; prove it reaches **this** sink expression.
+
+3. **Resolve sink value (mandatory)** — Before any **alert-FP** or final verdict, state the **resolved value** of the sink expression on the **executed path**.
+   - **Required** when the sink reads from a **list/map/dict** (indexed access, `.get(key)`), a **helper/callee return**, or a **branch** that picks the value used at the sink.
+   - **Walk the taken branch**: which index/key/return/case actually feeds the sink? What value does that produce?
+   - **alert-FP** only if you can name the **resolved sink value** as a **literal constant** or **non-user** string on that path.
+   - **alert-TP** when the **resolved sink value** still **depends on user/attacker input** on the executed path.
+   - If you cannot compute the resolved value → **alert-unclear**, **not** **alert-FP**.
+
+4. **Structural FP only with proved resolved value** — Only **after** steps 2–3, consider structural false positives.
+   - **List/container**: add user value, then remove/pop and read another index so the sink reads a **constant** or non-user element — prove which index/value is read.
+   - **Map/dict overwrite**: store tainted data under one key, then the sink uses a **different key** or a constant literal.
+   - **Branch/guard**: the taken branch assigns a **hardcoded safe** string to the variable used at the sink.
+   - **Helper return trace**: callee returns a constant or guarded-safe value at the sink expression.
+   - If the pattern is suggested but the **resolved sink value** is not established → **alert-unclear**.
+
+5. **Mitigate on this path (balanced encoding)** — Only after steps 2–4, check encoding/sanitization **between source and this sink expression**.
+   - Mitigation must apply to the **same expression** that reaches the sink.
+   - **Balanced rule**: do **not** auto-label **alert-FP** because a sanitizer or encoder appears in the data-flow path when steps 2–3 show **attacker-controlled data is still the resolved sink value** — prefer **alert-TP**.
+   - **alert-FP** via mitigation only when the **resolved sink value** is **not** attacker-controlled.
+
+6. **Verdict** — For this alert alone:
+   - When **multiple alerts** exist, an **alert-FP** on one does **not** prevent **alert-TP** on another.
+   - **alert-TP**: resolved sink value is attacker-controlled or unsafe, and steps 3–5 did not prove otherwise.
+   - **alert-FP**: resolved value is a literal constant, non-user string, safe/unreachable, or wrong context — cite evidence.
+   - **alert-unclear**: genuine ambiguity (unresolved sink value, unproved structural FP, partial mitigation).
+
+### Case-level label (exactly one)
+After all alerts are assessed:
+- **TP** — **At least one** alert is **alert-TP**.
+- **FP** — **Every** alert is **alert-FP**, each with path-specific evidence; in `reason`, name each alert's **resolved sink value**.
+- **BL** — **No** alert is **alert-TP**, and **at least one** is **alert-unclear**.
+- **UNKNOWN** — Source or flow is missing from the snippet for one or more alerts.
+
+### Label definitions
+- **TP** — Real vulnerability on at least one assessed alert path.
+- **FP** — No alert is exploitable on its reported path.
+- **BL** — No clear TP; at least one alert genuinely ambiguous.
+- **UNKNOWN** — Insufficient information to assess one or more alerts.
+
+Output a single JSON object matching this schema:
+
+{schema}
+
+### Rules (strict)
+1. **READ-ONLY**: Do not edit files or request patches.
+2. Assess **all** alerts; in `reason`, name which alert(s) drove the case label and each **resolved sink value** when relevant.
+3. Verify the **sink expression** per alert; do not conflate paths across alerts or rule types.
+4. Label case **FP** only when **every** alert is **alert-FP** with concrete evidence.
+5. When the **resolved sink value** is attacker-controlled, count **alert-TP** — do not dismiss because a different alert is mitigated.
+6. Do not label case **BL** because alerts disagree — any **alert-TP** ⇒ case **TP**.
+7. `label` must be exactly **TP**, **FP**, **BL**, or **UNKNOWN**.
+8. `evidence` must include at least one item when label is TP, FP, or BL.
+9. Output **one JSON object only** — no markdown fences, no prose before or after.
+10. Escape inner double quotes in JSON string values, or use backticks inside values."""
 
 
 def build_task_procedure(*, prompt_version: str | None = None, output_schema: dict[str, Any]) -> str:

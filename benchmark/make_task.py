@@ -127,23 +127,34 @@ def _codeflow_endpoints(
     return source, sink, key_steps
 
 
-def _format_alerts_summary(alerts: list[dict[str, Any]], default_file: str) -> str:
+def _format_alerts_summary(
+    alerts: list[dict[str, Any]],
+    default_file: str,
+    *,
+    prompt_version: str | None = None,
+) -> str:
+    from benchmark.prompt_versions import is_ship_prompt, normalize_rule_id
+
+    ship = is_ship_prompt(prompt_version)
+    tool_label = "SAST tool" if ship else "CodeQL"
+    flow_label = "data flow" if ship else "codeFlow"
     if not alerts:
         return (
             "## Alerts to assess\n\n"
-            "No structured CodeQL alerts were parsed; use `Finding (raw)` below.\n"
+            f"No structured {tool_label} alerts were parsed; use `Finding (raw)` below.\n"
         )
     n = len(alerts)
     lines = [
         "## Alerts to assess",
         "",
-        f"The finding contains **{n}** CodeQL alert{'s' if n != 1 else ''}. "
-        "**Evaluate every alert independently** (rule, sink, codeFlow), then apply the "
-        "case-level label rules in **Your task**.",
+        f"The finding contains **{n}** {tool_label} alert{'s' if n != 1 else ''}. "
+        "**Evaluate every alert independently** (rule, sink, "
+        f"{flow_label}), then apply the case-level label rules in **Your task**.",
         "",
     ]
     for i, alert in enumerate(alerts, start=1):
         rule_id = alert.get("ruleId") or (alert.get("rule") or {}).get("id") or "unknown"
+        rule_id = normalize_rule_id(str(rule_id), ship=ship)
         message = (alert.get("message") or {}).get("text") or ""
         sink_file, sink_lines = _alert_sink(alert, default_file)
         source, sink, key_steps = _codeflow_endpoints(alert)
@@ -153,11 +164,11 @@ def _format_alerts_summary(alerts: list[dict[str, Any]], default_file: str) -> s
             lines.append(f"- **message**: {message}")
         lines.append(f"- **sink**: `{sink_file}` {sink_lines}")
         if source:
-            lines.append(f"- **source (codeFlow)**: {source}")
+            lines.append(f"- **source ({flow_label})**: {source}")
         if sink and sink != source:
-            lines.append(f"- **sink (codeFlow)**: {sink}")
+            lines.append(f"- **sink ({flow_label})**: {sink}")
         if key_steps:
-            lines.append(f"- **key steps (codeFlow)**: {' → '.join(key_steps)}")
+            lines.append(f"- **key steps ({flow_label})**: {' → '.join(key_steps)}")
         lines.append("")
     return "\n".join(lines)
 
@@ -221,7 +232,9 @@ def build_task_markdown(
     finding_json = json.dumps(finding, ensure_ascii=False, indent=2)
     src_text = (repo_root / file_path).read_text(encoding="utf-8")
     alerts = _codeql_alerts(case.get("raw_output"))
-    alerts_summary = _format_alerts_summary(alerts, str(file_path or ""))
+    alerts_summary = _format_alerts_summary(
+        alerts, str(file_path or ""), prompt_version=prompt_version
+    )
 
     few_shot_block = ""
     layout_version = None

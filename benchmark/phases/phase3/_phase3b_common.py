@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import json
+import os
 import random
 from pathlib import Path
 from typing import Any
 
 _SAST = Path(__file__).resolve().parents[3]
-_MANIFEST = _SAST / "benchmark/phases/phase3/stage3b/MANIFEST.json"
+_DEFAULT_MANIFEST = _SAST / "benchmark/phases/phase3/stage3b/MANIFEST.json"
 
 _TRACKS = (
     ("fp", "FP"),
@@ -22,8 +23,10 @@ def sast_root() -> Path:
 
 
 def load_manifest(path: Path | None = None) -> dict[str, Any]:
-    p = path or _MANIFEST
-    return json.loads(p.expanduser().resolve().read_text(encoding="utf-8"))
+    if path is None:
+        env = os.environ.get("PHASE3_MANIFEST") or os.environ.get("PHASE3B_MANIFEST")
+        path = Path(env) if env else _DEFAULT_MANIFEST
+    return json.loads(path.expanduser().resolve().read_text(encoding="utf-8"))
 
 
 def stage3b_root(manifest: dict[str, Any] | None = None) -> Path:

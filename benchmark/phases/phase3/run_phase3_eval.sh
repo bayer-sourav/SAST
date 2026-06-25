@@ -17,7 +17,16 @@ source "$ROOT/benchmark/phase2_cell_env.sh"
 MANIFEST="${PHASE3B_MANIFEST:-$ROOT/benchmark/phases/phase3/stage3b/MANIFEST.json}"
 STAGE="${PHASE3_STAGE:-3a}"
 
-if [[ "$STAGE" == "3b" ]]; then
+if [[ "$STAGE" == "3c" ]]; then
+  MANIFEST="${PHASE3_MANIFEST:-$ROOT/benchmark/phases/phase3/stage3c/MANIFEST.json}"
+  LOG_DIR="runs/phase3/stage3c/logs"
+  SUM_DIR="runs/phase3/stage3c/summaries"
+  EVAL_ROOT="runs/phase3/stage3c/eval"
+  LORA="${SAST_LORA_ADAPTER:-runs/phase3/stage3c/lora/best}"
+  PROMPT_VERSION="${PHASE3_PROMPT_VERSION:-v7-ship}"
+  export QWEN_INFER_BACKEND=vllm
+  export SAST_REQUIRE_VLLM=1
+elif [[ "$STAGE" == "3b" ]]; then
   LOG_DIR="runs/phase3/stage3b/logs"
   SUM_DIR="runs/phase3/stage3b/summaries"
   EVAL_ROOT="runs/phase3/stage3b/eval"
@@ -65,8 +74,13 @@ RUNS_BL="$EVAL_ROOT/bl"
 export HF_HOME="${PHASE3_HF_HOME:-${HOME}/.cache/huggingface}"
 export PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-expandable_segments:True}"
 
-# shellcheck source=phase3b_env.sh
-source "$ROOT/benchmark/phases/phase3/phase3b_env.sh"
+if [[ "$STAGE" == "3c" ]]; then
+  # shellcheck source=phase3c_env.sh
+  source "$ROOT/benchmark/phases/phase3/phase3c_env.sh"
+else
+  # shellcheck source=phase3b_env.sh
+  source "$ROOT/benchmark/phases/phase3/phase3b_env.sh"
+fi
 
 phase2_apply_token_limits "$THINKING" "$PROFILE"
 export SAST_PROMPT_VERSION="$PROMPT_VERSION"

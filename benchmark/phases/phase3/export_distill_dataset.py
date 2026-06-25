@@ -88,6 +88,51 @@ def _read_teacher_assistant(run_dir: Path) -> str | None:
     return None
 
 
+def _teacher_json_compact(run_dir: Path) -> str | None:
+    """Prefer parsed triage result; fall back to JSON tail in llm_raw."""
+    result_path = run_dir / "agent-llm-triage-result.json"
+    if result_path.is_file():
+        try:
+            doc = json.loads(result_path.read_text(encoding="utf-8"))
+            payload: dict[str, Any] = {}
+            for key in ("label", "confidence", "confidence_score", "reason", "evidence"):
+                if key in doc and doc[key] is not None:
+                    payload[key] = doc[key]
+            if payload.get("label"):
+                return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        except Exception:
+            pass
+    raw = _read_teacher_assistant(run_dir)
+    if not raw:
+        return None
+    try:
+        parsed = extract_json_object(raw)
+        return json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
+    except Exception:
+        m = _JSON_TAIL_RE.search(raw)
+        if not m:
+            return None
+        try:
+            parsed = json.loads(m.group(0))
+            return json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
+        except Exception:
+            return None
+
+
+def _assistant_content(raw: str, *, target: str, run_dir: Path | None = None) -> str | None:
+    """Build training assistant turn from teacher output."""
+    if target == "json_only":
+        if run_dir is not None:
+            compact = _teacher_json_compact(run_dir)
+            if compact:
+                return compact
+        return None
+    raw = raw.strip()
+    if not raw:
+        return None
+    return raw
+
+
 def export_distill(
     *,
     dataset: Path,
@@ -98,10 +143,13 @@ def export_distill(
 ) -> dict[str, Any]:
     tok = _load_tokenizer()
     train_cfg = manifest["train_prompt"]
+    supervision = manifest.get("supervision") or {}
+    target = str(supervision.get("target") or "teacher_assistant_turn")
+    use_cot_target = target == "teacher_assistant_turn"
     test_ids = _phase2_test_ids_by_track(_sast)
     records: list[dict] = []
     dropped: list[dict] = []
-    stats = {"missing_teacher": 0, "too_long": 0, "leak": 0}
+    stats = {"missing_teacher": 0, "unparseable_teacher": 0, "too_long": 0, "leak": 0}
 
     for cls, _ in _TRACKS:
         mpath = dataset / cls / "manifest.json"
@@ -122,11 +170,19 @@ def export_distill(
                 dropped.append({"case_id": cid, "reason": "missing_teacher"})
                 continue
 
-            assistant = _truncate_assistant(
-                assistant,
-                max_tokens=max_thinking_tokens + 800,
-                tok=tok,
-            )
+            if use_cot_target:
+                assistant = _truncate_assistant(
+                    assistant,
+                    max_tokens=max_thinking_tokens + 800,
+                    tok=tok,
+                )
+            else:
+                compact = _assistant_content(assistant, target=target, run_dir=run_dir)
+                if not compact:
+                    stats["unparseable_teacher"] += 1
+                    dropped.append({"case_id": cid, "reason": "unparseable_teacher_json"})
+                    continue
+                assistant = compact
             user_text = build_task_markdown(
                 case=case,
                 repo_root=bundle,
@@ -174,6 +230,7 @@ def export_distill(
         "stats": stats,
         "max_thinking_tokens": max_thinking_tokens,
         "max_total_tokens": max_total_tokens,
+        "supervision_target": target,
         "prompt_version": train_cfg["prompt_version"],
         "out_path": str(out_path),
     }

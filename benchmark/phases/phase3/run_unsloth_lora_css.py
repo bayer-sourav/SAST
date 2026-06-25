@@ -96,6 +96,9 @@ class CssEvalCallback(TrainerCallback):
         eval_env = os.environ.copy()
         eval_env.setdefault("QWEN_INFER_BACKEND", "vllm")
         eval_env.pop("SAST_LORA_ADAPTER", None)
+        manifest_env = os.environ.get("PHASE3_MANIFEST") or os.environ.get("PHASE3B_MANIFEST")
+        if manifest_env:
+            eval_env["PHASE3_MANIFEST"] = manifest_env
         eval_env["PYTHONPATH"] = os.pathsep.join(
             [str(_sast), str(_sast / "benchmark"), eval_env.get("PYTHONPATH", "")]
         ).strip(os.pathsep)
@@ -174,6 +177,8 @@ def main() -> None:
     args = ap.parse_args()
 
     manifest = load_manifest()
+    train_cfg = manifest.get("train_prompt") or {}
+    enable_thinking = bool(train_cfg.get("thinking", True))
     dataset_path = args.dataset or (output_path(manifest, "sft_data") / "distill_train.jsonl")
     dataset_path = dataset_path.expanduser().resolve()
     if not dataset_path.is_file():
@@ -181,7 +186,12 @@ def main() -> None:
 
     rank = int(os.environ.get("PHASE3_LORA_R", "32"))
     lora_alpha = int(os.environ.get("PHASE3_LORA_ALPHA", str(rank)))
-    max_seq = int(os.environ.get("PHASE3_MAX_SEQ_LEN", "16384"))
+    max_seq = int(
+        os.environ.get(
+            "PHASE3_MAX_SEQ_LEN",
+            str(manifest.get("hyperparameters", {}).get("max_seq_len", 16384)),
+        )
+    )
     epochs = float(os.environ.get("PHASE3_EPOCHS", str(manifest["hyperparameters"]["epochs_max"])))
     lr = float(os.environ.get("PHASE3_LR", str(manifest["hyperparameters"]["learning_rate"])))
     batch_size = int(os.environ.get("PHASE3_BATCH_SIZE", "1"))
@@ -195,7 +205,11 @@ def main() -> None:
     val_eval_root = output_path(manifest, "val_eval")
     registry_path = output_path(manifest, "css_eligible_registry")
 
-    print(f"[train] rank={rank} max_seq={max_seq} packing={packing} dataset={dataset_path}", flush=True)
+    print(
+        f"[train] rank={rank} max_seq={max_seq} thinking={enable_thinking} "
+        f"packing={packing} dataset={dataset_path}",
+        flush=True,
+    )
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=args.model_id,
         max_seq_length=max_seq,
@@ -233,7 +247,7 @@ def main() -> None:
                 convo,
                 tokenize=False,
                 add_generation_prompt=False,
-                enable_thinking=True,
+                enable_thinking=enable_thinking,
             )
             for convo in convos
         ]
@@ -292,6 +306,7 @@ def main() -> None:
         "epochs": epochs,
         "learning_rate": lr,
         "packing": packing,
+        "enable_thinking": enable_thinking,
         "css_history": css_cb.history,
         "adapter_dir": str(run_dir),
         "finished_at": datetime.now(timezone.utc).isoformat(),

@@ -111,6 +111,43 @@ Code: `benchmark/css.py`
 
 ---
 
+## Phase 3C — ship-aligned distillation (in progress)
+
+| Field | Value |
+|-------|-------|
+| **Run ID** | `3c-001` |
+| **Status** | Training |
+| **Manifest** | `stage3c/MANIFEST.json` |
+| **Plan** | `stage3c/PLAN.md` |
+| **Hypothesis** | Train fs0_off + JSON-only targets; CSS val under ship config closes FPRR gap |
+
+### vs 3B ship
+
+| Metric | 3B ship (ep4) | Stage 2 | 3C target |
+|--------|---------------|---------|-----------|
+| SRS | 89.9% | 92.5% | ≥ 92.5% |
+| FPRR | 66.2% | 73.5% | ≥ 73.5% |
+| VDR | 90.3% | 92.5% | ≥ 90% |
+
+### Train export (first run)
+
+- **Records:** 1148 / 1500 (json_only, **v7-ship language-agnostic** user prompts)
+- **Reuse teacher:** `runs/phase3/stage3b/teacher/train`
+- **LoRA:** r=32 · CSS early stop · val fs0_off
+- **Ship prompts:** dedicated `_procedure_v7_ship` (no Java/CodeQL policy text); alert headers use "SAST tool", rule IDs strip `java/` prefix
+
+### Run checklist
+
+- [x] Plan + manifest
+- [x] Export ship-aligned distill JSONL
+- [x] Preflight
+- [ ] CSS training loop (running)
+- [ ] Full val rerank → `lora/best`
+- [ ] fs0_off test eval
+- [ ] Update summaries + reports
+
+---
+
 ## Decision log
 
 | Date | Decision | Rationale |
