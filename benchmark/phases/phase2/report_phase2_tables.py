@@ -275,8 +275,8 @@ def build_tables_markdown(sast: Path) -> str:
         "## Legend",
         "",
         "- **Status**: `Done` when evaluated = target and missing = 0; else `evaluated / target`.",
-        "- **FPRR** / **VDR** / **SRS** / **F1** use evaluated cases only.",
-        "- **SRS** = 0.5×FPRR + 0.5×VDR. **F1** = 0.5×F1-FP + 0.5×F1-TP.",
+        "- **SRS** = 1 − (Σ penalty) / (N × 3.0) over FP + TP + BL tracks (penalties: TP→FP 3.0×, "
+        "BL→FP 1.5×, TP→BL 1.0×, FP→TP/BL 1.0×, correct 0×; missing = 3.0×). **F1** = 0.5×F1-FP + 0.5×F1-TP.",
         "- **LenAcc**: borderline lenient accuracy. **BenchAg**: benchmark agreement. "
         "**AmbIdx**: ambiguity index.",
         "",

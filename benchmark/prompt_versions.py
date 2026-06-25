@@ -11,6 +11,7 @@ DEFAULT_PROMPT_VERSION = "v7-balanced"
 # Tag for v7-balanced matches Phase 2 Stage 2 ship config (Java/CodeQL-specific procedure).
 _REGISTRY: dict[str, str] = {
     "v7-balanced": "unified-4label-v7-balanced",
+    "v7-ship": "unified-4label-v7-ship",
     "v8-dual-gate": "unified-4label-v8-dual-gate",
     "v9-fprr-first": "unified-4label-v9-fprr-first",
 }
@@ -158,10 +159,26 @@ def _procedure_v9(output_schema: dict[str, Any]) -> str:
     return intro + base
 
 
+def _procedure_v7_ship(output_schema: dict[str, Any]) -> str:
+    """Language-agnostic ship procedure (Phase 3B train/eval)."""
+    proc = _procedure_v7(output_schema)
+    return (
+        proc.replace("CodeQL", "SAST tool")
+        .replace("java/xss", "xss")
+        .replace("java/sql-injection", "sql-injection")
+        .replace("java/ldap-injection", "ldap-injection")
+        .replace("java/insecure-randomness", "insecure-randomness")
+        .replace("Java/CodeQL", "SAST")
+        .replace("Java-flavored", "rule-agnostic")
+    )
+
+
 def build_task_procedure(*, prompt_version: str | None = None, output_schema: dict[str, Any]) -> str:
     key = resolve_prompt_version(prompt_version)
     if key == "v7-balanced":
         return _procedure_v7(output_schema)
+    if key == "v7-ship":
+        return _procedure_v7_ship(output_schema)
     if key == "v8-dual-gate":
         return _procedure_v8(output_schema)
     if key == "v9-fprr-first":

@@ -1,6 +1,6 @@
 # Phase 2 results tables
 
-Generated: 2026-06-10 06:24 UTC
+Generated: 2026-06-15 13:41 UTC
 
 Target: **200** cases per track (FP / TP / BL). **15** core gap cases skipped.
 

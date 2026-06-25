@@ -4,9 +4,15 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 SAST = Path(__file__).resolve().parents[4]
+if str(SAST) not in sys.path:
+    sys.path.insert(0, str(SAST))
+
+from benchmark.srs import compute_srs  # noqa: E402
+
 SUM = SAST / "runs/phase2/stage2/summaries"
 MANIFEST = SAST / "benchmark/phases/phase2/stage2/MANIFEST.json"
 OUT = SUM / "STAGE2_REPORT.md"
@@ -19,6 +25,7 @@ def main() -> None:
     for fs in (0, 3):
         fp_p = SUM / f"comparison_fp_think_on_fs{fs}.json"
         tp_p = SUM / f"comparison_tp_think_on_fs{fs}.json"
+        bl_p = SUM / f"comparison_bl_think_on_fs{fs}.json"
         if not fp_p.is_file() and not tp_p.is_file():
             continue
         lines.append(f"## Thinking ON · Few-shot {fs}\n")
@@ -26,16 +33,22 @@ def main() -> None:
         lines.append("| --- | --- | --- | --- |\n")
         fp = json.loads(fp_p.read_text()) if fp_p.is_file() else {}
         tp = json.loads(tp_p.read_text()) if tp_p.is_file() else {}
+        bl = json.loads(bl_p.read_text()) if bl_p.is_file() else {}
         for c in cells:
             if c["fewshot"] != fs:
                 continue
             prof = c["profile"]
             key = f"SLM ({prof})"
-            fprr = fp.get(key, {}).get("fprr")
-            vdr = tp.get(key, {}).get("vdr")
+            fp_m = fp.get(key, {})
+            tp_m = tp.get(key, {})
+            bl_m = bl.get(key)
+            fprr = fp_m.get("fprr")
+            vdr = tp_m.get("vdr")
             if fprr is None and vdr is None:
                 continue
-            srs = (float(fprr or 0) + float(vdr or 0)) / 2 if fprr is not None and vdr is not None else None
+            srs = compute_srs(fp_m, tp_m, bl_m)
+            if srs is None and fprr is not None and vdr is not None:
+                srs = (float(fprr) + float(vdr)) / 2
             lines.append(
                 f"| {prof} | {fprr*100:.1f}% | {vdr*100:.1f}% | {srs*100:.1f}% |\n"
                 if srs is not None

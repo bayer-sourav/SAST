@@ -62,6 +62,29 @@ def preload_profile(profile: str, *, use_4bit: bool = True) -> None:
     )
 
 
+def infer_triage(
+    messages: list[dict[str, Any]],
+    profile: str,
+    *,
+    thinking: bool = False,
+    use_4bit: bool = True,
+    max_new: int | None = None,
+) -> str:
+    """Triage inference honoring QWEN_INFER_BACKEND (vLLM when enabled for Qwen profiles)."""
+    family = profile_family(profile)
+    if family == "qwen":
+        from models.qwen.vllm_backend import should_use_vllm, vllm_generate_from_chat
+
+        if should_use_vllm(profile):
+            return vllm_generate_from_chat(
+                messages,
+                profile=profile,
+                enable_thinking=thinking,
+                max_new=max_new,
+            )
+    return generate_triage(messages, profile, thinking=thinking, use_4bit=use_4bit)
+
+
 def generate_triage(
     messages: list[dict[str, Any]],
     profile: str,

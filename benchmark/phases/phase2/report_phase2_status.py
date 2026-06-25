@@ -30,6 +30,7 @@ from timing import (  # noqa: E402
     write_json,
 )
 from benchmark.triage_labels import VALID_LABELS  # noqa: E402
+from benchmark.srs import compute_srs  # noqa: E402
 from benchmark.summarize_triage import (  # noqa: E402
     _f1_for_positive_class,
     _metrics_for_cases,
@@ -591,10 +592,13 @@ def _merge_matrix(
             amb_idx = float(bl_m.get("ambiguity_index", 0.0))
             cov_bl = float(bl_m.get("coverage", 0.0))
             srs3 = (fprr + vdr + len_acc) / 3.0
+        srs = compute_srs(fp_m, tp_m, bl_m)
+        if srs is None:
+            srs = 0.5 * fprr + 0.5 * vdr
         out["models"][profile] = {
             "fprr": fprr,
             "vdr": vdr,
-            "srs": 0.5 * fprr + 0.5 * vdr,
+            "srs": srs,
             "srs3": srs3,
             "f1_fp_track": f1_fp,
             "f1_tp_track": f1_tp,

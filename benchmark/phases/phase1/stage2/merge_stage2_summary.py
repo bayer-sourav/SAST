@@ -9,9 +9,13 @@ import sys
 from pathlib import Path
 
 _BENCH = Path(__file__).resolve().parents[3]  # benchmark/
+_SAST = _BENCH.parent
 if str(_BENCH) not in sys.path:
     sys.path.insert(0, str(_BENCH))
+if str(_SAST) not in sys.path:
+    sys.path.insert(0, str(_SAST))
 from merge_phase1_summary import _slm_row
+from benchmark.srs import compute_srs  # noqa: E402
 
 
 def main() -> None:
@@ -53,10 +57,13 @@ def main() -> None:
         vdr = float(tp_m.get("vdr", tp_m.get("tp_rate", 0.0)))
         f1_fp = float(fp_m.get("f1", 0.0))
         f1_tp = float(tp_m.get("f1", 0.0))
+        srs = compute_srs(fp_m, tp_m, bl_m)
+        if srs is None:
+            srs = 0.5 * fprr + 0.5 * vdr
         out["models"][profile] = {
             "fprr": fprr,
             "vdr": vdr,
-            "srs": 0.5 * fprr + 0.5 * vdr,
+            "srs": srs,
             "f1_fp_track": f1_fp,
             "f1_tp_track": f1_tp,
             "f1": 0.5 * f1_fp + 0.5 * f1_tp,

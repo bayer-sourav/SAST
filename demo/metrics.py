@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
+from benchmark.srs import compute_srs
+
 @dataclass
 class CaseOutcome:
     case_id: str
@@ -102,6 +104,27 @@ def _bl_acceptable(o: CaseOutcome) -> bool:
     return p == "BL" or p in acc
 
 
+def _track_summary(outcomes: list[CaseOutcome], gold: str) -> dict[str, Any]:
+    """Per-track counts for canonical SRS (matches benchmark summarize_triage shape)."""
+    gold_u = gold.upper()
+    cases = [o for o in outcomes if _norm(o.gold) == gold_u]
+    evaluated = 0
+    missing = 0
+    dist: Counter[str] = Counter()
+    for o in cases:
+        p = _norm(o.predicted)
+        if p is None:
+            missing += 1
+        else:
+            evaluated += 1
+            dist[p] += 1
+    return {
+        "evaluated": evaluated,
+        "missing": missing,
+        "distribution": dict(dist),
+    }
+
+
 def track_breakdown(outcomes: list[CaseOutcome]) -> dict[str, Any]:
     tp_cases = [o for o in outcomes if _norm(o.gold) == "TP"]
     fp_cases = [o for o in outcomes if _norm(o.gold) == "FP"]
@@ -167,7 +190,13 @@ def compute_metrics(
 
     vdr = rate(tp_gold, "TP")
     fprr = rate(fp_gold, "FP")
-    srs = (vdr + fprr) / 2 if vdr is not None and fprr is not None else None
+    srs = compute_srs(
+        _track_summary(outcomes, "FP"),
+        _track_summary(outcomes, "TP"),
+        _track_summary(outcomes, "BL"),
+    )
+    if srs is None and vdr is not None and fprr is not None:
+        srs = (vdr + fprr) / 2
 
     cm = confusion_vuln_vs_safe(outcomes)
     tpr = cm["tp"] / (cm["tp"] + cm["fn"] + cm["review_vuln"]) if (cm["tp"] + cm["fn"] + cm["review_vuln"]) else None

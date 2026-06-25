@@ -38,6 +38,7 @@ _MODEL: Any = None
 _TOKENIZER: Any = None
 _LOADED_4BIT: bool | None = None
 _LOADED_UNSLOTH_ID: str | None = None
+_LOADED_LORA_PATH: str | None = None
 _ACTIVE_PROFILE: str | None = None
 _BEDROCK_CLIENT: Any = None
 
@@ -63,17 +64,24 @@ QWEN3_PROFILES = frozenset(
 
 
 def _drop_qwen_weights() -> None:
-    global _MODEL, _TOKENIZER, _LOADED_4BIT, _LOADED_UNSLOTH_ID
+    global _MODEL, _TOKENIZER, _LOADED_4BIT, _LOADED_UNSLOTH_ID, _LOADED_LORA_PATH
     _MODEL = None
     _TOKENIZER = None
     _LOADED_4BIT = None
     _LOADED_UNSLOTH_ID = None
+    _LOADED_LORA_PATH = None
 
 
 def unload_qwen() -> None:
     global _ACTIVE_PROFILE
     _drop_qwen_weights()
     _ACTIVE_PROFILE = None
+    try:
+        from models.qwen.vllm_backend import unload_vllm
+
+        unload_vllm()
+    except Exception:
+        pass
 
 
 def _bedrock_creds() -> tuple[str, str, str]:
@@ -318,8 +326,33 @@ def _hf_cache_key(profile: str) -> str:
     return f"qwen_hf:{profile}"
 
 
+def _maybe_load_lora_adapter(model: Any) -> Any:
+    """Load PEFT adapter when SAST_LORA_ADAPTER points at a trained Phase 3 checkpoint."""
+    global _LOADED_LORA_PATH
+    raw = os.environ.get("SAST_LORA_ADAPTER", "").strip()
+    if not raw:
+        _LOADED_LORA_PATH = None
+        return model
+    path = str(Path(raw).expanduser().resolve())
+    if not Path(path).is_dir():
+        raise FileNotFoundError(f"SAST_LORA_ADAPTER directory not found: {path}")
+    if _LOADED_LORA_PATH == path:
+        return model
+    from peft import PeftModel
+
+    print(f"[Qwen] Loading LoRA adapter from {path!r}", flush=True)
+    model = PeftModel.from_pretrained(model, path, is_trainable=False)
+    _LOADED_LORA_PATH = path
+    return model
+
+
 def preload_qwen_profile(profile: str, *, use_4bit: bool = True) -> None:
-    """Eager HF/Unsloth load so batch cells do not retry load on every case after a failure."""
+    """Eager HF/Unsloth/vLLM load so batch cells do not retry load on every case after a failure."""
+    from models.qwen.vllm_backend import preload_vllm_profile, should_use_vllm
+
+    if should_use_vllm(profile):
+        preload_vllm_profile(profile)
+        return
     if _should_use_bedrock(profile):
         _get_bedrock_client()
         print(f"[preload] Bedrock ready for {profile!r} model={_bedrock_model_id()!r}", flush=True)
@@ -397,12 +430,59 @@ def _load_unsloth(*, use_4bit: bool, unsloth_model_id: str) -> tuple[Any, Any]:
         unsloth_kw["device_map"] = dm
         print(f"[Qwen] Unsloth device_map={dm!r}", flush=True)
     model, tokenizer = FastLanguageModel.from_pretrained(**unsloth_kw)
+    model = _maybe_load_lora_adapter(model)
     FastLanguageModel.for_inference(model)
     _MODEL, _TOKENIZER = model, tokenizer
     _LOADED_4BIT = use_4bit
     _LOADED_UNSLOTH_ID = unsloth_model_id
     print(f"[Qwen] Unsloth loaded model={unsloth_model_id!r} load_in_4bit={use_4bit}")
     return model, tokenizer
+
+
+def _text_tokenizer(tok_or_proc: Any) -> Any:
+    return getattr(tok_or_proc, "tokenizer", tok_or_proc)
+
+
+def _qwen_apply_generate_defaults(
+    tok_or_proc: Any,
+    model: Any,
+    gen_kwargs: dict[str, Any],
+) -> dict[str, Any]:
+    """Qwen3.5 checkpoints often ship config.eos_token_id=None — must pass tokenizer EOS or decode runs to max_new_tokens."""
+    t = _text_tokenizer(tok_or_proc)
+    if getattr(t, "pad_token_id", None) is not None:
+        gen_kwargs.setdefault("pad_token_id", t.pad_token_id)
+    eos_ids: list[int] = []
+    if getattr(t, "eos_token_id", None) is not None:
+        eos_ids.append(int(t.eos_token_id))
+    # Optional extra stops (comma-separated ids), e.g. <|endoftext|>
+    extra = os.environ.get("QWEN_EXTRA_EOS_TOKEN_IDS", "248044").strip()
+    if extra:
+        for part in extra.split(","):
+            part = part.strip()
+            if part.isdigit():
+                tid = int(part)
+                if tid not in eos_ids:
+                    eos_ids.append(tid)
+    if eos_ids:
+        gen_kwargs["eos_token_id"] = eos_ids[0] if len(eos_ids) == 1 else eos_ids
+    # Decode-phase KV cache (prefill once, then incremental). Disable only if debugging OOM.
+    if os.environ.get("QWEN_USE_CACHE", "1").strip().lower() not in ("0", "false", "no"):
+        gen_kwargs.setdefault("use_cache", True)
+    else:
+        gen_kwargs["use_cache"] = False
+    # Patch model generation_config so downstream HF helpers see EOS too.
+    gc = getattr(model, "generation_config", None)
+    if gc is not None and eos_ids and getattr(gc, "eos_token_id", None) in (None, 0):
+        gc.eos_token_id = eos_ids[0] if len(eos_ids) == 1 else eos_ids
+    if os.environ.get("QWEN_GEN_DEBUG", "").strip().lower() in ("1", "true", "yes"):
+        print(
+            f"[Qwen] generate defaults: eos={gen_kwargs.get('eos_token_id')} "
+            f"pad={gen_kwargs.get('pad_token_id')} use_cache={gen_kwargs.get('use_cache')} "
+            f"max_new={gen_kwargs.get('max_new_tokens')}",
+            flush=True,
+        )
+    return gen_kwargs
 
 
 def _prepare_messages_for_thinking(
@@ -499,6 +579,7 @@ def _hf_generate_with_template(
         input_token_len=input_len,
         max_seq_len=model_max_seq_len(),
     )
+    gen_kwargs = _qwen_apply_generate_defaults(tok, model, gen_kwargs)
     with torch.inference_mode():
         out = model.generate(**inputs, **gen_kwargs)
     new_tokens = out[0][input_len:]
@@ -543,6 +624,7 @@ def _generate_unsloth(
         input_token_len=input_len,
         max_seq_len=model_max_seq_len(),
     )
+    gen_kwargs = _qwen_apply_generate_defaults(tok, model, gen_kwargs)
     with torch.inference_mode():
         out = model.generate(**inputs, **gen_kwargs)
     new_tokens = out[0][input_len:]
@@ -622,6 +704,16 @@ def generate_from_chat_messages(
 
     norm = _normalize_chat_messages(messages)
     norm = _prepare_messages_for_thinking(norm, profile, enable_thinking=enable_thinking)
+
+    from models.qwen.vllm_backend import should_use_vllm, vllm_generate_from_chat
+
+    if should_use_vllm(profile):
+        return vllm_generate_from_chat(
+            norm,
+            profile=profile,
+            enable_thinking=enable_thinking,
+            tools=tools,
+        )
 
     if _should_use_bedrock(profile):
         return _bedrock_generate(norm, tools=tools, enable_thinking=enable_thinking)

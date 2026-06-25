@@ -24,6 +24,12 @@ def release_gpu_memory(*, verbose: bool = False) -> None:
 
     _step("qwen", lambda: __import__("models.qwen.runner", fromlist=["unload_qwen"]).unload_qwen())
     _step(
+        "vllm workers",
+        lambda: __import__(
+            "models.qwen.vllm_backend", fromlist=["kill_vllm_workers"]
+        ).kill_vllm_workers(),
+    )
+    _step(
         "gpt-oss unsloth",
         lambda: __import__(
             "models.open_ai_gpt_oss_20B.runner", fromlist=["unload_gpt_oss_unsloth"]

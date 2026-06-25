@@ -30,23 +30,28 @@ PYTHONPATH="$PWD:$PWD/benchmark" .venv/bin/python3 demo/build_cache.py
 
 ## Demo flow (live presentation)
 
-1. **Pipeline** — four steps: git commit, CodeQL SARIF, Qwen3-Coder-30B triage, metrics.
-2. **CodeQL table** — findings from the selected pack (file, rule, alert count, ground truth).
-3. **Run AI triage** — cached (instant) or live Bedrock.
-4. **Dashboard** — VDR, FPRR, SRS, TPR, FPR, confusion matrix, per-finding reasoning.
+1. **Pipeline bar** — four steps: git commit → CodeQL SARIF → AI triage → metrics.
+2. **CodeQL findings** — each finding card shows rule, alert message, sink location, dataflow trail, and a **highlighted Java snippet** (sink lines in amber).
+3. **Run AI triage** — cached (instant) or live Bedrock/GPU; cards update with **TP / FP / BL** verdict, status, and reasoning.
+4. **Aggregate metrics** — VDR, FPRR, SRS, borderline handling, summary table, and CodeQL-vs-AI chart.
+
+Toggle **Show eval ground truth** in the sidebar to reveal benchmark gold labels after triage.
 
 ## Finding packs
 
 | Pack | Size | Use when |
 |------|------|----------|
-| `quick` | 6 cases (2 TP + 2 FP + 2 BL) | Live demo; includes borderline disagreement |
+| `quick` | 8 cases (3× SSRF + 3× P-SSRF + 2× Type Confusion; TP/FP/BL mix) | Live demo with vuln-category variety |
 | `hard_slice` | 20 cases | Deeper metrics; prefer cached mode |
 
-**Best smoke prompt** (default): `v7-balanced` + `v2_3shot_tp_2fp` fs3 · think=on — 20/20 hard slice on qwen3_5_9b.
+**Quick pack categories** (research taxonomy over CodeQL CWE buckets):
+- **SSRF** — full taint-to-sink (e.g. XSS reflection)
+- **P-SSRF** — partial structured-target control (path / SQL injection)
+- **Type Confusion** — wrong primitive or format at sink (randomness, format strings)
 
 **Borderline cases in quick pack:**
-- `BenchmarkTest02201` — Coder labels TP, 5.9B/14B label FP
-- `BenchmarkTest02197` — 14B labels FP, 5.9B/Coder label TP
+- `BenchmarkTest02197` — P-SSRF path alert; 14B=FP vs 5.9B/Coder=TP
+- `BenchmarkTest02201` — SSRF XSS alert; Coder=TP vs 5.9B=FP
 
 ## Metrics (business ↔ technical)
 
@@ -54,7 +59,7 @@ PYTHONPATH="$PWD:$PWD/benchmark" .venv/bin/python3 demo/build_cache.py
 |--------|------------------|---------|
 | **VDR** | Threat detection | % of real vulns correctly labeled TP |
 | **FPRR** | Noise reduction | % of false alarms correctly labeled FP |
-| **SRS** | Combined score | Average of VDR and FPRR |
+| **SRS** | Security score | Penalty-weighted score over TP/FP/BL transitions |
 | **TPR** | Recall | Same as VDR on TP-gold cases |
 | **FPR** | False alarm rate | Safe cases wrongly flagged as vuln |
 

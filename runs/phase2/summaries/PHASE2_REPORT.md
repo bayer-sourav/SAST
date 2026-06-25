@@ -1,6 +1,6 @@
 # Phase 2 benchmark report
 
-Generated: 2026-06-10 06:18 UTC
+Generated: 2026-06-16 06:29 UTC
 
 Note: **15 gaps skipped** (per `runs/phase2/logs/gaps_skipped.txt`).
 
@@ -8,7 +8,7 @@ Note: **15 gaps skipped** (per `runs/phase2/logs/gaps_skipped.txt`).
 
 - All rates (FPRR, VDR, LenAcc, F1, coverage, label %) use **evaluated cases only**; missing or skipped cases are excluded from denominators.
 - **VDR** is often low on the TP track because gold labels are TP while models frequently predict FP or BL — low recall on the TP slice reflects conservative triage bias, not random error.
-- **SRS** = 0.5×FPRR + 0.5×VDR (FP + TP tracks). **SRS₃** adds borderline **LenAcc**: (FPRR + VDR + LenAcc) / 3 when borderline data exists for the profile.
+- **SRS** = 1 − (Σ penalty) / (N × 3.0) over FP + TP + BL tracks (penalties: TP→FP 3.0×, BL→FP 1.5×, TP→BL 1.0×, FP→TP/BL 1.0×, correct 0×; missing = 3.0×). **SRS₃** adds borderline **LenAcc**: (FPRR + VDR + LenAcc) / 3 when borderline data exists.
 - **Macro F1** = mean(F1-FP, F1-TP, F1-BL) when borderline F1 is available; otherwise mean(F1-FP, F1-TP). **F1₂** = 0.5×F1-FP + 0.5×F1-TP (Phase 1 compatible; JSON field `f1`).
 - High FPRR with low VDR yields a moderate **SRS** (~50–65%): strong FP removal alongside weak TP retention.
 
@@ -68,13 +68,21 @@ Note: **15 gaps skipped** (per `runs/phase2/logs/gaps_skipped.txt`).
 
 | Profile | FPRR | VDR | SRS | Macro F1 | LenAcc | SRS3 |
 | --- | --- | --- | --- | --- | --- | --- |
-| qwen3_5_4b_bnb | 12.0% | 96.5% | 54.2% | 36.3% | 99.5% | 69.3% |
-| qwen3_5_9b_bnb | 50.0% | 49.0% | 49.5% | 33.7% | 98.0% | 65.7% |
+| qwen3_4b_bnb | 94.0% | 31.7% | 67.9% | 41.9% | 100.0% | 75.2% |
+| qwen3_8b_bnb | 97.0% | 14.7% | 60.7% | 39.3% | 93.9% | 68.5% |
+| qwen3_14b_bnb | 100.0% | 8.0% | 54.8% | 36.0% | 100.0% | 69.3% |
+| qwen3_coder_30b_bnb | 92.5% | 37.0% | 73.6% | 45.7% | 92.5% | 74.0% |
+| qwen3_5_4b_bnb | 12.0% | 96.5% | 88.4% | 36.3% | 99.5% | 69.3% |
+| qwen3_5_9b_bnb | 50.0% | 49.0% | 71.3% | 33.7% | 98.0% | 65.7% |
 
 **Detail**
 
 | Profile | F1₂ | F1-FP | F1-TP | F1-BL | Cov-FP | Cov-TP | Cov-BL | BenchAg | AmbIdx |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| qwen3_4b_bnb | 62.8% | 94.0% | 31.7% | 0.0% | 100.0% | 99.5% | 99.5% | 50.8% | 0.985 |
+| qwen3_8b_bnb | 55.9% | 97.0% | 14.7% | 6.1% | 99.5% | 98.5% | 98.5% | 68.0% | 0.518 |
+| qwen3_14b_bnb | 54.0% | 100.0% | 8.0% | 0.0% | 100.0% | 100.0% | 99.5% | 86.9% | 0.261 |
+| qwen3_coder_30b_bnb | 64.8% | 92.5% | 37.0% | 7.5% | 100.0% | 100.0% | 100.0% | 40.5% | 0.960 |
 | qwen3_5_4b_bnb | 54.2% | 12.0% | 96.5% | 0.5% | 100.0% | 100.0% | 100.0% | 4.0% | 0.090 |
 | qwen3_5_9b_bnb | 49.5% | 50.0% | 49.0% | 2.0% | 100.0% | 100.0% | 100.0% | 46.0% | 0.960 |
 
@@ -82,6 +90,10 @@ Note: **15 gaps skipped** (per `runs/phase2/logs/gaps_skipped.txt`).
 
 | Profile | TP% | FP% | BL% | distribution note |
 | --- | --- | --- | --- | --- |
+| qwen3_4b_bnb | 49.2% | 50.8% | 0.0% | FP-dominant |
+| qwen3_8b_bnb | 25.9% | 68.0% | 6.1% | FP-dominant |
+| qwen3_14b_bnb | 13.1% | 86.9% | 0.0% | FP-dominant |
+| qwen3_coder_30b_bnb | 52.0% | 40.5% | 7.5% | TP-dominant |
 | qwen3_5_4b_bnb | 95.5% | 4.0% | 0.5% | TP-dominant |
 | qwen3_5_9b_bnb | 52.0% | 46.0% | 2.0% | TP-dominant |
 
@@ -141,13 +153,21 @@ Note: **15 gaps skipped** (per `runs/phase2/logs/gaps_skipped.txt`).
 
 | Profile | FPRR | VDR | SRS | Macro F1 | LenAcc | SRS3 |
 | --- | --- | --- | --- | --- | --- | --- |
-| qwen3_5_4b_bnb | 12.5% | 97.0% | 54.8% | 36.5% | 100.0% | 69.8% |
-| qwen3_5_9b_bnb | 56.5% | 61.0% | 58.7% | 39.3% | 99.5% | 72.3% |
+| qwen3_4b_bnb | 100.0% | 9.5% | 59.5% | 41.2% | 85.9% | 65.1% |
+| qwen3_8b_bnb | 95.0% | 8.0% | 58.1% | 37.4% | 91.0% | 64.7% |
+| qwen3_14b_bnb | 100.0% | 16.1% | 59.1% | 39.7% | 97.0% | 71.0% |
+| qwen3_coder_30b_bnb | 90.5% | 38.5% | 70.5% | 44.2% | 96.5% | 75.2% |
+| qwen3_5_4b_bnb | 12.5% | 97.0% | 86.4% | 36.5% | 100.0% | 69.8% |
+| qwen3_5_9b_bnb | 56.5% | 61.0% | 77.7% | 39.3% | 99.5% | 72.3% |
 
 **Detail**
 
 | Profile | F1₂ | F1-FP | F1-TP | F1-BL | Cov-FP | Cov-TP | Cov-BL | BenchAg | AmbIdx |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| qwen3_4b_bnb | 54.8% | 100.0% | 9.5% | 14.1% | 100.0% | 100.0% | 99.5% | 77.4% | 0.171 |
+| qwen3_8b_bnb | 51.5% | 95.0% | 8.0% | 9.0% | 100.0% | 99.5% | 99.5% | 78.9% | 0.241 |
+| qwen3_14b_bnb | 58.0% | 100.0% | 16.1% | 3.0% | 100.0% | 99.5% | 99.5% | 78.9% | 0.362 |
+| qwen3_coder_30b_bnb | 64.5% | 90.5% | 38.5% | 3.5% | 100.0% | 100.0% | 100.0% | 53.0% | 0.870 |
 | qwen3_5_4b_bnb | 54.8% | 12.5% | 97.0% | 0.0% | 100.0% | 100.0% | 100.0% | 17.5% | 0.350 |
 | qwen3_5_9b_bnb | 58.7% | 56.5% | 61.0% | 0.5% | 100.0% | 100.0% | 100.0% | 28.0% | 0.570 |
 
@@ -155,6 +175,10 @@ Note: **15 gaps skipped** (per `runs/phase2/logs/gaps_skipped.txt`).
 
 | Profile | TP% | FP% | BL% | distribution note |
 | --- | --- | --- | --- | --- |
+| qwen3_4b_bnb | 8.5% | 77.4% | 14.1% | FP-dominant |
+| qwen3_8b_bnb | 12.1% | 78.9% | 9.0% | FP-dominant |
+| qwen3_14b_bnb | 18.1% | 78.9% | 3.0% | FP-dominant |
+| qwen3_coder_30b_bnb | 43.5% | 53.0% | 3.5% | FP-dominant |
 | qwen3_5_4b_bnb | 82.5% | 17.5% | 0.0% | TP-dominant |
 | qwen3_5_9b_bnb | 71.5% | 28.0% | 0.5% | TP-dominant |
 
@@ -214,13 +238,21 @@ Note: **15 gaps skipped** (per `runs/phase2/logs/gaps_skipped.txt`).
 
 | Profile | FPRR | VDR | SRS | Macro F1 | LenAcc | SRS3 |
 | --- | --- | --- | --- | --- | --- | --- |
-| qwen3_5_4b_bnb | 71.5% | 68.5% | 70.0% | 48.0% | 96.0% | 78.7% |
-| qwen3_5_9b_bnb | 96.0% | 65.8% | 80.9% | 53.9% | 100.0% | 87.3% |
+| qwen3_4b_bnb | 95.5% | 21.5% | 63.0% | 39.0% | 100.0% | 72.3% |
+| qwen3_8b_bnb | 82.5% | 54.5% | 80.7% | 46.2% | 98.5% | 78.5% |
+| qwen3_14b_bnb | 98.5% | 11.5% | 56.2% | 36.7% | 100.0% | 70.0% |
+| qwen3_coder_30b_bnb | 91.5% | 37.0% | 74.1% | 46.7% | 88.5% | 72.3% |
+| qwen3_5_4b_bnb | 71.5% | 68.5% | 84.4% | 48.0% | 96.0% | 78.7% |
+| qwen3_5_9b_bnb | 96.0% | 65.8% | 86.7% | 53.9% | 100.0% | 87.3% |
 
 **Detail**
 
 | Profile | F1₂ | F1-FP | F1-TP | F1-BL | Cov-FP | Cov-TP | Cov-BL | BenchAg | AmbIdx |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| qwen3_4b_bnb | 58.5% | 95.5% | 21.5% | 0.0% | 100.0% | 100.0% | 100.0% | 62.0% | 0.760 |
+| qwen3_8b_bnb | 68.5% | 82.5% | 54.5% | 1.5% | 100.0% | 100.0% | 100.0% | 14.5% | 0.320 |
+| qwen3_14b_bnb | 55.0% | 98.5% | 11.5% | 0.0% | 100.0% | 100.0% | 100.0% | 84.5% | 0.310 |
+| qwen3_coder_30b_bnb | 64.2% | 91.5% | 37.0% | 11.5% | 100.0% | 100.0% | 100.0% | 39.5% | 0.980 |
 | qwen3_5_4b_bnb | 70.0% | 71.5% | 68.5% | 4.0% | 100.0% | 100.0% | 100.0% | 14.0% | 0.360 |
 | qwen3_5_9b_bnb | 80.9% | 96.0% | 65.8% | 0.0% | 100.0% | 99.5% | 100.0% | 11.0% | 0.220 |
 
@@ -228,6 +260,10 @@ Note: **15 gaps skipped** (per `runs/phase2/logs/gaps_skipped.txt`).
 
 | Profile | TP% | FP% | BL% | distribution note |
 | --- | --- | --- | --- | --- |
+| qwen3_4b_bnb | 38.0% | 62.0% | 0.0% | FP-dominant |
+| qwen3_8b_bnb | 84.0% | 14.5% | 1.5% | TP-dominant |
+| qwen3_14b_bnb | 15.5% | 84.5% | 0.0% | FP-dominant |
+| qwen3_coder_30b_bnb | 49.0% | 39.5% | 11.5% | mixed |
 | qwen3_5_4b_bnb | 82.0% | 14.0% | 4.0% | TP-dominant |
 | qwen3_5_9b_bnb | 89.0% | 11.0% | 0.0% | TP-dominant |
 
@@ -287,13 +323,21 @@ Note: **15 gaps skipped** (per `runs/phase2/logs/gaps_skipped.txt`).
 
 | Profile | FPRR | VDR | SRS | Macro F1 | LenAcc | SRS3 |
 | --- | --- | --- | --- | --- | --- | --- |
-| qwen3_5_4b_bnb | 82.5% | 53.0% | 67.8% | 45.7% | 98.5% | 78.0% |
-| qwen3_5_9b_bnb | 94.0% | 85.5% | 89.8% | 59.8% | 100.0% | 93.2% |
+| qwen3_4b_bnb | 100.0% | 9.5% | 59.6% | 41.5% | 85.0% | 64.8% |
+| qwen3_8b_bnb | 90.0% | 51.0% | 79.0% | 48.5% | 95.5% | 78.8% |
+| qwen3_14b_bnb | 97.5% | 26.0% | 66.5% | 42.3% | 96.5% | 73.3% |
+| qwen3_coder_30b_bnb | 90.0% | 43.0% | 73.2% | 45.5% | 96.5% | 76.5% |
+| qwen3_5_4b_bnb | 82.5% | 53.0% | 79.2% | 45.7% | 98.5% | 78.0% |
+| qwen3_5_9b_bnb | 94.0% | 85.5% | 92.8% | 59.8% | 100.0% | 93.2% |
 
 **Detail**
 
 | Profile | F1₂ | F1-FP | F1-TP | F1-BL | Cov-FP | Cov-TP | Cov-BL | BenchAg | AmbIdx |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| qwen3_4b_bnb | 54.8% | 100.0% | 9.5% | 15.0% | 100.0% | 100.0% | 100.0% | 76.0% | 0.180 |
+| qwen3_8b_bnb | 70.5% | 90.0% | 51.0% | 4.5% | 100.0% | 100.0% | 100.0% | 21.5% | 0.520 |
+| qwen3_14b_bnb | 61.7% | 97.5% | 26.0% | 3.5% | 100.0% | 100.0% | 100.0% | 53.5% | 0.860 |
+| qwen3_coder_30b_bnb | 66.5% | 90.0% | 43.0% | 3.5% | 100.0% | 100.0% | 100.0% | 45.0% | 0.970 |
 | qwen3_5_4b_bnb | 67.8% | 82.5% | 53.0% | 1.5% | 100.0% | 100.0% | 100.0% | 19.5% | 0.420 |
 | qwen3_5_9b_bnb | 89.8% | 94.0% | 85.5% | 0.0% | 100.0% | 100.0% | 100.0% | 11.0% | 0.220 |
 
@@ -301,6 +345,10 @@ Note: **15 gaps skipped** (per `runs/phase2/logs/gaps_skipped.txt`).
 
 | Profile | TP% | FP% | BL% | distribution note |
 | --- | --- | --- | --- | --- |
+| qwen3_4b_bnb | 9.0% | 76.0% | 15.0% | FP-dominant |
+| qwen3_8b_bnb | 74.0% | 21.5% | 4.5% | TP-dominant |
+| qwen3_14b_bnb | 43.0% | 53.5% | 3.5% | FP-dominant |
+| qwen3_coder_30b_bnb | 51.5% | 45.0% | 3.5% | TP-dominant |
 | qwen3_5_4b_bnb | 79.0% | 19.5% | 1.5% | TP-dominant |
 | qwen3_5_9b_bnb | 89.0% | 11.0% | 0.0% | TP-dominant |
 
