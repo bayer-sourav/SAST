@@ -49,102 +49,100 @@ Sources: `runs/phase2/phase2_benchmark_tables/BENCHMARK_RESULTS.html`, confusion
 
 ---
 
-## Phase 3B — teacher distillation + CSS + rank sweep (planned)
+## Phase 3B — teacher distillation + CSS + rank sweep (complete)
 
 | Field | Value |
 |-------|-------|
-| **Run ID** | `3b-001` (placeholder) |
-| **Status** | Not started |
+| **Run ID** | `3b-001` |
+| **Status** | Complete — ship adapter pushed (LFS) |
 | **Manifest** | `stage3b/MANIFEST.json` |
-| **Hypothesis** | Distill Stage 2 on **train**; CSS on **val** picks checkpoint; sweep ranks **16/32/64** (L40S) |
+| **Ship adapter** | `runs/phase3/stage3b/lora/best_fs0_off` (epoch 4, fs0 rerank) |
 
-### Data & teacher (confirmed)
+### Test results — ship (fs0_off best)
 
-| Split | N | Teacher? | Role |
-|-------|---|------------|------|
-| Train | 1,500 | **Yes** | SFT distillation targets (CoT + JSON from Stage 2) |
-| Validation | 600 | No | CSS checkpoint scoring vs **gold** labels |
-| Test | 600 | No | Final metrics (same suite as val) — **once**, best checkpoint only |
+| Metric | 3B ship | Stage 2 | Delta |
+|--------|---------|---------|-------|
+| SRS | 89.9% | 92.5% | -2.6pp |
+| VDR | 90.3% | 92.5% | -2.2pp |
+| FPRR | 66.2% | 73.5% | -7.3pp |
+| TP→FP | 17 | 14 | +3 |
 
-### LoRA rank sweep
+### Artifacts
 
-| Rank | Status | Best val CSS | Notes |
-|------|--------|--------------|-------|
-| 16 | — | — | 3A capacity; ablation |
-| 32 | — | — | Primary candidate |
-| 64 | — | — | CoT headroom |
-| ~~128~~ | excluded | — | Overfit risk; no VRAM win on L40S |
-
-### Checkpoint workflow
-
-**Epochs:** CSS early stop (patience 3 val evals); no fixed low budget — hard cap **≤10** per rank. Best checkpoint may be any epoch, not the last.
-
-1. **During training** (per rank): save checkpoints each epoch → **fast val (150 stratified)** → SRS/VDR/FPRR/macro-F1/CSS → log eligible (VDR ≥ 0.75); stop when CSS plateaus or cap hit.
-2. **After all ranks**: re-eval **every CSS-eligible** checkpoint on **full val (600)** (confirmation).
-3. **Pick global best** by CSS on val across all ranks.
-4. **Test eval once** on that adapter; report same metrics + confusion matrix.
-
-### CSS definition
-
-```
-CSS = 0.35*SRS + 0.35*VDR + 0.20*FPRR + 0.10*Macro-F1
-Disqualify if VDR < 0.75 -> CSS = 0
-```
-
-Code: `benchmark/css.py`
-
-### Results (fill after run)
-
-| Checkpoint | Rank | Val CSS | Val SRS | Val VDR | Test SRS | Test VDR | Selected |
-|------------|------|---------|---------|---------|----------|----------|----------|
-| — | — | — | — | — | — | — | |
-
-### Run checklist
-
-- [ ] Teacher on **train** only (1500)
-- [ ] `export_distill_dataset.py` → train JSONL
-- [ ] Preflight (no test leakage)
-- [ ] Train ranks **16, 32, 64** with CSS val eval each epoch
-- [ ] `rerank_val_checkpoints.py` on all CSS-eligible weights
-- [ ] Pick global best; **test eval once**
-- [ ] Update this table + `summaries/PHASE3B_REPORT.md`
+- `reports/phase3b/PHASE3B_TEST_REPORT.md`
+- `runs/phase3/stage3b/lora/best_fs0_off/` (git LFS)
 
 ---
 
-## Phase 3C — ship-aligned distillation (in progress)
+## Phase 3C — ship-aligned distillation (complete)
 
 | Field | Value |
 |-------|-------|
 | **Run ID** | `3c-001` |
-| **Status** | Training |
+| **Status** | Complete — did not beat Stage 2 SRS |
 | **Manifest** | `stage3c/MANIFEST.json` |
+| **Adapter** | `runs/phase3/stage3c/lora/best` (epoch 6, full-val CSS) |
 | **Plan** | `stage3c/PLAN.md` |
-| **Hypothesis** | Train fs0_off + JSON-only targets; CSS val under ship config closes FPRR gap |
 
-### vs 3B ship
+### Hypothesis result
 
-| Metric | 3B ship (ep4) | Stage 2 | 3C target |
-|--------|---------------|---------|-----------|
-| SRS | 89.9% | 92.5% | ≥ 92.5% |
-| FPRR | 66.2% | 73.5% | ≥ 73.5% |
-| VDR | 90.3% | 92.5% | ≥ 90% |
+Train/serve alignment **validated** (epoch 6 = val pick without fs0 rerank correction). **FPRR improved +12pp vs 3B ship** but **VDR dropped −4pp** → **same aggregate SRS** as 3B ship.
 
-### Train export (first run)
+### Train export
 
-- **Records:** 1148 / 1500 (json_only, **v7-ship language-agnostic** user prompts)
-- **Reuse teacher:** `runs/phase3/stage3b/teacher/train`
-- **LoRA:** r=32 · CSS early stop · val fs0_off
-- **Ship prompts:** dedicated `_procedure_v7_ship` (no Java/CodeQL policy text); alert headers use "SAST tool", rule IDs strip `java/` prefix
+- **Records:** 1283 / 1500 (json_only, v7-ship, fs0_off)
+- **Dropped:** 99 missing teacher, 97 unparseable, 21 too long
+- **Teacher:** reused `runs/phase3/stage3b/teacher/train`
+
+### Val rerank (full 600)
+
+| Epoch | Full CSS | SRS | VDR | FPRR | Selected |
+|-------|----------|-----|-----|------|----------|
+| 2 | 0.813 | 83.7% | 86.7% | 80.6% | |
+| 4 | 0.824 | 83.9% | 86.7% | 85.0% | |
+| **6** | **0.844** | **85.7%** | **89.9%** | **85.6%** | **yes** |
+| 8 | 0.839 | 85.2% | 88.8% | 85.6% | |
+| 10 | 0.833 | 84.4% | 88.8% | 84.4% | |
+
+### Test results (594/600 after gap-fill)
+
+| Metric | 3C | 3B ship | Stage 2 | Δ vs S2 |
+|--------|-----|---------|---------|---------|
+| SRS | 89.9% | 89.9% | 92.5% | -2.6pp |
+| VDR | 86.3% | 90.3% | 92.5% | -6.2pp |
+| FPRR | 78.3% | 66.2% | 73.5% | +4.8pp |
+| TP→FP | 27 | 17 | 14 | +13 |
+| BL→FP | 27 | 16 | 26 | +1 |
+| Missing | 6 | 13 | 0 | |
+
+### Diagnosis
+
+- Primary gap: **TP→FP** (VDR), not BL volume — BL→TP is zero penalty and dominates BL track
+- 3C trades fewer FP→TP errors for more TP→FP vs 3B ship (same total SRS penalty)
+- Six inference JSON-parse failures remain (CoT without JSON)
+
+### Artifacts
+
+- `reports/phase3c/PHASE3C_TEST_REPORT.md`
+- `reports/phase3c/PHASE3C_NEXT.md` — recommended 3D plan
+- `runs/phase3/stage3c/summaries/css_rerank_best.json`
+- `benchmark/phases/phase3/rescore_test_eval.py`
 
 ### Run checklist
 
 - [x] Plan + manifest
 - [x] Export ship-aligned distill JSONL
 - [x] Preflight
-- [ ] CSS training loop (running)
-- [ ] Full val rerank → `lora/best`
-- [ ] fs0_off test eval
-- [ ] Update summaries + reports
+- [x] CSS training (10 epochs, r=32)
+- [x] Full val rerank → `lora/best`
+- [x] fs0_off test eval + gap-fill
+- [x] Reports + EXPERIMENTS update
+
+---
+
+## Phase 3D — VDR / TP→FP correction (proposed)
+
+See `reports/phase3c/PHASE3C_NEXT.md`. **Not recommended:** remove BL from train only.
 
 ---
 
@@ -158,3 +156,7 @@ Code: `benchmark/css.py`
 | 2025-06 | CoT + fs3 in training | Match eval ship config |
 | 2025-06 | LoRA rank sweep 16/32/64 (L40S) | 32 primary; 64 CoT; skip 128 |
 | 2025-06 | Re-eval all CSS-eligible on val before test | Confirm best checkpoint; test run once only |
+| 2025-06 | 3C: fs0_off train + json_only + ship val CSS | Close 3B FPRR gap; fix train/serve mismatch |
+| 2025-06 | 3C: reuse 3B teacher cache | Avoid 1500-case re-inference |
+| 2025-06 | 3C result: same SRS as 3B ship, +FPRR −VDR | CSS picks different error tradeoff; TP→FP is next target |
+| 2025-06 | Do not drop BL from train (3D) | BL→TP is free; BL cases teach TP/FP boundary |

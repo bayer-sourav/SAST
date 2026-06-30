@@ -1,6 +1,6 @@
 # Phase 3C — Ship-aligned distillation (fs0_off train + val)
 
-**Status:** In progress  
+**Status:** Complete (2026-06-30)  
 **Prior:** Phase 3B complete — best ship test SRS **89.9%** (epoch 4, `best_fs0_off`) vs Stage 2 **92.5%**  
 **Frozen baseline:** Stage 2 GOOD · `5.9b_fs3_legacy` — SRS 92.5% · FPRR 73.5% · VDR 92.5%
 
@@ -122,9 +122,11 @@ PHASE3C_SKIP_TRAIN=1 bash benchmark/phases/phase3/run_phase3c.sh  # export + pre
 
 ---
 
-## Fallback / Phase 3D ideas (not in scope)
+## Fallback / Phase 3D ideas
 
-- Rank sweep r=64 if 3C FPRR plateaus
-- Mixed supervision: 80% json_only + 20% short rationale
-- Hard-negative mining on FP track failures from 3B confusion matrix
-- DPO on FP→TP / TP→FP pairs from Stage 2 vs 3B delta
+See `reports/phase3c/PHASE3C_NEXT.md` for full plan. Summary:
+
+- **3D primary:** hard-negative mining on TP→FP errors; VDR-weighted CSS; rank 64 json_only
+- **Data recovery:** re-export toward 1500 train records (217 currently dropped)
+- **Not recommended:** remove BL from train only (see NEXT doc)
+- DPO on Stage 2 vs 3C confusion deltas (3E)
