@@ -33,9 +33,8 @@ fi
 
 if [[ "${PHASE3C_SKIP_TRAIN:-0}" != "1" ]]; then
   for r in $PHASE3_LORA_RANKS; do
-    echo "[phase3c] train rank=$r (CSS val fs0_off every ${PHASE3_CSS_EVAL_EVERY} epochs)" | tee -a "$LOG"
-    PHASE3_LORA_R="$r" PHASE3_LORA_ALPHA="$r" \
-      .venv/bin/python "$ROOT/benchmark/phases/phase3/run_unsloth_lora_css.py" >> "$LOG" 2>&1
+    echo "[phase3c] train rank=$r (CSS val fs0_off every ${PHASE3_CSS_EVAL_EVERY} epochs, auto-resume on)" | tee -a "$LOG"
+    bash "$ROOT/benchmark/phases/phase3/run_train_auto_resume.sh" "$r"
   done
 fi
 

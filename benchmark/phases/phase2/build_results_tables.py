@@ -114,6 +114,7 @@ STAGE2_BAND = (4, "Stage 2 ship", "cat-stage2")
 PHASE3_BAND = (5, "Phase 3 LoRA", "cat-phase3")
 PHASE3B_BAND = (6, "Phase 3B LoRA", "cat-phase3b")
 PHASE3C_BAND = (7, "Phase 3C LoRA", "cat-phase3c")
+PHASE3D_BAND = (8, "Phase 3D LoRA", "cat-phase3d")
 PHASE3_SUM = _SAST / "runs/phase3/stage3a/summaries"
 PHASE3_EVAL = _SAST / "runs/phase3/stage3a/eval"
 CONFUSION_JSON = OUT_DIR / "benchmark_confusion_comparison.json"
@@ -682,31 +683,70 @@ def _load_phase3c_confusion_rows() -> list[dict]:
     return rows
 
 
+def _load_phase3d_rows() -> list[dict]:
+    from benchmark.phases.phase3.phase3d_benchmark import experiment_row_from_cell, load_all_test_cells
+
+    rows: list[dict] = []
+    for cell in load_all_test_cells():
+        row = experiment_row_from_cell(cell)
+        _, category, row_class = PHASE3D_BAND
+        row["category"] = cell.get("category") or category
+        row["row_class"] = row_class
+        row["band_order"] = PHASE3D_BAND[0]
+        rows.append(_finalize_row(row))
+    return rows
+
+
+def _load_phase3d_confusion_rows() -> list[dict]:
+    from benchmark.phases.phase3.phase3d_benchmark import load_all_test_cells
+
+    rows: list[dict] = []
+    for cell in load_all_test_cells():
+        cm = cell["confusion"]
+        row = {
+            "id": cell["id"],
+            "label": cell["label"],
+            "tier": _assign_tier(
+                {
+                    "vdr": cell["vdr"],
+                    "fprr": cell["fprr"],
+                    "macro_f1": cell["macro_f1"],
+                    "srs": cell["srs"],
+                    "critical": cell["critical_tp_fp"],
+                    "test_n": PHASE2_TEST_N,
+                }
+            ),
+            "category": cell.get("category", "Phase 3D LoRA"),
+            "row_class": "cat-phase3d",
+            "note": cell.get("note", ""),
+            **cm,
+            "fprr": cell["fprr"],
+            "vdr": cell["vdr"],
+            "srs": cell["srs"],
+        }
+        rows.append(row)
+    return rows
+
+
 def _load_phase3a_row() -> dict | None:
+    from benchmark.confusion_matrix import confusion_for_run, track_metrics_from_matrix
+    from benchmark.summarize_triage import macro_f1_from_track_f1s
+
     profile = "qwen3_5_9b_bnb"
-    row_key = f"SLM ({profile})"
-    fp_path = PHASE3_SUM / "comparison_fp_phase3a.json"
-    tp_path = PHASE3_SUM / "comparison_tp_phase3a.json"
-    bl_path = PHASE3_SUM / "comparison_bl_phase3a.json"
-    if not fp_path.is_file() or not tp_path.is_file():
+    cm = confusion_for_run(PHASE3_EVAL, profile, thinking="on", fewshot=3)
+    if int(cm.get("evaluated") or 0) < TARGET - 20:
         return None
-    fp_rows = json.loads(fp_path.read_text(encoding="utf-8"))
-    tp_rows = json.loads(tp_path.read_text(encoding="utf-8"))
-    bl_rows = (
-        json.loads(bl_path.read_text(encoding="utf-8")) if bl_path.is_file() else {}
-    )
-    matrix = _merge_matrix(fp_rows, tp_rows, bl_rows, [profile], "on", 3)
-    m = matrix.get("models", {}).get(profile)
-    if not m:
-        return None
-    fp_t = m["fp_track"]
-    tp_t = m["tp_track"]
-    if int(fp_t.get("evaluated", 0)) < TARGET - 10 or int(tp_t.get("evaluated", 0)) < TARGET - 10:
-        return None
-    bl_t = bl_rows.get(row_key)
+    fp_t = track_metrics_from_matrix(cm, "FP")
+    tp_t = track_metrics_from_matrix(cm, "TP")
+    bl_t = track_metrics_from_matrix(cm, "BL")
     srs = compute_srs(fp_t, tp_t, bl_t, test_n=PHASE2_TEST_N)
     if srs is None:
-        srs = float(m["srs"])
+        return None
+    fprr = fp_t["correct"] / fp_t["evaluated"] if fp_t["evaluated"] else 0.0
+    vdr = tp_t["correct"] / tp_t["evaluated"] if tp_t["evaluated"] else 0.0
+    fp_f1 = fp_t["correct"] / fp_t["evaluated"] if fp_t["evaluated"] else 0.0
+    tp_f1 = tp_t["correct"] / tp_t["evaluated"] if tp_t["evaluated"] else 0.0
+    macro = macro_f1_from_track_f1s(fp_f1, tp_f1, None)["macro_f1"]
     band_order, category, row_class = PHASE3_BAND
     return _finalize_row(
         {
@@ -719,13 +759,14 @@ def _load_phase3a_row() -> dict | None:
             "fewshot": 3,
             "source": "phase3/stage3a",
             "phase": "Phase 3A",
-            "vdr": float(m["vdr"]),
-            "fprr": float(m["fprr"]),
-            "macro_f1": _macro_f1(m),
+            "vdr": vdr,
+            "fprr": fprr,
+            "macro_f1": float(macro),
             "srs": float(srs),
-            "critical": _critical(tp_t),
+            "critical": int(cm.get("critical_tp_fp") or 0),
             "accuracy": _accuracy(fp_t, tp_t),
             "test_n": PHASE2_TEST_N,
+            "missing": int(cm.get("missing") or 0),
             "few_shot_config": "v2_3shot_tp_2fp",
         }
     )
@@ -768,11 +809,13 @@ def _build_confusion_section(comparisons: list[dict]) -> str:
         return ""
 
     from benchmark.phases.phase3.phase3b_benchmark import load_best_epoch, load_fs0_off_rerank
-    from benchmark.phases.phase3.phase3c_benchmark import load_rerank_best
+    from benchmark.phases.phase3.phase3c_benchmark import load_rerank_best as load_rerank_best_3c
+    from benchmark.phases.phase3.phase3d_benchmark import load_rerank_best as load_rerank_best_3d
 
     train_ep = load_best_epoch().get("epoch", 6)
     ship_ep = load_fs0_off_rerank().get("epoch", 4)
-    phase3c_ep = load_rerank_best().get("epoch", 6)
+    phase3c_ep = load_rerank_best_3c().get("epoch", 6)
+    phase3d_ep = load_rerank_best_3d().get("epoch", 6)
 
     summary_cols = [
         "Model",
@@ -817,8 +860,8 @@ def _build_confusion_section(comparisons: list[dict]) -> str:
         )
 
     return f"""<section>
-<h2>Confusion matrices — Stage 2 GOOD · Phase 2 MINIMUM · Phase 3A · Phase 3B · Phase 3C</h2>
-<p class="subtitle">Full 3×3 gold × predicted over 600 cases (200 FP + 200 TP + 200 BL). Phase 3B rows span teacher-matched (ep{train_ep}) and ship fs0_off (ep{ship_ep} rerank). Phase 3C: ship-aligned distill (ep{phase3c_ep}, fs0_off). Diagonal = correct; shaded cells = high-penalty misclassifications. <b>BL-gold:</b> ship models rarely predict BL — BL→TP is SRS-free; BL→FP is penalized.</p>
+<h2>Confusion matrices — Stage 2 GOOD · Phase 2 MINIMUM · Phase 3A–3D</h2>
+<p class="subtitle">Full 3×3 gold × predicted over 600 cases (200 FP + 200 TP + 200 BL). Phase 3B rows span teacher-matched (ep{train_ep}) and ship fs0_off (ep{ship_ep} rerank). Phase 3C: ship-aligned distill (ep{phase3c_ep}, fs0_off). Phase 3D: constrained CSS pick (ep{phase3d_ep}, fs0_off, 600/600). Diagonal = correct; shaded cells = high-penalty misclassifications. <b>BL-gold:</b> ship models rarely predict BL — BL→TP is SRS-free; BL→FP is penalized.</p>
 <table>
 <thead><tr>{summary_head}</tr></thead>
 <tbody>{"".join(summary_rows)}</tbody>
@@ -919,6 +962,7 @@ tr.cat-stage2 {{ background: #fffbe6; }}
 tr.cat-phase3 {{ background: #fce4ec; }}
 tr.cat-phase3b {{ background: #f3e5f5; }}
 tr.cat-phase3c {{ background: #e8eaf6; }}
+tr.cat-phase3d {{ background: #e0f2f1; }}
 .note {{ background: #fff8e1; padding: 8px 12px; border-radius: 4px; margin-bottom: 1rem; }}
 .cm-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1.25rem; margin-top: 1rem; }}
 .cm-block h3 {{ font-size: 0.95rem; margin: 0 0 0.25rem; color: #1e3a5f; }}
@@ -943,7 +987,7 @@ td.cm-warn {{ background: #fff9c4; }}
 
 <section>
 <h1>Phase 2 Benchmark Results — All Models &amp; Approaches</h1>
-<p class="subtitle">Test set · baselines n=27 (PoC reference) · LLM rows 600-case Phase 2 test (200 FP + 200 TP + 200 BL) · Baseline → Zero-shot → Few-shot → Few-shot (CoT) → Stage 2 ship → Phase 3A/3B/3C LoRA · Tier = PoC success gates (four metrics + hard gates; CRITICAL limit scales with total test size)</p>
+<p class="subtitle">Test set · baselines n=27 (PoC reference) · LLM rows 600-case Phase 2 test (200 FP + 200 TP + 200 BL) · Baseline → Zero-shot → Few-shot → Few-shot (CoT) → Stage 2 ship → Phase 3A/3B/3C/3D LoRA · Tier = PoC success gates (four metrics + hard gates; CRITICAL limit scales with total test size)</p>
 <table>
 <thead><tr>{exp_thead}</tr></thead>
 <tbody>{"".join(exp_trs)}</tbody>
@@ -1017,11 +1061,14 @@ td.cm-warn {{ background: #fff9c4; }}
 <dt>Phase 3C LoRA</dt>
 <dd>Ship-aligned retrain: json_only targets · fs0_off train prompts · fs0_off val CSS · v7-ship · epoch 6 pick · test SRS 89.9% (gap-fill). Reports: <code>reports/phase3c/</code> · BL analysis: <code>PHASE3C_BL_ANALYSIS.md</code>.</dd>
 
-<dt>CSS (Phase 3B checkpoint selection)</dt>
+<dt>Phase 3D LoRA</dt>
+<dd>Constrained CSS retrain: hard-neg + BL export · fs0_off · v7-balanced test · checkpoint-850 (epoch 6) · full 600/600 after compact JSON gap-fill · test SRS 88.0%. Val CSS 0.845 at pick. Reports: <code>runs/phase3/stage3d/summaries/</code>.</dd>
+
+<dt>CSS (Phase 3B–3D checkpoint selection)</dt>
 <dd><code>CSS = 0.35·SRS + 0.35·VDR + 0.20·FPRR + 0.10·Macro-F1</code> on validation; disqualified if VDR &lt; 0.75. Used for epoch pick only — not the final ship gate (test SRS is).</dd>
 
 <dt>Test scope</dt>
-<dd>Phase 2 stageless matrix (6 profiles × 4 configs = 24 cells) plus 4 Stage 2 ship cells plus Phase 3A/3B/3C LoRA when eval completes. Phase 1 Stage 2 (904/1373) excluded.</dd>
+<dd>Phase 2 stageless matrix (6 profiles × 4 configs = 24 cells) plus 4 Stage 2 ship cells plus Phase 3A/3B/3C/3D LoRA when eval completes. Phase 1 Stage 2 (904/1373) excluded.</dd>
 </dl>
 </section>
 </body>
@@ -1034,16 +1081,19 @@ def main() -> None:
     phase3_row = _load_phase3a_row()
     phase3b_rows = _load_phase3b_rows()
     phase3c_rows = _load_phase3c_rows()
+    phase3d_rows = _load_phase3d_rows()
     experiment_parts = baselines + _load_phase2_matrix_rows() + _load_stage2_ship_rows()
     if phase3_row:
         experiment_parts.append(phase3_row)
     experiment_parts.extend(phase3b_rows)
     experiment_parts.extend(phase3c_rows)
+    experiment_parts.extend(phase3d_rows)
     experiments = _sort_experiments(experiment_parts)
     comparisons = (
         _load_confusion_comparisons()
         + _load_phase3b_confusion_rows()
         + _load_phase3c_confusion_rows()
+        + _load_phase3d_confusion_rows()
     )
     ops = _load_ops_rows()
 
@@ -1057,6 +1107,7 @@ def main() -> None:
             + (" + Phase 3A LoRA" if phase3_row else "")
             + (f" + Phase 3B LoRA ({len(phase3b_rows)} cells)" if phase3b_rows else "")
             + (f" + Phase 3C LoRA ({len(phase3c_rows)} cells)" if phase3c_rows else "")
+            + (f" + Phase 3D LoRA ({len(phase3d_rows)} cells)" if phase3d_rows else "")
             + "."
         ),
         "baselines": baselines,
@@ -1080,6 +1131,7 @@ def main() -> None:
         "phase3a_row": phase3_row is not None,
         "phase3b_rows": len(phase3b_rows),
         "phase3c_rows": len(phase3c_rows),
+        "phase3d_rows": len(phase3d_rows),
         "confusion_comparisons": len(comparisons),
     }
 

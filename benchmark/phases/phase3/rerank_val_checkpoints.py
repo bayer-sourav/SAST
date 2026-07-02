@@ -15,6 +15,7 @@ if str(_sast) not in sys.path:
     sys.path.insert(0, str(_sast))
 
 from benchmark.phases.phase3._phase3b_common import load_manifest, output_path  # noqa: E402
+from benchmark.phases.phase3.css_constrained import pick_best  # noqa: E402
 
 
 def main() -> None:
@@ -65,7 +66,19 @@ def main() -> None:
         result = json.loads((out_dir / "css_result.json").read_text(encoding="utf-8"))
         confirmed.append(result)
 
-    best = max(confirmed, key=lambda r: float(r["css"]["css"]))
+    pick_by = (
+        (manifest.get("checkpoint_selection") or {})
+        .get("after_training", {})
+        .get("pick_global_best_by")
+        or (manifest.get("checkpoint_selection") or {}).get("pick_global_best_by")
+        or "css"
+    )
+    if pick_by == "constrained_srs":
+        best = pick_best(confirmed, manifest=manifest)
+        n_eligible = sum(1 for r in confirmed if r.get("constrained_eligible"))
+        print(f"[rerank] constrained pick: {n_eligible}/{len(confirmed)} eligible")
+    else:
+        best = max(confirmed, key=lambda r: float(r["css"]["css"]))
     best_adapter = Path(best["adapter"])
     global_best = output_path(manifest, "global_best")
     if global_best.exists() or global_best.is_symlink():
@@ -77,6 +90,7 @@ def main() -> None:
 
     summary = {
         "n_reranked": len(confirmed),
+        "pick_by": pick_by,
         "best": best,
         "global_best_path": str(global_best.resolve()),
     }

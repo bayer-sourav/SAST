@@ -187,6 +187,9 @@ def _infer_tracks_for_adapter(
     env = vllm_env_for_adapter(adapter)
     env["SAST_PROMPT_VERSION"] = prompt
     env.setdefault("PYTHONPATH", f"{_sast}:{_sast / 'benchmark'}")
+    css_gpu = os.environ.get("PHASE3_CSS_VLLM_GPU_UTIL", "").strip()
+    if css_gpu:
+        env["QWEN_VLLM_GPU_MEMORY_UTILIZATION"] = css_gpu
 
     if clear_stale:
         n_cleared = clear_invalid_val_runs(
@@ -429,6 +432,14 @@ def main() -> None:
     ap.add_argument("--thinking", choices=("on", "off"), default=None)
     ap.add_argument("--fewshot", type=int, default=None)
     args = ap.parse_args()
+
+    os.environ.setdefault("TORCHINDUCTOR_FX_GRAPH_REMOTE_CACHE", "0")
+    try:
+        from models.qwen.vllm_backend import kill_vllm_workers
+
+        kill_vllm_workers()
+    except Exception:
+        pass
 
     manifest = load_manifest()
     result = run_val_eval(

@@ -140,9 +140,26 @@ Train/serve alignment **validated** (epoch 6 = val pick without fs0 rerank corre
 
 ---
 
-## Phase 3D — VDR / TP→FP correction (proposed)
+## Phase 3D — VDR recovery + constrained CSS (planned)
 
-See `reports/phase3c/PHASE3C_NEXT.md`. **Not recommended:** remove BL from train only.
+| Field | Value |
+|-------|-------|
+| **Run ID** | `3d-001` (primary), `3d-a` (BL ablation) |
+| **Status** | Planned — see `stage3d/PLAN.md` |
+| **Hypothesis** | VDR-constrained checkpoint pick + hard-neg mining on 3C TP→FP errors closes SRS gap while keeping 3C FPRR |
+
+### Experiments
+
+| ID | Train | Selection | Rank |
+|----|-------|-----------|------|
+| 3D-001 | 3C export + hard-neg oversample | VDR≥0.90, FPRR≥0.735, max SRS | 32 |
+| 3D-002 | same | constrained | 64 |
+| 3D-a | FP+TP only (no BL) | constrained | 32 |
+| 3D-data | recover → 1500 export | constrained | 32 |
+
+### Targets
+
+SRS ≥ 92.5% · VDR ≥ 90% · FPRR ≥ 73.5% · TP→FP ≤ 17
 
 ---
 
@@ -159,4 +176,4 @@ See `reports/phase3c/PHASE3C_NEXT.md`. **Not recommended:** remove BL from train
 | 2025-06 | 3C: fs0_off train + json_only + ship val CSS | Close 3B FPRR gap; fix train/serve mismatch |
 | 2025-06 | 3C: reuse 3B teacher cache | Avoid 1500-case re-inference |
 | 2025-06 | 3C result: same SRS as 3B ship, +FPRR −VDR | CSS picks different error tradeoff; TP→FP is next target |
-| 2025-06 | Do not drop BL from train (3D) | BL→TP is free; BL cases teach TP/FP boundary |
+| 2025-06 | 3D-a: BL train ablation (not primary) | BL not valid ship output; contradictory teacher on BL-gold may blur TP/FP — test via 3D-a |

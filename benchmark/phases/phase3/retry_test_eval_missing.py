@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -56,6 +57,90 @@ def _count_missing(eval_root: Path, *, thinking: str, fewshot: int) -> dict[str,
                 n += 1
         counts[track] = n
     return counts
+
+
+def _missing_run_dirs(
+    eval_root: Path, *, thinking: str, fewshot: int
+) -> list[tuple[str, str, Path]]:
+    """Return (track, gold, run_dir) for cases without a valid triage result."""
+    missing: list[tuple[str, str, Path]] = []
+    for track, gold, _ in TRACKS:
+        runs_root = _track_runs_root(eval_root, track, thinking=thinking, fewshot=fewshot)
+        if not runs_root.is_dir():
+            continue
+        for run_dir in sorted(runs_root.iterdir()):
+            if run_dir.is_dir() and not _valid_result(run_dir / "agent-llm-triage-result.json"):
+                missing.append((track, gold, run_dir))
+    return missing
+
+
+def run_compact_retries(
+    *,
+    eval_root: Path,
+    adapter: Path,
+    thinking: str,
+    fewshot: int,
+    prompt: str,
+    fs_config: str,
+) -> dict[str, int]:
+    """Compact JSON-only retry for missing cases (preserves existing run dirs)."""
+    from benchmark.run_llm_local import run_compact_triage_retry
+
+    env = vllm_env_for_adapter(adapter)
+    env["SAST_PROMPT_VERSION"] = prompt
+    env.setdefault("PYTHONPATH", f"{_sast}:{_sast / 'benchmark'}")
+    for key, val in env.items():
+        os.environ[key] = val
+
+    missing = _missing_run_dirs(eval_root, thinking=thinking, fewshot=fewshot)
+    print(f"[retry-test] compact retry n={len(missing)}", flush=True)
+    ok = 0
+    for track, gold, run_dir in missing:
+        case_id = run_dir.name
+        meta = run_compact_triage_retry(
+            run_dir=run_dir,
+            case_id=case_id,
+            profile=PROFILE,
+            gold=gold,
+            few_shot=fewshot,
+            few_shot_config=fs_config,
+            prompt_version=prompt,
+            quiet=False,
+        )
+        if int(meta.get("returncode", 1)) == 0:
+            ok += 1
+        else:
+            print(f"[retry-test] compact failed {track}/{case_id}", flush=True)
+    print(f"[retry-test] compact recovered {ok}/{len(missing)}", flush=True)
+    return _count_missing(eval_root, thinking=thinking, fewshot=fewshot)
+
+
+def recover_from_llm_raw(
+    eval_root: Path, *, thinking: str, fewshot: int
+) -> dict[str, int]:
+    """Re-parse llm_raw.txt with improved parser; write triage JSON when recovered."""
+    from core.parsing import extract_triage_result
+
+    recovered = 0
+    for track, gold, run_dir in _missing_run_dirs(eval_root, thinking=thinking, fewshot=fewshot):
+        raw_path = run_dir / "llm_raw.txt"
+        if not raw_path.is_file():
+            continue
+        try:
+            result = extract_triage_result(raw_path.read_text(encoding="utf-8"))
+            lbl = str(result.get("label", "")).strip().upper()
+            if lbl not in VALID_LABELS:
+                continue
+            result["agent"] = "llm"
+            result["case_id"] = run_dir.name
+            out = run_dir / "agent-llm-triage-result.json"
+            out.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+            recovered += 1
+            print(f"[retry-test] recovered {track}/{run_dir.name} label={lbl}", flush=True)
+        except Exception:
+            continue
+    print(f"[retry-test] recover_from_raw n={recovered}", flush=True)
+    return _count_missing(eval_root, thinking=thinking, fewshot=fewshot)
 
 
 def clear_failed_runs(eval_root: Path, *, thinking: str, fewshot: int) -> int:
@@ -129,7 +214,10 @@ def main() -> None:
     ap.add_argument("--thinking", choices=("on", "off"), default=None)
     ap.add_argument("--fewshot", type=int, default=None)
     ap.add_argument("--sum-suffix", default=None, help="e.g. _fs0_off for ablation summaries")
+    ap.add_argument("--prompt-version", default=None, help="Override manifest prompt (default: manifest)")
     ap.add_argument("--rounds", type=int, default=1, help="Max gap-fill rounds (default 1; 0=skip infer)")
+    ap.add_argument("--compact-only", action="store_true", help="Compact JSON-only retry (no dir wipe)")
+    ap.add_argument("--recover-only", action="store_true", help="Re-parse llm_raw.txt only (no infer)")
     ap.add_argument("--no-infer", action="store_true", help="Resummarize only")
     args = ap.parse_args()
 
@@ -137,7 +225,7 @@ def main() -> None:
     icfg = manifest["inference_eval"]
     fewshot = int(args.fewshot if args.fewshot is not None else icfg["fewshot"])
     thinking = args.thinking or ("on" if icfg.get("thinking") else "off")
-    prompt = icfg["prompt_version"]
+    prompt = args.prompt_version or icfg["prompt_version"]
     fs_config = icfg["few_shot_config"]
     sum_suffix = args.sum_suffix if args.sum_suffix is not None else ""
 
@@ -154,46 +242,60 @@ def main() -> None:
 
     if not args.no_infer:
         adapter = args.adapter.resolve()
-        if not adapter.is_dir():
+        if args.recover_only:
+            after = recover_from_llm_raw(eval_root, thinking=thinking, fewshot=fewshot)
+            print(f"[retry-test] after recover missing={after}", flush=True)
+        elif not adapter.is_dir():
             raise SystemExit(f"adapter missing: {adapter}")
-        env = vllm_env_for_adapter(adapter)
-        env["SAST_PROMPT_VERSION"] = prompt
-        env.setdefault("PYTHONPATH", f"{_sast}:{_sast / 'benchmark'}")
-
-        tracks = [
-            {
-                "gold": gold,
-                "case_dir": str((_sast / corpus_rel).resolve()),
-                "runs_root": str(
-                    (eval_root / track / f"thinking_{thinking}/fewshot_{fewshot}").resolve()
-                ),
-            }
-            for track, gold, corpus_rel in TRACKS
-        ]
-
-        for round_i in range(max(0, args.rounds)):
-            miss = _count_missing(eval_root, thinking=thinking, fewshot=fewshot)
-            total_miss = sum(miss.values())
-            print(f"[retry-test] round {round_i + 1}/{args.rounds} missing={miss}", flush=True)
-            if total_miss == 0:
-                break
-            cleared = clear_failed_runs(eval_root, thinking=thinking, fewshot=fewshot)
-            print(f"[retry-test] cleared {cleared} stale run dirs", flush=True)
-            run_batch_tracks(
-                tracks,
-                env=env,
-                sast_root=_sast,
-                profile=PROFILE,
-                thinking=(thinking == "on"),
-                few_shot=fewshot,
-                few_shot_config=fs_config,
-                prompt_version=prompt,
-                retry_missing=True,
+        elif args.compact_only:
+            after = run_compact_retries(
+                eval_root=eval_root,
+                adapter=adapter,
+                thinking=thinking,
+                fewshot=fewshot,
+                prompt=prompt,
+                fs_config=fs_config,
             )
-            after = _count_missing(eval_root, thinking=thinking, fewshot=fewshot)
-            print(f"[retry-test] round {round_i + 1} after missing={after}", flush=True)
-            if sum(after.values()) == 0:
-                break
+            print(f"[retry-test] after compact missing={after}", flush=True)
+        else:
+            env = vllm_env_for_adapter(adapter)
+            env["SAST_PROMPT_VERSION"] = prompt
+            env.setdefault("PYTHONPATH", f"{_sast}:{_sast / 'benchmark'}")
+
+            tracks = [
+                {
+                    "gold": gold,
+                    "case_dir": str((_sast / corpus_rel).resolve()),
+                    "runs_root": str(
+                        (eval_root / track / f"thinking_{thinking}/fewshot_{fewshot}").resolve()
+                    ),
+                }
+                for track, gold, corpus_rel in TRACKS
+            ]
+
+            for round_i in range(max(0, args.rounds)):
+                miss = _count_missing(eval_root, thinking=thinking, fewshot=fewshot)
+                total_miss = sum(miss.values())
+                print(f"[retry-test] round {round_i + 1}/{args.rounds} missing={miss}", flush=True)
+                if total_miss == 0:
+                    break
+                cleared = clear_failed_runs(eval_root, thinking=thinking, fewshot=fewshot)
+                print(f"[retry-test] cleared {cleared} stale run dirs", flush=True)
+                run_batch_tracks(
+                    tracks,
+                    env=env,
+                    sast_root=_sast,
+                    profile=PROFILE,
+                    thinking=(thinking == "on"),
+                    few_shot=fewshot,
+                    few_shot_config=fs_config,
+                    prompt_version=prompt,
+                    retry_missing=True,
+                )
+                after = _count_missing(eval_root, thinking=thinking, fewshot=fewshot)
+                print(f"[retry-test] round {round_i + 1} after missing={after}", flush=True)
+                if sum(after.values()) == 0:
+                    break
 
     rows = resummarize(
         eval_root=eval_root,

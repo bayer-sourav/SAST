@@ -140,6 +140,9 @@ def export_distill(
     out_path: Path,
     max_thinking_tokens: int,
     max_total_tokens: int,
+    train_tracks: tuple[str, ...] | None = None,
+    hard_neg_json: Path | None = None,
+    oversample_factor: int = 1,
 ) -> dict[str, Any]:
     tok = _load_tokenizer()
     train_cfg = manifest["train_prompt"]
@@ -150,8 +153,17 @@ def export_distill(
     records: list[dict] = []
     dropped: list[dict] = []
     stats = {"missing_teacher": 0, "unparseable_teacher": 0, "too_long": 0, "leak": 0}
+    oversample_ids: set[str] = set()
+    if hard_neg_json and hard_neg_json.is_file():
+        hn = json.loads(hard_neg_json.read_text(encoding="utf-8"))
+        oversample_ids = set(hn.get("oversample_train_case_ids") or [])
 
-    for cls, _ in _TRACKS:
+    track_filter = set(train_tracks) if train_tracks else None
+    tracks = _TRACKS
+    if track_filter:
+        tracks = tuple((cls, gold) for cls, gold in _TRACKS if cls in track_filter)
+
+    for cls, _ in tracks:
         mpath = dataset / cls / "manifest.json"
         entries = _split_entries(json.loads(mpath.read_text(encoding="utf-8")), "train")
         track_test = test_ids.get(cls) or set()
@@ -218,6 +230,22 @@ def export_distill(
                     ],
                 }
             )
+            extra = oversample_factor - 1 if cid in oversample_ids and oversample_factor > 1 else 0
+            for _ in range(extra):
+                records.append(
+                    {
+                        "case_id": cid,
+                        "gold_label": _gold_label(cls),
+                        "teacher_label": teacher_label,
+                        "bundle": str(bundle),
+                        "oversample": True,
+                        "messages": [
+                            {"role": "system", "content": _SYSTEM_PROMPT},
+                            {"role": "user", "content": user_text},
+                            {"role": "assistant", "content": assistant},
+                        ],
+                    }
+                )
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open("w", encoding="utf-8") as fh:
@@ -232,6 +260,10 @@ def export_distill(
         "max_total_tokens": max_total_tokens,
         "supervision_target": target,
         "prompt_version": train_cfg["prompt_version"],
+        "train_tracks": list(train_tracks) if train_tracks else [c for c, _ in _TRACKS],
+        "hard_neg_json": str(hard_neg_json) if hard_neg_json else None,
+        "oversample_factor": oversample_factor,
+        "n_oversample_ids": len(oversample_ids),
         "out_path": str(out_path),
     }
     out_path.with_suffix(".meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
@@ -253,16 +285,39 @@ def main() -> None:
         type=int,
         default=int(os.environ.get("PHASE3_MAX_SEQ_LEN", "16384")),
     )
+    ap.add_argument(
+        "--tracks",
+        default=os.environ.get("PHASE3D_TRAIN_TRACKS", ""),
+        help="Comma-separated train tracks: fp,tp,borderline",
+    )
+    ap.add_argument(
+        "--hard-neg-json",
+        type=Path,
+        default=Path(os.environ["PHASE3D_HARD_NEG_JSON"])
+        if os.environ.get("PHASE3D_HARD_NEG_JSON")
+        else None,
+    )
+    ap.add_argument(
+        "--oversample-factor",
+        type=int,
+        default=int(os.environ.get("PHASE3D_OVERSAMPLE_FACTOR", "2")),
+    )
     args = ap.parse_args()
 
     manifest = load_manifest()
     out_path = output_path(manifest, "sft_data") / f"distill_{args.split}.jsonl"
+    train_tracks = None
+    if args.tracks.strip():
+        train_tracks = tuple(t.strip() for t in args.tracks.split(",") if t.strip())
     meta = export_distill(
         dataset=_dataset_root(None),
         manifest=manifest,
         out_path=out_path,
         max_thinking_tokens=args.max_thinking_tokens,
         max_total_tokens=args.max_total_tokens,
+        train_tracks=train_tracks,
+        hard_neg_json=args.hard_neg_json,
+        oversample_factor=args.oversample_factor,
     )
     print(
         f"[distill] {meta['n_records']} records -> {out_path} "

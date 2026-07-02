@@ -137,9 +137,64 @@ def preflight_3c(manifest: dict) -> None:
     print("[preflight] Phase 3C checks passed")
 
 
+def preflight_3d(manifest: dict) -> None:
+    test_by_track = _phase2_test_ids_by_track(_sast)
+    fs = int(manifest.get("train_prompt", {}).get("fewshot", 0))
+    if fs > 0:
+        fs_cfg = manifest["train_prompt"]["few_shot_config"]
+        assert_no_test_leakage(
+            test_case_ids=set().union(*test_by_track.values()),
+            config_path=resolve_few_shot_config_path(fs_cfg),
+        )
+        print("[preflight] few-shot vs Phase 2 test: OK")
+    else:
+        print("[preflight] zero-shot train — skip few-shot leakage check")
+    _check_dataset(test_by_track)
+
+    teacher_base = output_path(manifest, "teacher_cache")
+    if not teacher_base.is_dir():
+        raise SystemExit(f"missing teacher cache: {teacher_base}")
+
+    hn_cfg = (manifest.get("supervision") or {}).get("hard_negative_mining") or {}
+    hn_path = _sast / str(hn_cfg.get("hard_neg_json", "runs/phase3/stage3d/data/hard_negatives.json"))
+    if hn_path.is_file():
+        hn = json.loads(hn_path.read_text(encoding="utf-8"))
+        print(
+            f"[preflight] hard_negatives: {hn.get('n_tp_fp_errors')} errors, "
+            f"{hn.get('n_oversample')} oversample ids"
+        )
+    else:
+        print("[warn] hard_negatives.json not found (run analyze_tp_fp_errors.py)", file=sys.stderr)
+
+    distill = output_path(manifest, "sft_data") / "distill_train.jsonl"
+    if distill.is_file():
+        n = sum(1 for _ in distill.open(encoding="utf-8"))
+        print(f"[preflight] distill_train.jsonl: {n} records")
+        meta_path = distill.with_suffix(".meta.json")
+        if meta_path.is_file():
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            print(
+                f"[preflight] tracks={meta.get('train_tracks')} "
+                f"oversample_factor={meta.get('oversample_factor')} "
+                f"n_oversample_ids={meta.get('n_oversample_ids')} stats={meta.get('stats')}"
+            )
+    else:
+        print("[preflight] distill_train.jsonl not found (run export_distill_dataset.py)")
+
+    pick_by = (
+        (manifest.get("checkpoint_selection") or {})
+        .get("after_training", {})
+        .get("pick_global_best_by")
+        or (manifest.get("checkpoint_selection") or {}).get("pick_global_best_by")
+    )
+    floors = (manifest.get("checkpoint_selection") or {}).get("constrained_floors") or {}
+    print(f"[preflight] global best pick: {pick_by} floors={floors}")
+    print("[preflight] Phase 3D checks passed")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--stage", choices=("3a", "3b", "3c"), default="3a")
+    ap.add_argument("--stage", choices=("3a", "3b", "3c", "3d"), default="3a")
     args = ap.parse_args()
 
     if args.stage == "3b":
@@ -148,6 +203,9 @@ def main() -> None:
     elif args.stage == "3c":
         manifest = load_manifest(_sast / "benchmark/phases/phase3/stage3c/MANIFEST.json")
         preflight_3c(manifest)
+    elif args.stage == "3d":
+        manifest = load_manifest(_sast / "benchmark/phases/phase3/stage3d/MANIFEST.json")
+        preflight_3d(manifest)
     else:
         manifest = json.loads((_sast / "benchmark/phases/phase3/MANIFEST.json").read_text(encoding="utf-8"))
         preflight_3a(manifest)

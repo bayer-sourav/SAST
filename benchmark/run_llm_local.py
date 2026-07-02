@@ -72,11 +72,6 @@ def _system_prompt() -> str:
     return _SYSTEM_PROMPT
 
 
-def _system_prompt() -> str:
-    """JSON/output rules only; few-shot exemplars live in task.md (see make_task --few-shot)."""
-    return _SYSTEM_PROMPT
-
-
 def prepare_triage_messages(
     *,
     case_path: Path,
@@ -246,12 +241,43 @@ def finalize_triage_inference(
         'Required keys: "label" (TP|FP|BL|UNKNOWN), "confidence", '
         '"confidence_score", "reason", "evidence", "agent", "case_id".'
     )
+    json_retry_max = os.environ.get("AGENT_JSON_RETRY_MAX_NEW", "1024")
+    json_retry_strict_max = os.environ.get("AGENT_JSON_RETRY_STRICT_MAX", "768")
+    json_retry_compact_max = os.environ.get("AGENT_JSON_RETRY_COMPACT_MAX", "512")
+
+    def _compact_json_retry_msgs() -> list[dict[str, str]] | None:
+        from benchmark.compact_triage_prompt import compact_messages_from_task_path
+
+        task_path = run_dir / "task.md"
+        if not task_path.is_file():
+            return None
+        _, msgs = compact_messages_from_task_path(task_path, case_id=case_id)
+        return msgs
+
+    def _strict_json_retry_msgs() -> list[dict[str, str]]:
+        task_user = next(
+            (m["content"] for m in reversed(messages) if m.get("role") == "user"),
+            "",
+        )
+        return [
+            {
+                "role": "system",
+                "content": _SYSTEM_PROMPT
+                + "\nCRITICAL: Your entire response must be one JSON object starting with { and ending with }. "
+                "No markdown. No headings. No analysis before or after the JSON.",
+            },
+            {
+                "role": "user",
+                "content": task_user + "\n\n" + json_retry_prompt,
+            },
+        ]
+
     try:
         result = _normalize_label(_extract_json_object(raw))
     except ValueError as parse_exc:
         json_msgs = list(messages) + [{"role": "user", "content": json_retry_prompt}]
         t_retry = time.perf_counter()
-        raw_retry = _json_retry(json_msgs, max_new="768")
+        raw_retry = _json_retry(json_msgs, max_new=json_retry_max)
         inference_sec += time.perf_counter() - t_retry
         combined = (raw or "").rstrip() + "\n\n--- json_retry ---\n\n" + raw_retry
         (run_dir / "llm_raw.txt").write_text(combined, encoding="utf-8")
@@ -273,7 +299,7 @@ def finalize_triage_inference(
                 }
             ]
             t_retry2 = time.perf_counter()
-            raw_retry2 = _json_retry(json_msgs_off, max_new="512", thinking_on=False)
+            raw_retry2 = _json_retry(json_msgs_off, max_new=json_retry_strict_max, thinking_on=False)
             inference_sec += time.perf_counter() - t_retry2
             combined += "\n\n--- json_retry_thinking_off ---\n\n" + raw_retry2
             (run_dir / "llm_raw.txt").write_text(combined, encoding="utf-8")
@@ -287,7 +313,48 @@ def finalize_triage_inference(
             try:
                 result = _normalize_label(_extract_json_object(raw_retry2))
             except ValueError:
-                raise parse_exc from None
+                t_retry3 = time.perf_counter()
+                raw_retry3 = _json_retry(
+                    _strict_json_retry_msgs(),
+                    max_new=json_retry_strict_max,
+                    thinking_on=False,
+                )
+                inference_sec += time.perf_counter() - t_retry3
+                combined += "\n\n--- json_retry_strict ---\n\n" + raw_retry3
+                (run_dir / "llm_raw.txt").write_text(combined, encoding="utf-8")
+                from core.gen_meta import get_gen_meta
+
+                gen = get_gen_meta()
+                if int(gen.get("input_tokens") or -1) >= 0:
+                    input_tokens = (input_tokens or 0) + int(gen["input_tokens"])
+                if int(gen.get("output_tokens") or -1) >= 0:
+                    output_tokens = (output_tokens or 0) + int(gen["output_tokens"])
+                try:
+                    result = _normalize_label(_extract_json_object(raw_retry3))
+                except ValueError:
+                    compact_msgs = _compact_json_retry_msgs()
+                    if compact_msgs is None:
+                        raise parse_exc from None
+                    t_retry4 = time.perf_counter()
+                    raw_retry4 = _json_retry(
+                        compact_msgs,
+                        max_new=json_retry_compact_max,
+                        thinking_on=False,
+                    )
+                    inference_sec += time.perf_counter() - t_retry4
+                    combined += "\n\n--- json_retry_compact ---\n\n" + raw_retry4
+                    (run_dir / "llm_raw.txt").write_text(combined, encoding="utf-8")
+                    from core.gen_meta import get_gen_meta
+
+                    gen = get_gen_meta()
+                    if int(gen.get("input_tokens") or -1) >= 0:
+                        input_tokens = (input_tokens or 0) + int(gen["input_tokens"])
+                    if int(gen.get("output_tokens") or -1) >= 0:
+                        output_tokens = (output_tokens or 0) + int(gen["output_tokens"])
+                    try:
+                        result = _normalize_label(_extract_json_object(raw_retry4))
+                    except ValueError:
+                        raise parse_exc from None
 
     result["agent"] = AGENT_NAME
     result["case_id"] = case_id
@@ -320,6 +387,144 @@ def finalize_triage_inference(
     if not quiet:
         print(json.dumps(result, ensure_ascii=False, indent=2))
         print(f"\n[{AGENT_NAME}] Wrote: {out_path}")
+    return meta
+
+
+def run_compact_triage_retry(
+    *,
+    run_dir: Path,
+    case_id: str,
+    profile: str,
+    gold: str | None = None,
+    few_shot: int = 0,
+    few_shot_config: str | Path | None = None,
+    prompt_version: str | None = None,
+    quiet: bool = False,
+) -> dict[str, Any]:
+    """JSON-only retry using a compact prompt built from existing task.md."""
+    from benchmark.compact_triage_prompt import compact_messages_from_task_path
+    from benchmark.llm_generate import infer_triage
+    from core.gen_meta import get_gen_meta, reset_gen_meta
+    from timing import utc_now_iso
+
+    sast_root = Path(__file__).resolve().parent.parent
+    _ensure_paths(sast_root)
+    run_dir = run_dir.expanduser().resolve()
+    task_path = run_dir / "task.md"
+    if not task_path.is_file():
+        raise FileNotFoundError(f"task.md missing in {run_dir}")
+
+    started_at = utc_now_iso()
+    t_start = time.perf_counter()
+    task_path = run_dir / "task.md"
+    _, messages = compact_messages_from_task_path(task_path, case_id=case_id)
+    compact_max = int(os.environ.get("AGENT_JSON_RETRY_COMPACT_MAX", "512"))
+    compact_max2 = int(os.environ.get("AGENT_JSON_RETRY_COMPACT_MAX2", "1024"))
+    raw_path = run_dir / "llm_raw.txt"
+    prior_raw = raw_path.read_text(encoding="utf-8").rstrip() if raw_path.is_file() else ""
+
+    def _infer_compact(msgs: list[dict[str, str]], max_new: int) -> str:
+        reset_gen_meta()
+        return infer_triage(
+            msgs,
+            profile,
+            thinking=False,
+            use_4bit=True,
+            max_new=max_new,
+        )
+
+    inference_sec = 0.0
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    raw = ""
+    parse_exc: ValueError | None = None
+    combined = prior_raw
+    attempts: list[tuple[str, list[dict[str, str]], int]] = [
+        ("json_retry_compact", messages, compact_max),
+        ("json_retry_compact2", messages, compact_max2),
+    ]
+    _, alerts_only_msgs = compact_messages_from_task_path(
+        task_path, case_id=case_id, alerts_only=True
+    )
+    attempts.append(("json_retry_compact_ultra", alerts_only_msgs, 384))
+
+    result: dict[str, Any] | None = None
+    for marker, msgs, max_new in attempts:
+        t0 = time.perf_counter()
+        raw = _infer_compact(msgs, max_new)
+        inference_sec += time.perf_counter() - t0
+        gen = get_gen_meta()
+        if int(gen.get("input_tokens") or -1) >= 0:
+            input_tokens = (input_tokens or 0) + int(gen["input_tokens"])
+        if int(gen.get("output_tokens") or -1) >= 0:
+            output_tokens = (output_tokens or 0) + int(gen["output_tokens"])
+        combined = combined + f"\n\n--- {marker} ---\n\n" + (raw or "")
+        raw_path.write_text(combined, encoding="utf-8")
+        try:
+            result = _normalize_label(_extract_json_object(raw))
+            parse_exc = None
+            break
+        except ValueError as exc:
+            parse_exc = exc
+            try:
+                result = _normalize_label(_extract_json_object(combined))
+                parse_exc = None
+                break
+            except ValueError:
+                pass
+
+    if result is None:
+        err_s = f"ValueError: {parse_exc}"
+        meta = {
+            "profile": profile,
+            "thinking": False,
+            "few_shot": few_shot,
+            "few_shot_config": str(few_shot_config) if few_shot_config else None,
+            "prompt_version": prompt_version,
+            "gold": gold,
+            "case_id": case_id,
+            "started_at": started_at,
+            "finished_at": utc_now_iso(),
+            "elapsed_sec": round(time.perf_counter() - t_start, 3),
+            "inference_sec": round(inference_sec, 3),
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "compact_retry": True,
+            "error": err_s,
+            "returncode": 1,
+        }
+        (run_dir / "run_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+        if not quiet:
+            print(f"[compact-retry] failed {case_id}: {parse_exc}", file=sys.stderr)
+        return meta
+
+    result["agent"] = AGENT_NAME
+    result["case_id"] = case_id
+    out_path = run_dir / f"agent-{AGENT_NAME}-triage-result.json"
+    out_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    meta = {
+        "profile": profile,
+        "thinking": False,
+        "few_shot": few_shot,
+        "few_shot_config": str(few_shot_config) if few_shot_config else None,
+        "prompt_version": prompt_version,
+        "gold": gold,
+        "case_id": case_id,
+        "started_at": started_at,
+        "finished_at": utc_now_iso(),
+        "elapsed_sec": round(time.perf_counter() - t_start, 3),
+        "inference_sec": round(inference_sec, 3),
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": (input_tokens + output_tokens)
+        if input_tokens is not None and output_tokens is not None
+        else None,
+        "compact_retry": True,
+        "returncode": 0,
+    }
+    (run_dir / "run_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    if not quiet:
+        print(f"[compact-retry] ok {case_id} label={result.get('label')}", flush=True)
     return meta
 
 

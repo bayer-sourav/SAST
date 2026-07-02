@@ -322,6 +322,91 @@ def extract_json_object(text: str) -> dict:
 _TRIAGE_LABELS = frozenset({"TP", "FP", "BL", "UNKNOWN"})
 
 
+def _recover_triage_label_from_prose(text: str) -> dict | None:
+    """Last-resort label recovery from analysis prose (compact retries)."""
+    cleaned = _strip_redacted_thinking((text or "").strip())
+    if not cleaned:
+        return None
+
+    # Prefer compact-retry sections; fall back to full text.
+    sections: list[str] = []
+    for marker in ("--- json_retry_compact2 ---", "--- json_retry_compact ---"):
+        if marker in cleaned:
+            sections.append(cleaned.split(marker)[-1])
+    sections.append(cleaned)
+
+    for section in sections:
+        tail = section[-3000:]
+        m = re.search(
+            r'"label"\s*:\s*"(TP|FP|BL|UNKNOWN)"',
+            tail,
+            flags=re.IGNORECASE,
+        )
+        if m:
+            return {
+                "label": m.group(1).upper(),
+                "confidence": "low",
+                "confidence_score": 0.5,
+                "reason": "Recovered label via regex fallback (malformed JSON in model output).",
+                "evidence": [],
+            }
+
+        for pat in (
+            r"case[- ]level label[^.\n]{0,60}\b(TP|FP|BL|UNKNOWN)\b",
+            r"(?:final|overall|assign(?:ed)?|should be labeled?)\s*(?:as\s*)?\b(TP|FP|BL|UNKNOWN)\b",
+            r"\blabel(?:ed)?\s*(?:as\s*)?\b(TP|FP|BL|UNKNOWN)\b",
+            r"\bcase\s+(?:is|should be)\s+\b(TP|FP|BL|UNKNOWN)\b",
+        ):
+            m = re.search(pat, tail, flags=re.IGNORECASE)
+            if m:
+                lbl = m.group(1).upper()
+                return {
+                    "label": lbl,
+                    "confidence": "low",
+                    "confidence_score": 0.5,
+                    "reason": f"Recovered case label from analysis prose ({pat}).",
+                    "evidence": [],
+                }
+
+        if re.search(
+            r"\b(?:every alert is |both alerts are |this is a )?(?:a )?false positive\b",
+            tail,
+            flags=re.IGNORECASE,
+        ) or re.search(r"\bappears to be a false\b", tail, flags=re.IGNORECASE):
+            return {
+                "label": "FP",
+                "confidence": "low",
+                "confidence_score": 0.5,
+                "reason": "Recovered FP from analysis prose (false positive).",
+                "evidence": [],
+            }
+        if re.search(
+            r"\b(?:true positive|real vulnerability|exploitable|alert-tp)\b",
+            tail,
+            flags=re.IGNORECASE,
+        ):
+            return {
+                "label": "TP",
+                "confidence": "low",
+                "confidence_score": 0.5,
+                "reason": "Recovered TP from analysis prose.",
+                "evidence": [],
+            }
+        if re.search(
+            r"\b(?:borderline|ambiguous|alert-unclear|genuinely ambiguous)\b",
+            tail,
+            flags=re.IGNORECASE,
+        ):
+            return {
+                "label": "BL",
+                "confidence": "low",
+                "confidence_score": 0.5,
+                "reason": "Recovered BL from analysis prose.",
+                "evidence": [],
+            }
+    return None
+
+
 def extract_triage_result(text: str) -> dict:
     """
     Parse SAST triage JSON from model output.
@@ -386,6 +471,10 @@ def extract_triage_result(text: str) -> dict:
             "reason": "Recovered label via regex fallback (malformed JSON in model output).",
             "evidence": [],
         }
+
+    prose = _recover_triage_label_from_prose(text)
+    if prose is not None:
+        return prose
 
     fallback = extract_json_object(text)
     lbl = str(fallback.get("label", "")).strip().upper()

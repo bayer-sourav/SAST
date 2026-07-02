@@ -56,6 +56,12 @@ def ensure_vllm_merged_adapter(
         except Exception:
             pass
 
+    from benchmark.phases.phase3.lora_disk_guard import ensure_disk_gb, prune_vllm_merged
+
+    min_disk = float(os.environ.get("PHASE3_MIN_DISK_GB", "25"))
+    ensure_disk_gb(adapter_dir, min_disk, lora_run_dir=adapter_dir.parent)
+    prune_vllm_merged(adapter_dir.parent)
+
     print(
         f"[vllm-export] merging adapter={adapter_dir.name} base={base!r} -> {out_dir}",
         file=sys.stderr,

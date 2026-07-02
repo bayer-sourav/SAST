@@ -122,11 +122,6 @@ PHASE3C_SKIP_TRAIN=1 bash benchmark/phases/phase3/run_phase3c.sh  # export + pre
 
 ---
 
-## Fallback / Phase 3D ideas
+## Fallback / Phase 3D
 
-See `reports/phase3c/PHASE3C_NEXT.md` for full plan. Summary:
-
-- **3D primary:** hard-negative mining on TP→FP errors; VDR-weighted CSS; rank 64 json_only
-- **Data recovery:** re-export toward 1500 train records (217 currently dropped)
-- **Not recommended:** remove BL from train only (see NEXT doc)
-- DPO on Stage 2 vs 3C confusion deltas (3E)
+See `benchmark/phases/phase3/stage3d/PLAN.md` for full experiment matrix (3D-001 primary, 3D-a BL ablation, constrained CSS).
