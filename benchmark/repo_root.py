@@ -35,3 +35,14 @@ def resolve_benchmark_java_root(
         if isinstance(rel, str) and (bundle / rel).is_file():
             return bundle
     return Path(".").expanduser().resolve()
+
+
+def resolve_repo_root(
+    sast_root: Path,
+    case: dict[str, Any],
+    repo_arg: str | Path | None,
+    *,
+    case_path: Path | None = None,
+) -> Path:
+    """Resolve repository root for benchmark bundles or enterprise git clones."""
+    return resolve_benchmark_java_root(sast_root, case, repo_arg, case_path=case_path)

@@ -173,6 +173,57 @@ def _format_alerts_summary(
     return "\n".join(lines)
 
 
+def _render_source_section(
+    case: dict[str, Any],
+    repo_root: Path,
+    file_path: str | None,
+) -> str:
+    """Render primary file or multi-file source→sink snippets for the prompt."""
+    snippets = case.get("code_snippets")
+    if isinstance(snippets, list) and snippets:
+        lines = ["### Code (source → sink path)", ""]
+        for snip in snippets:
+            if not isinstance(snip, dict):
+                continue
+            rel = snip.get("file") or file_path or "unknown"
+            start = snip.get("start_line")
+            end = snip.get("end_line", start)
+            role = snip.get("role")
+            header = f"#### `{rel}`"
+            if start is not None:
+                header += f" L{start}" if end in (None, start) else f" L{start}-L{end}"
+            if role:
+                header += f" ({role})"
+            text = snip.get("text")
+            if not isinstance(text, str):
+                text = _read_line_range(repo_root, str(rel), start, end)
+            lines.extend([header, "```", text.rstrip(), "```", ""])
+        return "\n".join(lines).rstrip()
+
+    if not file_path:
+        return "### Code\n\n(no source file in case)\n"
+    src_text = (repo_root / file_path).read_text(encoding="utf-8")
+    return f"### File\n{src_text}"
+
+
+def _read_line_range(
+    repo_root: Path,
+    rel_path: str,
+    start_line: int | None,
+    end_line: int | None,
+) -> str:
+    path = repo_root / rel_path
+    if not path.is_file():
+        return f"(source unavailable: {rel_path})"
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    if start_line is None:
+        return "\n".join(lines)
+    start = max(1, int(start_line))
+    end = int(end_line) if end_line is not None else start
+    end = min(len(lines), max(start, end))
+    return "\n".join(lines[start - 1 : end])
+
+
 def build_task_markdown(
     case: dict[str, Any],
     repo_root: Path,
@@ -230,7 +281,7 @@ def build_task_markdown(
         )
 
     finding_json = json.dumps(finding, ensure_ascii=False, indent=2)
-    src_text = (repo_root / file_path).read_text(encoding="utf-8")
+    source_section = _render_source_section(case, repo_root, file_path)
     alerts = _codeql_alerts(case.get("raw_output"))
     alerts_summary = _format_alerts_summary(
         alerts, str(file_path or ""), prompt_version=prompt_version
@@ -271,8 +322,7 @@ def build_task_markdown(
 ## Inputs
 
 {alerts_summary}
-### File
-{src_text}
+{source_section}
 
 ### Finding (raw)
 {finding_json}

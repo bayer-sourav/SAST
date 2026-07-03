@@ -1,0 +1,370 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  SAST GitHub Advisory Triage — webhook API (ECS Fargate), job queue (SQS),
+  job store (DynamoDB), GPU inference worker (EC2 g6e), and supporting IAM/network.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: sast-advisory
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC for ALB, ECS, and GPU worker
+  PublicSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Public subnets for ALB
+  PrivateSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Private subnets for ECS tasks and GPU worker
+  ContainerImage:
+    Type: String
+    Description: ECR image URI for webhook/API container
+  GitHubWebhookSecret:
+    Type: String
+    NoEcho: true
+    Description: GitHub App webhook secret
+  TriageApiHmacSecret:
+    Type: String
+    NoEcho: true
+    Description: HMAC secret for internal API auth
+  GitHubAppId:
+    Type: String
+    Description: GitHub App ID
+  GpuInstanceType:
+    Type: String
+    Default: g6e.xlarge
+    AllowedValues: [g6e.xlarge, g6e.2xlarge, g6e.4xlarge]
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: SSH key for GPU worker (optional debugging)
+  ModelArtifactS3Uri:
+    Type: String
+    Default: ""
+    Description: Optional s3:// bucket prefix with vLLM model weights / LoRA (if not baked in AMI)
+  AcmCertificateArn:
+    Type: String
+    Description: ACM certificate ARN for ALB HTTPS (must be in same region as stack)
+
+Resources:
+  AdvisoryBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  JobsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${ProjectName}-jobs"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: job_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: job_id
+          KeyType: HASH
+
+  JobQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${ProjectName}-jobs"
+      VisibilityTimeout: 900
+      MessageRetentionPeriod: 86400
+
+  GitHubAppKeySecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${ProjectName}/github-app-private-key"
+      Description: PEM private key for GitHub App
+
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${ProjectName}-cluster"
+
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB for GitHub webhooks
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  ServiceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ECS webhook/API tasks
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  GpuSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: GPU inference worker
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${ProjectName}-alb"
+      Scheme: internet-facing
+      Subnets: !Ref PublicSubnetIds
+      SecurityGroups: [!Ref AlbSecurityGroup]
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${ProjectName}-tg"
+      Port: 8080
+      Protocol: HTTP
+      VpcId: !Ref VpcId
+      TargetType: ip
+      HealthCheckPath: /health
+
+  HttpsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref AcmCertificateArn
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: triage-api-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [sqs:SendMessage, sqs:ReceiveMessage, sqs:DeleteMessage, sqs:GetQueueAttributes]
+                Resource: !GetAtt JobQueue.Arn
+              - Effect: Allow
+                Action: [dynamodb:PutItem, dynamodb:GetItem, dynamodb:UpdateItem]
+                Resource: !GetAtt JobsTable.Arn
+              - Effect: Allow
+                Action: [secretsmanager:GetSecretValue]
+                Resource: !Ref GitHubAppKeySecret
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:ListBucket]
+                Resource:
+                  - !GetAtt AdvisoryBucket.Arn
+                  - !Sub "${AdvisoryBucket.Arn}/*"
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${ProjectName}-webhook"
+      Cpu: "512"
+      Memory: "1024"
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: webhook
+          Image: !Ref ContainerImage
+          PortMappings:
+            - ContainerPort: 8080
+          Environment:
+            - Name: TRIAGE_QUEUE_URL
+              Value: !Ref JobQueue
+            - Name: TRIAGE_JOBS_TABLE
+              Value: !Ref JobsTable
+            - Name: GITHUB_WEBHOOK_SECRET
+              Value: !Ref GitHubWebhookSecret
+            - Name: TRIAGE_API_HMAC_SECRET
+              Value: !Ref TriageApiHmacSecret
+            - Name: GITHUB_APP_ID
+              Value: !Ref GitHubAppId
+            - Name: GITHUB_APP_PRIVATE_KEY_PATH
+              Value: /secrets/github-app.pem
+            - Name: SAST_PROMPT_VERSION
+              Value: v7-ship
+            - Name: PHASE3_THINKING
+              Value: "on"
+            - Name: PHASE3_FEWSHOT
+              Value: "0"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: webhook
+          Secrets:
+            - Name: GITHUB_APP_PRIVATE_KEY
+              ValueFrom: !Ref GitHubAppKeySecret
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${ProjectName}"
+      RetentionInDays: 30
+
+  EcsService:
+    Type: AWS::ECS::Service
+    DependsOn: HttpsListener
+    Properties:
+      ServiceName: !Sub "${ProjectName}-webhook"
+      Cluster: !Ref EcsCluster
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: 2
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets: !Ref PrivateSubnetIds
+          SecurityGroups: [!Ref ServiceSecurityGroup]
+      LoadBalancers:
+        - ContainerName: webhook
+          ContainerPort: 8080
+          TargetGroupArn: !Ref TargetGroup
+
+  GpuInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: gpu-worker
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [sqs:*, dynamodb:*, s3:*, secretsmanager:GetSecretValue]
+                Resource: "*"
+
+  GpuInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref GpuInstanceRole]
+
+  GpuLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "${ProjectName}-gpu"
+      LaunchTemplateData:
+        ImageId: !Ref GpuAmiId
+        InstanceType: !Ref GpuInstanceType
+        KeyName: !Ref KeyPairName
+        IamInstanceProfile:
+          Name: !Ref GpuInstanceProfile
+        SecurityGroupIds: [!Ref GpuSecurityGroup]
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: 200
+              VolumeType: gp3
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -euxo pipefail
+            yum update -y
+            # Install Docker + NVIDIA container toolkit on Deep Learning AMI pattern
+            systemctl enable docker && systemctl start docker
+            aws s3 sync ${ModelArtifactS3Uri} /opt/sast-model/ || true
+            export TRIAGE_QUEUE_URL=${JobQueue}
+            export TRIAGE_JOBS_TABLE=${JobsTable}
+            export GITHUB_APP_ID=${GitHubAppId}
+            export GITHUB_APP_PRIVATE_KEY_PATH=/opt/secrets/github-app.pem
+            aws secretsmanager get-secret-value --secret-id ${GitHubAppKeySecret} --query SecretString --output text > /opt/secrets/github-app.pem
+            docker pull ${ContainerImage}
+            docker run -d --gpus all --restart always \
+              -e TRIAGE_QUEUE_URL \
+              -e TRIAGE_JOBS_TABLE \
+              -e GITHUB_APP_ID \
+              -e GITHUB_APP_PRIVATE_KEY_PATH \
+              -e SAST_PROMPT_VERSION=v7-ship \
+              -e PHASE3_THINKING=on \
+              -e PHASE3_FEWSHOT=0 \
+              -v /opt/secrets:/opt/secrets:ro \
+              -v /opt/sast-model:/opt/sast-model:ro \
+              ${ContainerImage} \
+              python -m services.triage_api.worker
+
+  GpuAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/deeplearning/amis/base-oss-nvidia-driver-gpu-py311-ubuntu-22.04/latest/ami-id
+    Description: GPU AMI (override with Deep Learning AMI in your region)
+
+  GpuAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub "${ProjectName}-gpu-asg"
+      MinSize: 1
+      MaxSize: 2
+      DesiredCapacity: 1
+      VPCZoneIdentifier: !Ref PrivateSubnetIds
+      LaunchTemplate:
+        LaunchTemplateId: !Ref GpuLaunchTemplate
+        Version: !GetAtt GpuLaunchTemplate.LatestVersionNumber
+
+Outputs:
+  WebhookUrl:
+    Description: Set this as GitHub App webhook URL (+ /webhook/github)
+    Value: !Sub "https://${ApplicationLoadBalancer.DNSName}/webhook/github"
+  AlbDnsName:
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+  JobQueueUrl:
+    Value: !Ref JobQueue
+  JobsTableName:
+    Value: !Ref JobsTable
+  AdvisoryBucketName:
+    Value: !Ref AdvisoryBucket
+  GitHubAppKeySecretArn:
+    Value: !Ref GitHubAppKeySecret
