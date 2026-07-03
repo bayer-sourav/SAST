@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate PowerPoint: comparison table + bar-chart graphics for SAST triage $/M costs."""
+"""Generate PowerPoint: summary table + simple business bar chart for SAST triage costs."""
 
 from __future__ import annotations
 
@@ -25,17 +25,18 @@ SM_G6E = 2.605
 CMU_RATE = 0.05718
 BEDROCK_OVERHEAD = 1.1
 
+CHART_COLOR = "#2563eb"
+
 # category, segment, vendor, model, in_m, out_m, note — in/out None => derived self-host
-# segment distinguishes managed-API rows: "Bedrock FM" vs "Frontier" (OpenAI/Anthropic/Google)
 ROWS: list[tuple[str, str, str, str, float | None, float | None, str]] = [
-    ("Managed API", "Bedrock FM", "Bedrock", "Qwen3.5-9B* (hypothetical)", 0.18, 0.18, "Not listed on Bedrock"),
-    ("Managed API", "Bedrock FM", "Bedrock", "Ministral 8B", 0.15, 0.15, "Listed per-token FM"),
-    ("Managed API", "Bedrock FM", "Bedrock", "Qwen3 32B", 0.1545, 0.618, "Nearest listed Qwen"),
+    # ("Managed API", "Bedrock FM", "Bedrock", "Qwen3.5-9B* (hypothetical)", 0.18, 0.18, "Not listed on Bedrock"),
+    # ("Managed API", "Bedrock FM", "Bedrock", "Ministral 8B", 0.15, 0.15, "Listed per-token FM"),
+    # ("Managed API", "Bedrock FM", "Bedrock", "Qwen3 32B", 0.1545, 0.618, "Nearest listed Qwen"),
     ("Self-host", "", "AWS VPC", "EC2 g6e spot + vLLM + LoRA", None, None, "GPU $/hr"),
     ("Self-host", "", "AWS VPC", "EC2 g6e on-demand + vLLM + LoRA", None, None, "GPU $/hr"),
     ("Self-host", "", "AWS VPC", "SageMaker ml.g6e BYOC + LoRA", None, None, "VPC endpoint"),
     ("Self-host", "", "Bedrock CMI", "Bedrock Custom Model Import · 1 CMU", None, None, "Merged LoRA import"),
-    ("Self-host", "", "Bedrock CMI", "Bedrock Custom Model Import · 2 CMU", None, None, "Typical 8B CMU"),
+    # ("Self-host", "", "Bedrock CMI", "Bedrock Custom Model Import · 2 CMU", None, None, "Typical 8B CMU"),
     ("Managed API", "Frontier", "Google", "Gemini 2.5 Pro", 1.25, 10.00, ""),
     ("Managed API", "Frontier", "Google", "Gemini 3.5 Flash", 1.50, 9.00, ""),
     ("Managed API", "Frontier", "OpenAI", "GPT-5.4", 2.50, 15.00, ""),
@@ -45,15 +46,28 @@ ROWS: list[tuple[str, str, str, str, float | None, float | None, str]] = [
     ("Managed API", "Frontier", "Anthropic", "Claude Opus 4.8", 5.00, 25.00, ""),
 ]
 
-CAT_COLORS = {
-    "Managed API": "#2d8a5e",
-    "Self-host": "#3b6ea8",
-}
-SEGMENT_COLORS = {
-    "Bedrock FM": "#2d8a5e",
-    "Frontier": "#5cb88a",
-    "": "#3b6ea8",
-}
+
+def business_label(model: str, category: str) -> str:
+    """Plain-language labels for executives."""
+    if category == "Self-host":
+        if "spot" in model:
+            return "Qwen3.5-9B self-host (spot)"
+        if "on-demand" in model:
+            return "Qwen3.5-9B self-host (on-demand)"
+        if "SageMaker" in model:
+            return "Qwen3.5-9B self-host (managed)"
+        if "1 CMU" in model:
+            return "Qwen3.5-9B on Bedrock"
+        if "2 CMU" in model:
+            return "Qwen3.5-9B on Bedrock"
+        return "Qwen3.5-9B self-host"
+    if "hypothetical" in model:
+        return "Qwen3.5-9B pay-per-use*"
+    if "Ministral" in model:
+        return "Ministral 8B pay-per-use"
+    if "Qwen3 32B" in model:
+        return "Qwen3-32B pay-per-use"
+    return model.replace(" (intro)", "")
 
 
 def per_triage(in_m: float, out_m: float) -> float:
@@ -90,7 +104,7 @@ def build() -> list[dict]:
     for cat, segment, vendor, model, in_m, out_m, note in ROWS:
         if in_m is None:
             pt = self_host_pt(model)
-            in_s = out_s = "derived*"
+            in_s = out_s = "—"
         else:
             pt = per_triage(in_m, out_m)
             in_s = fmt_m(in_m)
@@ -101,6 +115,7 @@ def build() -> list[dict]:
                 "segment": segment,
                 "vendor": vendor,
                 "model": model,
+                "label": business_label(model, cat),
                 "in_s": in_s,
                 "out_s": out_s,
                 "blended": blended(pt),
@@ -120,7 +135,7 @@ def fmt_m(v: float) -> str:
 
 
 def fmt_triage(v: float) -> str:
-    return f"${v:.5f}" if v < 0.01 else f"${v:.4f}"
+    return f"${v:.4f}" if v >= 0.01 else f"${v:.5f}"
 
 
 def add_title(slide, title: str, subtitle: str) -> None:
@@ -146,74 +161,56 @@ def add_table(slide, headers: list[str], rows: list[list[str]], *, top: float, h
         c.text = h
         for p in c.text_frame.paragraphs:
             p.font.bold = True
-            p.font.size = Pt(8)
+            p.font.size = Pt(9)
     for i, row in enumerate(rows, start=1):
         for j, val in enumerate(row):
             c = table.cell(i, j)
             c.text = val
             for p in c.text_frame.paragraphs:
-                p.font.size = Pt(7)
-                if j >= 4:
+                p.font.size = Pt(8)
+                if j >= 1:
                     p.alignment = PP_ALIGN.RIGHT
 
 
 def render_chart(rows: list[dict], path: Path) -> None:
-    """Grouped horizontal bar: $/M blended by option, colored by category."""
-    labels = [r["model"].replace(" + vLLM + LoRA", "").replace("Custom Model Import · ", "CMI ") for r in rows]
+    """Simple vertical bar chart — one color, business labels."""
+    labels = [r["label"] for r in rows]
     values = [r["blended"] for r in rows]
-    colors = [
-        SEGMENT_COLORS.get(r["segment"], CAT_COLORS[r["category"]]) for r in rows
-    ]
 
-    fig, ax = plt.subplots(figsize=(10, 6.5))
-    y = range(len(labels))
-    ax.barh(list(y), values, color=colors, height=0.72)
-    ax.set_yticks(list(y))
-    ax.set_yticklabels(labels, fontsize=8)
-    ax.invert_yaxis()
-    ax.set_xlabel("$/M blended (in+out at triage workload)", fontsize=10)
-    ax.set_title(
-        f"SAST triage token cost — {IN_TOK:,} in + {OUT_TOK:,} out / case · Jun 2026 pricing",
-        fontsize=11,
-        fontweight="bold",
-    )
-    ax.axvline(blended(per_triage(0.18, 0.18)), color="#2d8a5e", linestyle="--", linewidth=1, alpha=0.7)
-    ax.text(blended(per_triage(0.18, 0.18)) + 0.02, 0.5, "Managed 9B*", fontsize=7, color="#2d8a5e")
-    from matplotlib.patches import Patch
-
-    ax.legend(
-        handles=[
-            Patch(facecolor=SEGMENT_COLORS["Bedrock FM"], label="Managed API — Bedrock FM"),
-            Patch(facecolor=SEGMENT_COLORS["Frontier"], label="Managed API — Frontier"),
-            Patch(facecolor=CAT_COLORS["Self-host"], label="Self-host (BYOM)"),
-        ],
-        loc="upper right",
-        fontsize=8,
-    )
-    fig.tight_layout()
-    fig.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-
-
-def render_self_host_chart(path: Path) -> None:
-    """Self-host only: show derived vs blended."""
-    sh = [r for r in build() if r["category"] == "Self-host"]
-    labels = [r["model"].replace(" + vLLM + LoRA", "") for r in sh]
-    blended_v = [r["blended"] for r in sh]
-    pt_v = [r["per_triage"] * 1000 for r in sh]  # m$/triage for scale
-
-    fig, ax1 = plt.subplots(figsize=(9, 4))
+    fig, ax = plt.subplots(figsize=(10, 6.2))
     x = range(len(labels))
-    ax1.bar([i - 0.2 for i in x], blended_v, width=0.4, color="#3b6ea8", label="$/M blended")
-    ax1.set_ylabel("$/M blended", color="#3b6ea8")
-    ax1.set_xticks(list(x))
-    ax1.set_xticklabels(labels, rotation=15, ha="right", fontsize=8)
-    ax2 = ax1.twinx()
-    ax2.bar([i + 0.2 for i in x], pt_v, width=0.4, color="#7aa6d8", label="m$/triage (×1000)")
-    ax2.set_ylabel("$/triage × 1000", color="#7aa6d8")
-    ax1.set_title("Self-host paths — derived $/M from GPU/CMU time (not vendor token rates)", fontsize=10)
-    fig.tight_layout()
-    fig.savefig(path, dpi=150, bbox_inches="tight")
+    bars = ax.bar(list(x), values, color=CHART_COLOR, width=0.62, edgecolor="white", linewidth=0.6)
+
+    ax.set_xticks(list(x))
+    ax.set_xticklabels(labels, rotation=55, ha="right", fontsize=9)
+    ax.set_ylabel("Cost per million tokens ($)", fontsize=11)
+    # ax.set_title("Cost by deployment option", fontsize=14, fontweight="bold", pad=14)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.grid(axis="y", linestyle=":", alpha=0.35)
+    ax.set_axisbelow(True)
+
+    for bar, val in zip(bars, values):
+        ax.text(
+            bar.get_x() + bar.get_width() / 2,
+            bar.get_height() + max(values) * 0.012,
+            fmt_m(val),
+            ha="center",
+            va="bottom",
+            fontsize=7,
+            color="#333333",
+        )
+
+    # fig.text(
+    #     0.5,
+    #     0.02,
+    #     f"Typical security alert (~{TOTAL:,} tokens). Lower is better.  ·  Pricing as of Jun 2026",
+    #     ha="center",
+    #     fontsize=9,
+    #     color="#666666",
+    # )
+    fig.tight_layout(rect=(0, 0.04, 1, 1))
+    fig.savefig(path, dpi=150, bbox_inches="tight", facecolor="white")
     plt.close(fig)
 
 
@@ -226,24 +223,19 @@ def main() -> None:
     prs.slide_width = Inches(10)
     prs.slide_height = Inches(7.5)
 
-    # Slide 1 — full comparison table
+    # Slide 1 — summary table (plain language)
     s1 = prs.slides.add_slide(prs.slide_layouts[6])
     add_title(
         s1,
-        "SAST Triage — $/M Token Cost Comparison",
-        f"Workload: {IN_TOK:,} in + {OUT_TOK:,} out tokens/triage · Phase 3C ship · Jun 2026",
+        "SAST Triage — Cost Comparison",
+        "What it costs to review one security alert with each option",
     )
     add_table(
         s1,
-        ["Category", "Segment", "Vendor", "Model", "$/M in", "$/M out", "$/M blended", "$/triage"],
+        ["Option", "$/M tokens", "$/alert"],
         [
             [
-                r["category"],
-                r["segment"] or "—",
-                r["vendor"],
-                r["model"],
-                r["in_s"],
-                r["out_s"],
+                r["label"],
                 fmt_m(r["blended"]),
                 fmt_triage(r["per_triage"]),
             ]
@@ -254,39 +246,17 @@ def main() -> None:
     )
 
     with tempfile.TemporaryDirectory() as tmp:
-        tmp_path = Path(tmp)
-        chart_all = tmp_path / "all.png"
-        chart_sh = tmp_path / "selfhost.png"
+        chart_all = Path(tmp) / "cost_chart.png"
         render_chart(rows, chart_all)
-        render_self_host_chart(chart_sh)
 
-        # Slide 2 — bar chart all categories
+        # Slide 2 — simple bar chart
         s2 = prs.slides.add_slide(prs.slide_layouts[6])
         add_title(
             s2,
-            "Graphic — $/M blended by deployment option",
-            "Green = Managed API (Bedrock FM + Frontier) · Blue = Self-host BYOM with custom LoRA",
+            "Cost by deployment options",
+            "$/M tokens — self-host vs pay-per-use vs frontier models",
         )
-        s2.shapes.add_picture(str(chart_all), Inches(0.35), Inches(1.1), width=Inches(9.3))
-
-        # Slide 3 — self-host methodology graphic
-        s3 = prs.slides.add_slide(prs.slide_layouts[6])
-        add_title(
-            s3,
-            "Graphic — Self-host derived rates",
-            "* $/M in/out are derived from GPU $/hr or CMU $/min ÷ token throughput — see formula below",
-        )
-        s3.shapes.add_picture(str(chart_sh), Inches(0.35), Inches(1.05), width=Inches(9.0))
-        box = s3.shapes.add_textbox(Inches(0.45), Inches(5.35), Inches(9.0), Inches(1.8))
-        tf = box.text_frame
-        tf.word_wrap = True
-        p = tf.paragraphs[0]
-        p.text = (
-            "VPC: $/triage = (13.5s ÷ 3600) × GPU_$/hr  →  $/M blended = $/triage ÷ (8,195 ÷ 1M)\n"
-            "Bedrock CMI: $/triage = CMUs × $0.05718/min × 60 × active_hrs  →  same blended formula\n"
-            "Derived $/M_in = $/triage ÷ (7,154 ÷ 1M)   ·   Derived $/M_out = $/triage ÷ (1,041 ÷ 1M)"
-        )
-        p.font.size = Pt(10)
+        s2.shapes.add_picture(str(chart_all), Inches(0.35), Inches(1.05), width=Inches(9.3))
 
     prs.save(out_path)
     print(f"Wrote {out_path}")
