@@ -11,7 +11,9 @@ DEFAULT_PROMPT_VERSION = "v7-balanced"
 # Tag for v7-balanced matches Phase 2 Stage 2 ship config (Java/CodeQL-specific procedure).
 _REGISTRY: dict[str, str] = {
     "v7-balanced": "unified-4label-v7-balanced",
+    "v7-balanced-bl": "unified-4label-v7-balanced-bl",
     "v7-ship": "unified-4label-v7-ship",
+    "v7-ship-bl": "unified-4label-v7-ship-bl",
     "v8-dual-gate": "unified-4label-v8-dual-gate",
     "v9-fprr-first": "unified-4label-v9-fprr-first",
 }
@@ -119,6 +121,60 @@ Output a single JSON object matching this schema:
 10. Escape inner double quotes in JSON string values, or use backticks inside values."""
 
 
+def _bl_calibration_block(*, ship: bool) -> str:
+    """BL v4 calibration — ship variant is language-agnostic."""
+    if ship:
+        dns = (
+            "Hostname is resolved in one step and a **separate** outbound HTTP/TCP request "
+            "uses the hostname string. Without DNS TTL, resolver cache, and egress policy, "
+            "label **alert-unclear**."
+        )
+        semi = (
+            "Data from session storage, server config / init parameters, partner/OAuth tokens, "
+            "or server-set cookies. If who can influence that value is not visible, use **alert-unclear**."
+        )
+    else:
+        dns = (
+            "Hostname is resolved (e.g. `InetAddress.getByName`) and a **separate** HTTP "
+            "connection/fetch uses the hostname. Without DNS TTL, resolver cache, and egress "
+            "policy, label **alert-unclear**."
+        )
+        semi = (
+            "Data from session attributes, servlet init parameters, partner/OAuth flows, or "
+            "server-set cookies. If who can influence that value is not visible, use **alert-unclear**."
+        )
+    return f"""
+### Borderline (BL) calibration — when a reviewer needs context not in the snippet
+Apply **before** forcing **alert-TP** or **alert-FP**. Use **alert-unclear** (supports case **BL**) when:
+
+1. **Bypassable-but-non-trivial mitigation** — A sanitizer, allowlist, or guard is present and blocks naive abuse, but a **skilled** bypass may exist (encoding tricks, parser differentials, alternate IP forms, wrong output context). If proving bypass requires deployment policy or environment facts **not in the code**, use **alert-unclear**, not **alert-TP** merely because bypass is theoretically possible.
+
+2. **DNS rebinding window** — {dns}
+
+3. **Deployment / infrastructure trust** — Impact depends on WAF, network ACLs, admin-only routes, log exposure, or whether queries/strings are actually executed. If those facts would change the verdict, use **alert-unclear**.
+
+4. **Semi-trusted or partially-controlled input** — {semi}
+
+**Case BL** when: no **alert-TP**, and **at least one** **alert-unclear** for the reasons above.
+**Do not** upgrade to **alert-TP** only because user input reaches the sink when a non-trivial mitigation or trust boundary is in play — prove exploitable on the executed path **or** mark **alert-unclear**.
+
+"""
+
+
+def _procedure_v7_bl(output_schema: dict[str, Any]) -> str:
+    """v7-balanced + BL calibration for principled borderline cases."""
+    base = _procedure_v7(output_schema)
+    marker = "### Label definitions"
+    return base.replace(marker, _bl_calibration_block(ship=False) + marker)
+
+
+def _procedure_v7_ship_bl(output_schema: dict[str, Any]) -> str:
+    """Language-agnostic ship procedure + BL v4 calibration."""
+    base = _procedure_v7_ship(output_schema)
+    marker = "### Label definitions"
+    return base.replace(marker, _bl_calibration_block(ship=True) + marker)
+
+
 def _procedure_v8(output_schema: dict[str, Any]) -> str:
     base = _procedure_v7(output_schema)
     dual_gate = """
@@ -160,8 +216,8 @@ def _procedure_v9(output_schema: dict[str, Any]) -> str:
 
 
 def is_ship_prompt(name: str | None = None) -> bool:
-    """True for production language-agnostic prompt (v7-ship)."""
-    return resolve_prompt_version(name) == "v7-ship"
+    """True for language-agnostic ship prompts (v7-ship, v7-ship-bl)."""
+    return resolve_prompt_version(name) in ("v7-ship", "v7-ship-bl")
 
 
 def normalize_rule_id(rule_id: str, *, ship: bool) -> str:
@@ -258,8 +314,12 @@ def build_task_procedure(*, prompt_version: str | None = None, output_schema: di
     key = resolve_prompt_version(prompt_version)
     if key == "v7-balanced":
         return _procedure_v7(output_schema)
+    if key == "v7-balanced-bl":
+        return _procedure_v7_bl(output_schema)
     if key == "v7-ship":
         return _procedure_v7_ship(output_schema)
+    if key == "v7-ship-bl":
+        return _procedure_v7_ship_bl(output_schema)
     if key == "v8-dual-gate":
         return _procedure_v8(output_schema)
     if key == "v9-fprr-first":

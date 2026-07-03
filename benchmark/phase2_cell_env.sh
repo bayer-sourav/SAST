@@ -92,3 +92,9 @@ release_gpu_memory(verbose=os.environ.get('PHASE2_VERBOSE','0')=='1')
     fi
   fi
 }
+
+# Fast vLLM inference for Phase 2 batch runs (see phases/phase2/phase2_infer_env.sh).
+if [[ -f "$(dirname "${BASH_SOURCE[0]}")/phases/phase2/phase2_infer_env.sh" ]]; then
+  # shellcheck source=benchmark/phases/phase2/phase2_infer_env.sh
+  source "$(dirname "${BASH_SOURCE[0]}")/phases/phase2/phase2_infer_env.sh"
+fi
