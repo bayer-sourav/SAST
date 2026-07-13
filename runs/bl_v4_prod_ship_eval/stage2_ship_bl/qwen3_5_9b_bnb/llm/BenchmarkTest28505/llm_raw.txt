@@ -1,0 +1,201 @@
+The user wants me to assess a CodeQL alert for SSRF (Server-Side Request Forgery) in the provided Java code.
+
+**Task Breakdown:**
+1.  **Analyze the Alert:**
+    *   **Rule ID:** `java/ssrf`
+    *   **Message:** "Separate DNS resolution and outbound fetch."
+    *   **Sink Location:** Line 43 (`new java.net.URL("http://" + host + "/v1").openConnection()`).
+    *   **File:** `src/main/java/org/owasp/benchmark/testcode/BenchmarkTest28505.java`.
+
+2.  **Analyze the Code Flow:**
+    *   The `doPost` method receives a parameter `BenchmarkTest` into `param`.
+    *   `host` is assigned directly from `param` (unless null, set to "").
+    *   There is a check: `if (isNonPublicAddress(resolveHost(host))) return;`.
+        *   `resolveHost(host)` calls `InetAddress.getByName(host)`.
+        *   `isNonPublicAddress` checks loopback, site-local, link-local, any-local.
+        *   If the address resolves to a non-public/private/local address, the method returns early.
+    *   If the check passes (meaning the address IS public/global), the code proceeds to line 43.
+    *   Line 43 constructs a URL using `host` and opens a connection.
+
+3.  **Assess the Vulnerability (SSRF):**
+    *   **Input:** `request.getParameter("BenchmarkTest")` -> `host`. Attacker controlled.
+    *   **Sanitization/Guard:** `if (isNonPublicAddress(resolveHost(host))) return;`.
+        *   This guard prevents connecting to local/internal IPs (loopback, site-local, etc.).
+        *   However, standard SSRF protections often require checking against specific lists (like `localhost`, `127.x.x.x`, `169.254.x.x`, cloud metadata service IPs like `169.254.169.254`).
+        *   The current check `isNonPublicAddress` covers IPv4 mapped addresses, loopback, etc., based on `InetAddress` methods.
+        *   Crucially, there is a known issue with `InetAddress.isSiteLocalAddress()` and `isLoopbackAddress()`. It might miss some edge cases (e.g., `::1` sometimes behaves differently depending on implementation, though usually caught by `isLoopbackAddress` or `isAnyLocalAddress`). But specifically, the main concern here is whether the check effectively prevents accessing sensitive resources.
+        *   More importantly, look at the **BL Calibration** rules provided in the instructions.
+            *   Rule 3: **Deployment / infrastructure trust** — User input stored... without visible execution... Label **alert-unclear**. (Not applicable here, direct execution).
+            *   Rule 1: **Bypassable-but-non-trivial mitigation** — A sanitizer, allowlist, or guard blocks naive abuse, but a skilled bypass may exist.
+            *   Specifically, regarding DNS rebinding or IP validation: The instruction says "IP checks at resolve time do **not** prove the later connection is safe. Without DNS TTL, resolver cache, same-connection vs new-connection fetch, and egress policy in the snippet, label **alert-unclear**". Wait, let me re-read the specific SSRF guidance in the prompt.
+            *   Prompt Section: "**Borderline (BL) calibration** ... 2. **DNS rebinding window** — Resolution may check that the resolved IP is non-public, but a **separate** outbound HTTP/TCP request uses the **hostname string** (not the resolved IP). That split creates a DNS rebinding window..."
+            *   In this code:
+                1.  `resolveHost(host)` happens.
+                2.  Check `isNonPublicAddress(resolved_ip)`.
+                3.  Then `new java.net.URL("http://" + host + "/v1").openConnection()` happens.
+                4.  Does the second step use the *hostname* or the *resolved IP*? `URL` constructor takes a string. `http://<host>/v1`. The browser/JVM will perform DNS lookup again when resolving the URL.
+                5.  Since the original `host` string comes from user input, an attacker could provide a hostname that resolves to a private IP initially (to pass the check?), wait.
+                6.  Actually, the check is: `if (isNonPublicAddress(resolveHost(host))) return;`.
+                    *   If I send `127.0.0.1`, `resolveHost` gets `127.0.0.1`. `isNonPublicAddress` returns true. Returns early. Safe.
+                    *   If I send `evil.com`, `resolveHost` gets `X.X.X.X` (public). `isNonPublicAddress` returns false. Proceeds.
+                    *   Can I make `resolveHost` think it's public, but the actual connection goes somewhere else?
+                    *   Standard DNS rebinding attack: Hostname resolves to Public IP (passes check), then changes to Private IP before the connection completes? Or relies on caching?
+                    *   Usually, SSRF vulnerabilities flagged by "Separate DNS resolution and outbound fetch" imply that the check was done on the resolved IP, but the connection might happen via hostname, allowing the attacker to manipulate DNS between the check and the connection.
+                    *   However, looking closely at the code:
+                        ```java
+                        if (isNonPublicAddress(resolveHost(host))) return;
+                        java.net.URLConnection c = new java.net.URL("http://" + host + "/v1").openConnection();
+                        ```
+                        The check resolves `host`. If it's private, we stop. If it's public, we continue. We construct a URL with `host`. The JVM will likely resolve `host` again for the connection.
+                        Is there a gap? Yes. Between `resolveHost(host)` and `new java.net.URL(...).openConnection()`, the DNS record for `host` could theoretically change (though unlikely in practice within milliseconds, it's technically possible).
+                        Also, `InetAddress.isSiteLocalAddress()` behavior varies.
+                        Most critically, the instruction explicitly mentions: "**DNS rebinding window** — Resolution may check that the resolved IP is non-public, but a **separate** outbound HTTP/TCP request uses the **hostname string** (not the resolved IP). That split creates a DNS rebinding window — IP checks at resolve time do **not** prove the later connection is safe. Without DNS TTL, resolver cache, same-connection vs new-connection fetch, and egress policy in the snippet, label **alert-unclear**".
+                        
+                        Let's verify if this fits the description.
+                        1. Resolve `host` -> Get IP. Check IP.
+                        2. Construct URL with `host` (string). Connect.
+                        3. Connection triggers DNS resolution of `host` again.
+                        4. If DNS changed between step 1 and 3, the connection goes to a different place than checked.
+                        5. This matches the "DNS rebinding window" scenario described in the BL calibration section.
+                        
+                        Therefore, despite the presence of a check, the separation of resolution and usage via hostname string suggests potential for DNS rebinding attacks where the initial check passes (because the IP looked public at that moment) but the subsequent connection targets a different resource (potentially internal) if DNS manipulation occurs.
+                        
+                        Given the strict instruction: "Without DNS TTL, resolver cache, same-connection vs new-connection fetch, and egress policy in the snippet, label **alert-unclear** — **not** **alert-TP** from hostname taint alone."
+                        
+                        So, should I label this **BL**?
+                        The instruction says: "When the **resolved sink value** is attacker-controlled and BL calibration does **not** apply, count **alert-TP**."
+                        Here, the resolved sink value (the destination of the connection) *could* be attacker-controlled via DNS manipulation (rebinding).
+                        However, the instruction specifically flags this exact pattern ("Resolution may check that the resolved IP is non-public, but a separate outbound HTTP/TCP request uses the hostname string") as a condition for **alert-unclear** leading to **BL**.
+                        
+                        Let's double check the code structure.
+                        Line 33: `String host = param;`
+                        Line 34: `if (isNonPublicAddress(resolveHost(host))) return;`
+                        Line 43: `java.net.URLConnection c = new java.net.URL("http://" + host + "/v1").openConnection();`
+                        
+                        The check validates the IP associated with `host`. The connection uses `host`.
+                        If `host` is `example.com`, it resolves to `A.B.C.D`. Check passes.
+                        If `host` is `internal-service.local`, it resolves to `10.0.0.1`. Check fails. Return.
+                        The vulnerability arises if `host` resolves to a public IP now, but the application intends to block internal access.
+                        Wait, the goal of the check is to prevent accessing internal IPs.
+                        If I supply `169.254.169.254` (AWS metadata), `isNonPublicAddress` returns true (link-local/site-local/etc?). `InetAddress.isLinkLocalAddress` covers `169.254.x.x`. So AWS metadata would be blocked by `isLinkLocalAddress`.
+                        However, what if I supply a hostname that resolves to a public IP, but I want to hit an internal service?
+                        If I supply `my-internal-host.internal`, and my DNS allows me to point it to `10.0.0.1` (which is detected as private), I am blocked.
+                        To exploit, I need to bypass the check.
+                        If I supply a hostname that currently resolves to a public IP (check passes), but I want to reach an internal resource.
+                        If I have control over DNS (unlikely for external attacker), I could make it resolve to internal IP later.
+                        But typically, SSRF via hostname relies on the fact that the check happened on the *resolved* IP, but the connection happens on the *hostname*. If the DNS record changes between check and connection, the connection hits a different target.
+                        This is the classic "DNS Rebinding" SSRF vector.
+                        The instructions say: "That split creates a DNS rebinding window — IP checks at resolve time do **not** prove the later connection is safe. ... label **alert-unclear**".
+                        
+                        So, since the code exhibits this specific pattern (Check Resolved IP -> Connect via Hostname), and the instructions mandate labeling such scenarios as **alert-unclear** (due to lack of info on TTL/cache/policy), the alert verdict is **alert-unclear**.
+                        
+                        Consequently, the case level label should be **BL** (since no alert is TP, and at least one is unclear).
+                        
+                        Wait, I need to ensure there isn't a stronger TP signal.
+                        Is there any way to confirm the sink value is definitely attacker-controlled *and* reachable?
+                        The sink is `new java.net.URL("http://" + host + "/v1").openConnection()`.
+                        The `host` variable is derived from `param` (user input).
+                        The check attempts to mitigate SSRF by blocking private IPs.
+                        However, the mitigation has a flaw (timing/DNS race).
+                        According to the "BL calibration" section:
+                        "Apply **BL calibration** before defaulting to **alert-TP**. When BL calibration applies (DNS rebinding split, deployment trust, semi-trusted source, or non-trivial mitigation), prefer **alert-unclear** even if user input reaches the sink expression."
+                        
+                        This confirms that the DNS rebinding split pattern pushes the verdict to **alert-unclear**.
+                        Thus, the case label is **BL**.
+
+4.  **Drafting the Reason:**
+    *   State the alert type: `java/ssrf`.
+    *   Describe the flow: User input `param` becomes `host`. `resolveHost(host)` checks if the resolved IP is non-public. If yes, return. Otherwise, proceed to connect via `new java.net.URL("http://" + host + "/v1")`.
+    *   Explain why it's not TP: While user input reaches the sink, there is a mitigation attempt (blocking private IPs). However, the mitigation separates DNS resolution (for checking) from the actual connection (using the hostname string). This introduces a DNS rebinding window where the DNS record could change between the check and the connection.
+    *   Cite the BL calibration rule: "DNS rebinding window — Resolution may check that the resolved IP is non-public, but a separate outbound HTTP/TCP request uses the hostname string... label alert-unclear".
+    *   Conclusion: Alert is unclear, thus Case is BL.
+
+5.  **Evidence:**
+    *   Lines showing the check and the connection.
+    *   Line 34: `if (isNonPublicAddress(resolveHost(host))) return;`
+    *   Line 43: `java.net.URLConnection c = new java.net.URL("http://" + host + "/v1").openConnection();`
+
+6.  **Final Verification:**
+    *   Did I follow the "Resolved Sink Value" requirement?
+        *   Step 3 says: "Before any alert-FP or final verdict, state the resolved value of the sink expression on the executed path."
+        *   Here, the resolved value of the *destination* is determined by the DNS resolution of `host` at connection time. Since `host` is user input, the destination *can* be attacker-controlled.
+        *   However, the *mitigation* status makes it unclear.
+        *   The instruction says: "If you cannot compute the resolved value → alert-unclear".
+        *   Can I compute the resolved value? Not definitively, because it depends on DNS state at runtime (TTL, caching).
+        *   Even if I assume worst-case (attacker controls DNS), the instruction explicitly categorizes this "split" pattern as **alert-unclear** under BL calibration.
+        *   So I don't need to force TP just because it's potentially vulnerable. The policy dictates Unclear for this specific pattern.
+    
+    *   Confidence Score: Medium (0.55 range typical for BL).
+    *   Agent: llm.
+    *   Case ID: BenchmarkTest28505.
+
+    One nuance: The example 3 (BL) had "DNS rebinding window". My analysis aligns perfectly with that example's rationale.
+    Example 3 Code:
+    ```java
+    if (isNonPublicAddress(resolveHost(host))) return;
+    fetchHttpByHostname(host);
+    ```
+    My Code:
+    ```java
+    if (isNonPublicAddress(resolveHost(host))) return;
+    java.net.URLConnection c = new java.net.URL("http://" + host + "/v1").openConnection();
+    ```
+    These are structurally identical regarding the vulnerability pattern (Resolve -> Check -> Fetch via Hostname).
+    Example 3 Verdict: **BL**.
+    My Verdict: Should be **BL**.
+
+    Wait, I need to check if there are any differences.
+    Example 3: `fetchHttpByHostname(host)` called separately.
+    My Code: Directly connects.
+    Both involve resolving `host` once for safety check, then using `host` string for connection.
+    The distinction is purely syntactic. The semantic vulnerability (DNS rebinding window) remains.
+    Therefore, following the few-shot precedent (Example 3), the label is BL.
+
+    Wait, I should also check if `isNonPublicAddress` is robust enough.
+    `addr.isLoopbackAddress() || addr.isSiteLocalAddress() ...`
+    This covers most private ranges.
+    But the timing issue is the primary blocker for TP according to the instructions.
+    Instruction: "Without DNS TTL, resolver cache, same-connection vs new-connection fetch, and egress policy in the snippet, label **alert-unclear**".
+    This snippet lacks visibility into those factors.
+    So, BL is correct.
+
+    Final check on JSON structure.
+    Keys: label, confidence, confidence_score, reason, evidence, agent, case_id.
+    Values must be quoted properly.
+    Evidence array required for TP, FP, BL.
+    Confidence score float.
+
+    Ready to write.
+
+    Wait, one detail in the prompt: "Output EXACTLY ONE JSON object matching the schema in the user message."
+    And "Do NOT put JSON inside redacted_thinking blocks."
+    Okay, I will output raw JSON.
+
+    Double check the `confidence_score`. Example 3 used 0.55. I'll use 0.55 or similar medium value.
+    Reason needs to mention the specific alert and the calibration applied.
+
+    Plan:
+    1. Define label: BL.
+    2. Confidence: medium.
+    3. Score: 0.55.
+    4. Reason: Alert 1 (ssrf) is alert-unclear due to DNS rebinding window pattern (resolution check separated from connection via hostname).
+    5. Evidence: Lines 34 and 43.
+
+    Wait, I need to make sure I don't confuse "resolved sink value" terminology.
+    The instruction says: "State the resolved value of the sink expression on the executed path."
+    For SSRF, the sink is the network connection destination.
+    The value is `http://{host}/v1`.
+    The `host` is user input.
+    So the sink value *expression* is attacker-controlled.
+    BUT the instruction says: "apply BL calibration ... prefer alert-unclear even if user input reaches the sink expression."
+    So I acknowledge user input reaches the sink, but the calibration overrides to Unclear.
+    I will phrase the reason to reflect this.
+
+    Wait, looking at Example 3 again.
+    Reason: "Alert 1 alert-unclear: resolve-then-fetch pattern — DNS rebinding and egress controls are not visible in code. Case BL."
+    My Reason should mirror this.
+
+    One more thing: The prompt asks to "state the resolved value of the sink expression".
+    If I decide it's Unclear, do I still need to describe the value?
+    "If you cannot compute the resolved value → alert-unclear".
+    Here I can compute the *form* of the value (`http://{host}/v1`), but the *actual* destination is uncertain due to DNS

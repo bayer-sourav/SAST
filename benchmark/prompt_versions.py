@@ -11,9 +11,11 @@ DEFAULT_PROMPT_VERSION = "v7-balanced"
 # Tag for v7-balanced matches Phase 2 Stage 2 ship config (Java/CodeQL-specific procedure).
 _REGISTRY: dict[str, str] = {
     "v7-balanced": "unified-4label-v7-balanced",
+    "v7-balanced-langagnostic": "unified-4label-v7-balanced-langagnostic",
     "v7-balanced-bl": "unified-4label-v7-balanced-bl",
     "v7-ship": "unified-4label-v7-ship",
     "v7-ship-bl": "unified-4label-v7-ship-bl",
+    "v8-ship-bl": "unified-4label-v8-ship-bl",
     "v8-dual-gate": "unified-4label-v8-dual-gate",
     "v9-fprr-first": "unified-4label-v9-fprr-first",
 }
@@ -121,42 +123,175 @@ Output a single JSON object matching this schema:
 10. Escape inner double quotes in JSON string values, or use backticks inside values."""
 
 
-def _bl_calibration_block(*, ship: bool) -> str:
+def _procedure_v7_langagnostic(output_schema: dict[str, Any]) -> str:
+    schema = _schema_block(output_schema)
+    return f"""You are a **security-oriented code reviewer** triaging **SAST findings** for one source file.
+The finding may contain **multiple alerts** for the same file. You must **assess every alert**
+before assigning **one case-level label**.
+
+Use the tool's `codeFlows`, `locations`, and the shown source. Treat scanner messages as starting points;
+verify each alert's path in code. Apply the same logic for **any language** (Java, Python, JavaScript, Go, C#, etc.).
+
+### Per-alert assessment (do this for every alert)
+For **each** alert listed in **Alerts to assess**:
+
+1. **Scope** — Use that alert's `ruleId`, sink lines, and `codeFlow` only (do not borrow mitigation from a different alert).
+   Match the rule to the **vulnerability class** and **expected sink context** — infer from `ruleId`, rule message, and sink API, regardless of programming language. Examples (any language):
+   - **Cross-site scripting / HTML injection** → markup or HTTP response body sinks (templates, writers, render calls).
+   - **SQL / command injection** → query or command string passed to a database or shell API.
+   - **LDAP / XPath / NoSQL injection** → search filter or query argument.
+   - **Path / file injection** → file path, stream, or filesystem API.
+   - **Open redirect / SSRF** → URL or outbound request target.
+   - **Weak randomness / crypto** → security-sensitive tokens, session identifiers, keys, or nonces.
+   Do **not** assume a specific language prefix in `ruleId`; use the rule metadata and sink semantics.
+
+2. **Trace to sink expression first** — Identify the **exact variable or expression** at the reported sink (the value passed into the dangerous API on the executed path).
+   Follow data flow from untrusted **sources** to **that** expression, including through helpers, nested scopes, and indirection. Use **key steps (codeFlow)** as a guide, but **verify in source** — static-analysis paths can be misleading.
+   - Track **reassignments and overwrites**: the value at the sink is the **final** value on the taken path, not an earlier tainted assignment.
+   - For **markup/response-output rules**: if flow reaches a response or template sink, treat that as the sink context — **do not** dismiss the alert because taint passed through headers, cookies, or session storage without re-checking what reaches the output sink.
+   - For **weak-randomness / weak-crypto rules**: **alert-TP** when a predictable or weak RNG/crypto primitive feeds **session IDs, auth tokens, cookies, or other security-sensitive material** on the executed path.
+   - **Do not** label **alert-TP** merely because untrusted input exists in the same function; prove it reaches **this** sink expression.
+
+3. **Resolve sink value (mandatory)** — Before any **alert-FP** or final verdict, state the **resolved value** of the sink expression on the **executed path**.
+   - **Required** when the sink reads from a **collection** (list/array/map/dict index or key lookup), a **helper/callee return**, or a **branch** (switch/match/if-else) that selects the value used at the sink.
+   - **Walk the taken branch**: which index/key/return/case actually feeds the sink? What value does that produce?
+   - **alert-FP** only if you can name the **resolved sink value** as a **literal constant** or **provably non-user** value on that path (e.g. fixed index reads a constant element after removal; map lookup uses a different key than the tainted one; branch assigns hardcoded safe text).
+   - **alert-TP** when the **resolved sink value** still **depends on attacker-controlled input** (request fields, environment, file content, user-influenced variables concatenated or interpolated into the sink), even if the path also shows taint elsewhere or a container was involved.
+   - If you cannot compute the resolved value on the executed path → **alert-unclear**, **not** **alert-FP**.
+
+4. **Structural FP only with proved resolved value** — Only **after** steps 2–3, consider structural false positives. A structural **alert-FP** requires the **resolved sink value** from step 3 to be a constant or provably non-user — not merely that a collection/branch/helper appears in the path.
+   - **Required evidence form**: "resolved sink value = `<literal>`" or "index/key/branch on this path returns `<constant>`, not the user parameter".
+   - **Provable structural patterns** (language-agnostic):
+     - **Collection reorder/remove**: user value added then removed or bypassed so the sink reads a **constant** or non-user element — prove which element is read.
+     - **Map/dict key mismatch**: tainted data stored under one key, sink reads a **different key** or a constant.
+     - **Branch selection**: the taken branch assigns a **hardcoded safe** value to the variable used at the sink.
+     - **Helper return trace**: callee returns a constant or guarded-safe value that reaches the sink, with proof at the sink expression.
+   - If the pattern is suggested but the **resolved sink value** is not established → **alert-unclear**, **not** **alert-FP**.
+
+5. **Mitigate on this path (balanced encoding)** — Only after steps 2–4, check sanitization **between source and this sink expression** (escaping, encoding, parameterization, allowlists).
+   - Mitigation must apply to the **same expression** that reaches the sink, in the **correct context** for the vulnerability class (e.g. HTML escape for markup sinks, parameterized queries for SQL).
+   - **Balanced rule**: do **not** auto-label **alert-FP** because a sanitizer appears in the codeFlow when steps 2–3 show **attacker-controlled data is still the resolved sink value** — prefer **alert-TP** in that case.
+   - **alert-FP** via mitigation only when the **resolved sink value** is **not** attacker-controlled (sanitizer applied to a different value, wrong context, or unreachable branch).
+
+6. **Verdict** — For this alert alone:
+   - When **multiple alerts** exist, an **alert-FP** on one does **not** prevent **alert-TP** on another; verdict each alert on its own path.
+   - **alert-TP**: the **resolved sink value** on the executed path is attacker-controlled or unsafe, and steps 3–5 did not prove otherwise.
+   - **alert-FP**: **resolved sink value** is a literal constant, non-user string, safe/unreachable, or wrong context — cite the resolved value and line-level evidence.
+   - **alert-unclear**: steps 1–5 leave genuine ambiguity (unresolved sink value, unproved structural FP, partial mitigation, debatable guard) — not merely because another alert differs.
+
+### Case-level label (exactly one)
+After all alerts are assessed:
+- **TP** — **At least one** alert is **alert-TP**. Do not downgrade because other alerts are **alert-FP**.
+- **FP** — **Every** alert is **alert-FP**, each with its own path-specific evidence; in `reason`, name each alert's **resolved sink value** that justified **alert-FP**.
+- **BL** — **No** alert is **alert-TP**, and **at least one** is **alert-unclear**.
+- **UNKNOWN** — Source or flow is missing from the snippet for one or more alerts.
+
+### Label definitions
+- **TP** — Real vulnerability on at least one assessed alert path (unsafe data in the sink expression).
+- **FP** — No alert is exploitable on its reported path.
+- **BL** — No clear TP; at least one alert genuinely ambiguous.
+- **UNKNOWN** — Insufficient information to assess one or more alerts.
+
+Output a single JSON object matching this schema:
+
+{schema}
+
+### Rules (strict)
+1. **READ-ONLY**: Do not edit files or request patches.
+2. Assess **all** alerts; in `reason`, name which alert(s) are **alert-TP**, **alert-FP**, or **alert-unclear**, each alert's **resolved sink value** when relevant, and which drove the case label.
+3. Verify the **sink expression** per alert; do not conflate paths across alerts or rule types.
+4. Label case **FP** only when **every** alert is **alert-FP** with concrete evidence; for each **alert-FP**, state that alert's **resolved sink value** in `reason`.
+5. When the **resolved sink value** on the executed path is attacker-controlled, count **alert-TP** (supports case **TP**) — do not dismiss because a *different* alert is mitigated or because a collection/branch appears without proving a constant resolved value.
+6. Do not label case **BL** because alerts disagree — any **alert-TP** ⇒ case **TP**.
+7. `label` must be exactly **TP**, **FP**, **BL**, or **UNKNOWN**.
+8. `evidence` must include at least one item when label is TP, FP, or BL.
+9. Output **one JSON object only** — no markdown fences, no prose before or after.
+10. Escape inner double quotes in JSON string values, or use backticks inside values."""
+
+
+def _bl_calibration_block(*, ship: bool, strengthened: bool = False) -> str:
     """BL v4 calibration — ship variant is language-agnostic."""
     if ship:
-        dns = (
-            "Hostname is resolved in one step and a **separate** outbound HTTP/TCP request "
-            "uses the hostname string. Without DNS TTL, resolver cache, and egress policy, "
-            "label **alert-unclear**."
-        )
-        semi = (
-            "Data from session storage, server config / init parameters, partner/OAuth tokens, "
-            "or server-set cookies. If who can influence that value is not visible, use **alert-unclear**."
-        )
+        if strengthened:
+            dns = (
+                "Resolution may check that the resolved IP is non-public, but a **separate** outbound "
+                "HTTP/TCP request uses the **hostname string** (not the resolved IP). That split creates "
+                "a DNS rebinding window — IP checks at resolve time do **not** prove the later connection "
+                "is safe. Without DNS TTL, resolver cache, same-connection vs new-connection fetch, and "
+                "egress policy in the snippet, label **alert-unclear** — **not** **alert-TP** from hostname "
+                "taint alone."
+            )
+            deploy = (
+                "User input stored in request attributes, audit/event maps, deferred query strings, "
+                "or similar **without** visible execution, logging, or response exposure in the snippet. "
+                "Label **alert-unclear** — downstream pipeline, WAF, ACL, and retention are not in code. "
+                "Do **not** treat attribute/map storage alone as **alert-TP** exposure."
+            )
+            semi = (
+                "Data from session storage, server config / init parameters, partner/OAuth tokens, "
+                "or server-set cookies. If who can influence that value is not visible, use **alert-unclear**."
+            )
+            bypass = (
+                "A sanitizer, allowlist, or guard blocks naive abuse, but a skilled bypass may exist. "
+                "Output inside HTML **comment** delimiters with only delimiter stripping: use **alert-unclear** "
+                "unless comment breakout to active HTML is proved on the executed path."
+            )
+        else:
+            dns = (
+                "Hostname is resolved in one step and a **separate** outbound HTTP/TCP request "
+                "uses the hostname string. Without DNS TTL, resolver cache, and egress policy, "
+                "label **alert-unclear**."
+            )
+            deploy = (
+                "Impact depends on WAF, network ACLs, admin-only routes, log exposure, or whether "
+                "queries/strings are actually executed. If those facts would change the verdict, "
+                "use **alert-unclear**."
+            )
+            semi = (
+                "Data from session storage, server config / init parameters, partner/OAuth tokens, "
+                "or server-set cookies. If who can influence that value is not visible, use **alert-unclear**."
+            )
+            bypass = (
+                "A sanitizer, allowlist, or guard is present and blocks naive abuse, but a **skilled** "
+                "bypass may exist (encoding tricks, parser differentials, alternate IP forms, wrong output "
+                "context). If proving bypass requires deployment policy or environment facts **not in the "
+                "code**, use **alert-unclear**, not **alert-TP** merely because bypass is theoretically possible."
+            )
     else:
         dns = (
             "Hostname is resolved (e.g. `InetAddress.getByName`) and a **separate** HTTP "
             "connection/fetch uses the hostname. Without DNS TTL, resolver cache, and egress "
             "policy, label **alert-unclear**."
         )
+        deploy = (
+            "Impact depends on WAF, network ACLs, admin-only routes, log exposure, or whether "
+            "queries/strings are actually executed. If those facts would change the verdict, "
+            "use **alert-unclear**."
+        )
         semi = (
             "Data from session attributes, servlet init parameters, partner/OAuth flows, or "
             "server-set cookies. If who can influence that value is not visible, use **alert-unclear**."
+        )
+        bypass = (
+            "A sanitizer, allowlist, or guard is present and blocks naive abuse, but a **skilled** "
+            "bypass may exist (encoding tricks, parser differentials, alternate IP forms, wrong output "
+            "context). If proving bypass requires deployment policy or environment facts **not in the "
+            "code**, use **alert-unclear**, not **alert-TP** merely because bypass is theoretically possible."
         )
     return f"""
 ### Borderline (BL) calibration — when a reviewer needs context not in the snippet
 Apply **before** forcing **alert-TP** or **alert-FP**. Use **alert-unclear** (supports case **BL**) when:
 
-1. **Bypassable-but-non-trivial mitigation** — A sanitizer, allowlist, or guard is present and blocks naive abuse, but a **skilled** bypass may exist (encoding tricks, parser differentials, alternate IP forms, wrong output context). If proving bypass requires deployment policy or environment facts **not in the code**, use **alert-unclear**, not **alert-TP** merely because bypass is theoretically possible.
+1. **Bypassable-but-non-trivial mitigation** — {bypass}
 
 2. **DNS rebinding window** — {dns}
 
-3. **Deployment / infrastructure trust** — Impact depends on WAF, network ACLs, admin-only routes, log exposure, or whether queries/strings are actually executed. If those facts would change the verdict, use **alert-unclear**.
+3. **Deployment / infrastructure trust** — {deploy}
 
 4. **Semi-trusted or partially-controlled input** — {semi}
 
 **Case BL** when: no **alert-TP**, and **at least one** **alert-unclear** for the reasons above.
-**Do not** upgrade to **alert-TP** only because user input reaches the sink when a non-trivial mitigation or trust boundary is in play — prove exploitable on the executed path **or** mark **alert-unclear**.
+Apply BL calibration **before** rule 5 below: do **not** upgrade to **alert-TP** only because user input reaches the sink when a non-trivial mitigation, DNS rebinding split, deployment trust boundary, or semi-trusted source is in play — prove exploitable on the executed path **or** mark **alert-unclear**.
 
 """
 
@@ -173,6 +308,25 @@ def _procedure_v7_ship_bl(output_schema: dict[str, Any]) -> str:
     base = _procedure_v7_ship(output_schema)
     marker = "### Label definitions"
     return base.replace(marker, _bl_calibration_block(ship=True) + marker)
+
+
+def _procedure_v8_ship_bl(output_schema: dict[str, Any]) -> str:
+    """v8-ship-bl: strengthened language-agnostic BL calibration (prod ship)."""
+    base = _procedure_v7_ship(output_schema)
+    marker = "### Label definitions"
+    proc = base.replace(marker, _bl_calibration_block(ship=True, strengthened=True) + marker)
+    proc = proc.replace(
+        "5. When the **resolved sink value** is attacker-controlled, count **alert-TP** — do not dismiss because a different alert is mitigated.",
+        "5. Apply **BL calibration** before defaulting to **alert-TP**. When BL calibration applies (DNS rebinding split, deployment trust, semi-trusted source, or non-trivial mitigation), prefer **alert-unclear** even if user input reaches the sink expression.",
+    )
+    proc = proc.replace(
+        "6. Do not label case **BL** because alerts disagree — any **alert-TP** ⇒ case **TP**.",
+        "6. When the **resolved sink value** is attacker-controlled and BL calibration does **not** apply, count **alert-TP**.\n"
+        "7. Do not label case **BL** because alerts disagree — any **alert-TP** ⇒ case **TP**.",
+    )
+    return proc.replace("7. `label`", "8. `label`").replace("8. `evidence`", "9. `evidence`").replace(
+        "9. Output", "10. Output"
+    ).replace("10. Escape", "11. Escape")
 
 
 def _procedure_v8(output_schema: dict[str, Any]) -> str:
@@ -216,8 +370,8 @@ def _procedure_v9(output_schema: dict[str, Any]) -> str:
 
 
 def is_ship_prompt(name: str | None = None) -> bool:
-    """True for language-agnostic ship prompts (v7-ship, v7-ship-bl)."""
-    return resolve_prompt_version(name) in ("v7-ship", "v7-ship-bl")
+    """True for language-agnostic ship prompts (v7-ship, v7-ship-bl, v8-ship-bl)."""
+    return resolve_prompt_version(name) in ("v7-ship", "v7-ship-bl", "v8-ship-bl")
 
 
 def normalize_rule_id(rule_id: str, *, ship: bool) -> str:
@@ -314,12 +468,16 @@ def build_task_procedure(*, prompt_version: str | None = None, output_schema: di
     key = resolve_prompt_version(prompt_version)
     if key == "v7-balanced":
         return _procedure_v7(output_schema)
+    if key == "v7-balanced-langagnostic":
+        return _procedure_v7_langagnostic(output_schema)
     if key == "v7-balanced-bl":
         return _procedure_v7_bl(output_schema)
     if key == "v7-ship":
         return _procedure_v7_ship(output_schema)
     if key == "v7-ship-bl":
         return _procedure_v7_ship_bl(output_schema)
+    if key == "v8-ship-bl":
+        return _procedure_v8_ship_bl(output_schema)
     if key == "v8-dual-gate":
         return _procedure_v8(output_schema)
     if key == "v9-fprr-first":

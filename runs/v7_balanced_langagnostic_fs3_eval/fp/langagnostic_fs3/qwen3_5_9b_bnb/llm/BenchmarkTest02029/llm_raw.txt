@@ -1,0 +1,89 @@
+Let me analyze both alerts carefully.
+
+**Alert 1: java/xss**
+- Sink: Lines 58-64, specifically `encodeForHTML(fileTarget.toString())` being printed to response
+- The codeFlow shows: param → decode → param → map96688[put] → map96688.get("keyB-96688") → bar → doSomething → bar → new File(bar) → fileTarget → toString → encodeForHTML(fileTarget.toString())
+
+Looking at the source code:
+```java
+private static String doSomething(HttpServletRequest request, String param)
+        throws ServletException, IOException {
+
+    String bar = "safe!";
+    java.util.HashMap<String, Object> map96688 = new java.util.HashMap<String, Object>();
+    map96688.put("keyA-96688", "a_Value"); // put some stuff in the collection
+    map96688.put("keyB-96688", param); // put it in a collection
+    map96688.put("keyC", "another_Value"); // put some stuff in the collection
+    bar = (String) map96688.get("keyB-96688"); // get it back out
+    bar = (String) map96688.get("keyA-96688"); // get safe value back out
+
+    return bar;
+}
+```
+
+So in `doSomething`:
+1. `bar` starts as `"safe!"`
+2. `map96688.put("keyB-96688", param)` stores the user input
+3. `bar = (String) map96688.get("keyB-96688")` retrieves param
+4. `bar = (String) map96688.get("keyA-96688")` retrieves `"a_Value"` (NOT param!)
+
+Then `bar` is returned to the main method and becomes the argument to `new File(bar)`.
+
+
+In the main method, `fileTarget` gets assigned from `new File(bar)`, and `fileTarget.toString()` produces the path. Since `bar` now holds `"a_Value"` instead of the original user input, the XSS payload never makes it to the encoded output—the sink receives a benign filename rather than malicious script content.
+
+However, I need to reconsider how CodeQL traces the data flow. Looking at the actual execution sequence: the user-supplied parameter flows through decoding and mapping operations, eventually reaching `doSomething` where it's stored in the map under `"keyB-96688"`. Then `bar` gets reassigned twice—first pulling from that key, then from `"keyA-96688"`—which means the final value of `bar` is the safe constant, not the tainted input.
+
+But there's something odd about the codeFlow showing multiple occurrences of `param : String` at different locations. Let me verify whether the taint actually persists through these assignments or if the second retrieval truly breaks the chain.
+
+Looking at the actual code structure, `bar` gets reassigned sequentially: once from the decoded parameter, then again from a different map entry. By the time it reaches the sink, it should hold the safe value from `"keyA-96688"`, not the original user input. Yet the alert flags this as vulnerable, suggesting either my understanding of the control flow is incomplete or the analysis missed how the taint propagates despite the reassignment.
+
+Examining the full execution path reveals the issue: while `bar` initially captures the decoded parameter, subsequent assignments overwrite it with constants like `"a_Value"`. However, the critical question is whether the final value reaching the sink expression itself remains tainted or has been properly sanitized through these intermediate steps.
+
+Looking at the complete flow, `bar` ends up holding `"a_Value"` after the final assignment, which means the XSS payload never actually reaches the output destination. The alert appears to flag the initial taint propagation without accounting for how the variable gets overwritten before use.
+
+Yet examining the codeFlow more closely reveals something important—it traces the entire path from the user input through `doSomething`, capturing all intermediate states including the point where `bar` temporarily holds the tainted value. The real question becomes whether the final value at the sink expression itself carries that taint, or if the intermediate overwrites effectively neutralize it before the output occurs.
+
+Looking at the actual code, `bar` gets reassigned twice within `doSomething`—once retrieving the parameter from the map, then immediately overwritten with a safe constant from a different key. This means by the time `bar` returns to the calling method, it contains `"a_Value"` rather than the original user input. The taint disappears during those reassignments, making this a false positive.
+
+However, I'm noticing something in the codeFlow that contradicts this. There appear to be two separate instances of `param : String` appearing in the flow—one around line 53 and another later—which suggests the taint might persist through the call stack in ways the simple variable tracking isn't catching.
+
+Looking at the actual execution order: the parameter gets decoded and stored in the map, then retrieved back out. But then there's a second retrieval from a different key ("keyA-96688"), which would give us the safe value instead. So the final `bar` should be clean. Unless... the codeFlow is showing multiple possible execution paths, and one of them keeps the taint alive even though the primary path clears it.
+
+Actually, reviewing the flow more carefully: the parameter enters, goes through decode, gets mapped, then retrieved—but the final assignment pulls from "keyA-96688" which contains the safe value. That means the taint shouldn't reach the sink. This looks like a false positive unless I'm misreading which key is actually being accessed at the end.
+
+Wait—I need to look at the actual codeFlow structure again. It shows the parameter flowing through multiple stages, but the final retrieval happens at line 83, which corresponds to getting the safe value from "keyA-96688". So the taint gets cleared before reaching the output. This should be marked as alert-FP.
+
+Now checking Alert 2 for path traversal: the same parameter flows through the same transformations, ending up as `fileTarget` when constructing the File object. Since `bar` ultimately resolves to the safe constant rather than the user input, the path traversal risk is also eliminated here. Both alerts appear to be false positives based on the actual code execution path.
+
+However, I notice the codeFlow indicates the sink location spans lines 58-64, which includes the HTML encoding operation. Even though the underlying data is safe, the presence of `encodeForHTML` in the flow suggests the analyzer detected potential XSS exposure. The key distinction is whether the taint actually reaches the output—or if it's blocked by the safe value assignment before reaching the sink.
+
+Looking at the actual code flow: the parameter gets decoded and stored in the map, then retrieved back out. But critically, `bar` gets reassigned to retrieve from "keyA-96688" instead of "keyB-96688"—meaning the final value sent to `encodeForHTML` comes from a safe constant, not the user input. This makes both alerts false positives since the taint never reaches the sensitive sink.
+
+I should verify the exact line numbers against the provided code to ensure accuracy in my assessment. Looking at the code structure, I can identify the key sections: the servlet initialization at lines 21-22, the doGet/doPost methods handling requests, and the core logic beginning around line 44 where parameters are extracted from headers. The parameter undergoes URL decoding and is passed to doSomething(), which processes it further. The file operations and response generation occur between lines 55-65, with the actual file creation happening at line 55 using the processed parameter.
+
+Continuing through the remaining code, the doSomething method initializes a HashMap and populates it with test entries, storing the parameter under a specific key before returning it. The flow shows the parameter moving through multiple transformations—from extraction to decoding to storage and retrieval—before finally being used in file system operations.
+
+Both alerts appear to be false positives since the parameter gets overwritten with a safe constant before reaching the sink expressions. The resolved value at the point of use is consistently "a_Value" rather than the original user input, meaning neither the XSS nor path injection vulnerabilities are actually triggered in this execution path.
+</think>
+
+{
+  "label": "FP",
+  "confidence": "high",
+  "confidence_score": 0.95,
+  "reason": "Alert 1 (java/xss): alert-FP — resolved sink value is \"a_Value\" (constant): in doSomething, bar is set to map96688.get(\"keyA-96688\") which returns \"a_Value\", not the user parameter. Alert 2 (java/path-injection): alert-FP — resolved sink value is \"a_Value\" (constant): same path, bar = map96688.get(\"keyA-96688\") = \"a_Value\" before new File(bar). Case FP: every alert is alert-FP with proven resolved sink value.",
+  "evidence": [
+    {
+      "file": "src/main/java/org/owasp/benchmark/testcode/BenchmarkTest02029.java",
+      "lines": "L72-L83",
+      "note": "doSomething sets bar = map96688.get(\"keyA-96688\") which equals \"a_Value\", overwriting the user parameter"
+    },
+    {
+      "file": "src/main/java/org/owasp/benchmark/testcode/BenchmarkTest02029.java",
+      "lines": "L58-L65",
+      "note": "Sink encodes fileTarget.toString() to HTML; fileTarget derived from bar which resolved to constant \"a_Value\""
+    }
+  ],
+  "agent": "llm",
+  "case_id": "BenchmarkTest02029"
+}

@@ -1,0 +1,238 @@
+The user wants me to act as a security-oriented SAST triage assistant. I need to analyze the provided Java code and the specific SSRF alert to determine if it's a True Positive (TP), False Positive (FP), or Borderline (BL).
+
+**Task Breakdown:**
+1.  **Analyze the Alert:**
+    *   **Rule ID:** `java/ssrf`
+    *   **Message:** "Separate DNS resolution and outbound fetch."
+    *   **Sink Location:** Line 44 (`connectHttpByHostname(host)` call site, though the actual URL construction happens inside the method). Wait, looking at the location details in the raw output: `startLine: 44`. Let's look at the code around line 44.
+    *   The code provided has methods defined earlier. Let's map the lines.
+    *   Lines 1-10: Imports.
+    *   Line 11: Class definition.
+    *   Line 12: SerialVersionUID.
+    *   Line 14: `isNonPublicAddress` method starts.
+    *   Line 17: `resolveHost` method starts.
+    *   Line 20: `fetchHttpByHostname` method starts.
+    *   Line 23: `connectHttpByHostname` method starts.
+    *   Line 26: `openUrlByHostname` method starts.
+    *   Line 30: `doPost` method starts.
+    *   Line 31-32: Response type set.
+    *   Line 33: `param` retrieval.
+    *   Line 34: `host` assignment.
+    *   Line 35: `if (isNonPublicAddress(resolveHost(host))) return;` -> This is the DNS resolution check.
+    *   Line 36: `Thread.sleep(50);`
+    *   Line 37: `connectHttpByHostname(host);` -> This is the fetch.
+
+    Wait, the alert says Sink is at Line 44. In the provided snippet, `connectHttpByHostname(host)` is at line 37. However, sometimes line numbers in reports differ slightly from the snippet provided (maybe imports take up space differently, or the snippet is truncated/padded). Regardless, the logic is clearly:
+    1. Resolve host using `InetAddress.getByName(host)` (Line 19 inside `resolveHost`).
+    2. Check if address is non-public (Line 35).
+    3. Call `connectHttpByHostname(host)` (Line 37). Inside this method (Line 23-25), it constructs a URL: `new java.net.URL("https://" + host + "/health").openStream()` (Wait, `connectHttpByHostname` uses `http://` based on my reading of the snippet provided in the prompt? Let's check carefully).
+
+    Snippet Analysis:
+    ```java
+    private void connectHttpByHostname(String host) throws java.io.IOException {
+        new java.net.URL("http://" + host).openConnection().connect();
+    }
+    ```
+    Okay, so `connectHttpByHostname` takes `host` directly and appends it to `"http://"`. It does *not* resolve the DNS again inside the method. The URL constructor will handle the resolution.
+
+    The Alert Logic (`java/ssrf`):
+    Usually, SSRF vulnerabilities occur when user input determines the target of an outbound network request.
+    Here, `host` comes from `request.getParameter("BenchmarkTest")` (Line 33).
+    So `host` is user-controllable.
+    
+    The Defense Mechanism:
+    There is a check: `if (isNonPublicAddress(resolveHost(host))) return;` (Line 35).
+    This resolves the hostname to an IP address and checks if it is loopback, link-local, site-local, or any-local.
+    If the IP is considered "public" (i.e., not returned true by `isNonPublicAddress`), the code proceeds to `connectHttpByHostname(host)`.
+
+    Vulnerability Assessment:
+    1.  **Input:** `host` is user-supplied.
+    2.  **Resolution:** `resolveHost(host)` converts hostname to IP.
+    3.  **Check:** Checks if IP is private/reserved.
+    4.  **Fetch:** Uses `host` string directly in `URL` constructor. `new java.net.URL("http://" + host).openConnection().connect();`.
+    
+    **Critical Issue:**
+    The check verifies the IP address associated with the hostname. However, the actual fetch connects to the `host` string provided by the user.
+    
+    Scenario: DNS Rebinding Attack.
+    Attacker provides a hostname (e.g., `evil.com`).
+    At time T1 (check phase), `evil.com` resolves to a public IP (e.g., `1.2.3.4`). The check passes.
+    Between T1 and T2 (fetch phase), the attacker changes their DNS record for `evil.com` to point to a local/private IP (e.g., `127.0.0.1` or `192.168.1.1`).
+    Since the application reconnects to the `host` string (which triggers a fresh DNS lookup by the underlying networking stack when opening the stream/connection), the application might now reach the attacker's machine.
+    
+    Even if we assume standard behavior where the OS caches DNS, relying on a pre-resolved check against a dynamic DNS entry is inherently risky for SSRF prevention regarding DNS rebinding.
+    Specifically, the `java/net/URL` constructor performs its own DNS resolution when connecting. The initial `resolveHost` call was just for validation.
+    
+    Is this a known SSRF pattern? Yes. Checking IP addresses derived from user input before making a connection is generally insufficient protection against DNS rebinding attacks unless the connection is made immediately to the resolved IP (using the InetAddress object) rather than the original hostname string.
+    
+    Furthermore, there is a `Thread.sleep(50);` between the check and the fetch. This gives ample time for a DNS record update (TTL permitting).
+    
+    Therefore, the data flows from `param` -> `host` -> `connectHttpByHostname(host)`. The sink is the network connection initiated by `URL(...).openConnection()`. The value determining the destination is `host`, which is user input.
+    
+    Does the mitigation hold?
+    The mitigation attempts to block private IPs. But since the fetch uses the hostname string, DNS rebinding allows bypassing this check.
+    Also, `resolveHost` might fail if the domain doesn't exist, but here we assume it succeeds for the check.
+    
+    Is it a TP?
+    Most modern SAST tools flag this pattern ("Separate DNS resolution and outbound fetch") as high severity SSRF because the separation introduces a timing window for DNS rebinding.
+    The prompt instructions say:
+    > **Borderline (BL) calibration — when a reviewer needs context not in the snippet**
+    > 2. **DNS rebinding window** — Resolution may check that the resolved IP is non-public, but a **separate** outbound HTTP/TCP request uses the **hostname string** (not the resolved IP). That split creates a DNS rebinding window — IP checks at resolve time do **not** prove the later connection is safe. Without DNS TTL, resolver cache, same-connection vs new-connection fetch, and egress policy in the snippet, label **alert-unclear** — **not** **alert-TP** from hostname taint alone.
+    
+    Wait, let's re-read the instruction carefully.
+    Instruction Rule 5: "When the **resolved sink value** is attacker-controlled and BL calibration does **not** apply, count **alert-TP**."
+    Instruction Rule 5 (BL Calibration): "Apply **BL calibration** before defaulting to **alert-TP**. When BL calibration applies... prefer **alert-unclear** even if user input reaches the sink expression."
+    Specific BL Calibration Point 2: "**DNS rebinding window** ... Resolution may check that the resolved IP is non-public, but a **separate** outbound HTTP/TCP request uses the **hostname string** (not the resolved IP). That split creates a DNS rebinding window ... label **alert-unclear**".
+    
+    This matches the scenario perfectly.
+    1. Input `host` is user controlled.
+    2. `resolveHost(host)` is called to check IP.
+    3. `connectHttpByHostname(host)` is called separately using the hostname string.
+    4. This creates a DNS rebinding window.
+    
+    According to the specific BL calibration rule provided in the prompt instructions:
+    "Without DNS TTL, resolver cache, same-connection vs new-connection fetch, and egress policy in the snippet, label **alert-unclear** — **not** **alert-TP** from hostname taint alone."
+    
+    So, despite the fact that this is technically vulnerable to DNS rebinding (a real-world attack vector), the specific instructions for this triage task tell me to classify this specific pattern (IP check followed by hostname fetch) as **alert-unclear** (leading to case **BL**) because the necessary context (DNS TTL, caching, etc.) is not visible in the snippet to definitively prove exploitation is possible *on the executed path* within the constraints of the snippet analysis.
+    
+    Wait, let me double check the "Resolved Sink Value" requirement.
+    Step 3: "Resolve sink value (mandatory)... Required when the sink reads from a list/map/dict... or a branch..."
+    Step 6 Verdict: "alert-TP: resolved sink value is attacker-controlled or unsafe, and steps 3–5 did not prove otherwise."
+    Step 5 Mitigate: "Only after steps 2–4, check encoding/sanitization... alert-FP via mitigation only when the resolved sink value is not attacker-controlled."
+    
+    The BL calibration section overrides the general TP/FP decision process for specific scenarios like DNS rebinding.
+    "Apply **BL calibration** before defaulting to **alert-TP**. When BL calibration applies... prefer **alert-unclear** even if user input reaches the sink expression."
+    
+    So, since the pattern matches "DNS rebinding window" described in the BL calibration section, I should label the alert as **alert-unclear**.
+    Consequently, the case level label becomes **BL** (since no alert is TP, and at least one is unclear).
+    
+    Let's verify if there are any other factors.
+    The `Thread.sleep(50)` explicitly adds delay, increasing the window for DNS rebinding.
+    However, the instruction specifically says: "Without DNS TTL, resolver cache... in the snippet, label **alert-unclear**".
+    This implies that without external knowledge of the environment's DNS configuration, we cannot confirm the exploit works.
+    
+    So the verdict for Alert 1 is **alert-unclear**.
+    Since there is only 1 alert, and it is unclear, the case label is **BL**.
+    
+    Reasoning summary:
+    - Alert 1 (`java/ssrf`): User input `host` flows into `connectHttpByHostname(host)`.
+    - Preceding check `isNonPublicAddress(resolveHost(host))` validates the IP.
+    - Fetch uses `host` string, triggering potential DNS resolution during connection.
+    - Separation between validation (IP-based) and action (Hostname-based) creates a DNS rebinding window.
+    - Per BL calibration guidelines for DNS rebinding windows where TTL/cache info is absent, this should be labeled **alert-unclear**.
+    - Case Level: **BL**.
+
+    Evidence needed: Cite the lines showing the check and the subsequent fetch.
+    Line 35: `if (isNonPublicAddress(resolveHost(host))) return;`
+    Line 37: `connectHttpByHostname(host);`
+    Method `connectHttpByHostname` (Lines 23-25): `new java.net.URL("http://" + host).openConnection().connect();`
+    
+    Confidence: Medium (because it relies on interpreting the specific BL calibration rule correctly).
+    
+    Let's refine the confidence score. The instructions are explicit about this pattern being BL. High confidence in applying the rule, medium confidence in the practical exploitability without env context. I'll stick with medium/high depending on how strict I am. Given the explicit instruction "label alert-unclear", I'm confident in the classification logic. I'll set confidence to "high" because the rule is explicit in the prompt. Actually, usually "high" means I know the answer well. Since the prompt tells me exactly how to judge this, I have high confidence in following the instruction.
+    
+    Wait, checking the example cases.
+    Example 3 (BL) had "DNS rebinding window".
+    Pattern: `resolveHost` then `fetchHttpByHostname`.
+    My case: `resolveHost` then `connectHttpByHostname`.
+    Same pattern.
+    Example 3 Result: BL.
+    My Case Result: Should be BL.
+    
+    One detail: The prompt asks for `confidence_score`. I should provide a float.
+    
+    Final check on JSON structure.
+    Keys: `label`, `confidence`, `confidence_score`, `reason`, `evidence`, `agent`, `case_id`.
+    Values must be correct types.
+    `agent` must be `llm`.
+    `case_id` is `BenchmarkTest28490`.
+    
+    Constructing the reason:
+    "Alert 1 (ssrf) alert-unclear: Hostname taint flows to fetch endpoint, preceded by IP validation check. Per BL calibration for DNS rebinding windows (resolution separated from fetch), exploitability depends on unseen DNS TTL/cache settings. Case BL."
+    
+    Evidence items:
+    1. Line 35: Validation check.
+    2. Line 37: Fetch call.
+    3. Line 23-25: Fetch implementation using hostname.
+    
+    Wait, I need to make sure I don't miss anything.
+    Is there any other mitigation?
+    `Thread.sleep(50)` makes it worse (more time for DNS change).
+    `isNonPublicAddress` checks loopback, site-local, link-local, any-local. It misses some reserved ranges potentially, but mainly focuses on private.
+    The core issue is the separation of resolution and usage.
+    
+    Okay, proceeding with BL.
+
+    Double check: Are there multiple alerts?
+    "The finding contains **1** SAST tool alert."
+    So if Alert 1 is Unclear, Case is BL.
+    If Alert 1 were TP, Case would be TP.
+    If Alert 1 were FP, Case would be FP.
+    
+    Decision: BL.
+
+    Wait, one nuance. The instruction says:
+    "Apply **BL calibration** before defaulting to **alert-TP**. When BL calibration applies... prefer **alert-unclear** even if user input reaches the sink expression."
+    And:
+    "**Case BL** when: no **alert-TP**, and **at least one** **alert-unclear** for the reasons above."
+    
+    So yes, BL is the correct label.
+
+    One more thing: The prompt mentions "Do NOT put JSON inside redacted_thinking blocks." and "OUTPUT the JSON result only".
+    I must ensure the final output is clean JSON.
+
+    Let's draft the JSON content.
+    label: "BL"
+    confidence: "high" (I follow the rule strictly)
+    confidence_score: 0.9
+    reason: "Alert 1 (ssrf) alert-unclear: User input 'host' flows to fetch ('connectHttpByHostname') after IP validation ('resolveHost'). This separation creates a DNS rebinding window. Per BL calibration guidelines, without visibility into DNS TTL/cache/network policies, this cannot be confirmed as exploitable on the path. Case BL."
+    evidence: [
+      {"file": "...", "lines": "L35-L37", "note": "Validation check followed by fetch"},
+      {"file": "...", "lines": "L23-L25", "note": "Fetch uses hostname string"}
+    ]
+    agent: "llm"
+    case_id: "BenchmarkTest28490"
+
+    Wait, I should check the exact file path in the snippet.
+    `src/main/java/org/owasp/benchmark/testcode/BenchmarkTest28490.java`
+    
+    Lines in snippet:
+    L35: `if (isNonPublicAddress(resolveHost(host))) return;`
+    L37: `connectHttpByHostname(host);`
+    L23: `private void connectHttpByHostname(String host) throws java.io.IOException {`
+    L24: `new java.net.URL("http://" + host).openConnection().connect();`
+    L25: `}`
+    
+    I will combine these into evidence.
+
+    One small correction: The prompt says "Do NOT duplicate the JSON. Do NOT put JSON inside redacted_thinking blocks."
+    I will write the thinking process first (hidden/internal) then the JSON.
+    Wait, the system instruction says "After any internal reasoning, output EXACTLY ONE JSON object".
+    Usually, this means I can think silently, then output the JSON.
+    The prompt also says "You may reason internally first."
+    So I will generate the thought block here, then the JSON.
+    
+    Wait, I see "Output requirements (strict): ... Do NOT put JSON inside redacted_thinking blocks."
+    This implies I shouldn't wrap the JSON in markdown code blocks either?
+    "No markdown code fences. No prose before or after the final JSON object."
+    So literally just the raw JSON string.
+    
+    Okay, ready.
+
+    One final verification on the "Resolved Sink Value".
+    The sink is the `URL` constructor call inside `connectHttpByHostname`.
+    The value passed is `host`.
+    `host` is assigned from `param` (Line 34).
+    `param` is `request.getParameter("BenchmarkTest")` (Line 33).
+    So `host` is attacker-controlled.
+    The BL calibration prevents labeling this TP because of the DNS rebinding uncertainty.
+    So `alert-unclear` is appropriate.
+    
+    Structure looks good.
+</think>
+
+{
+  "label": "BL",
+  "confidence": "high",
+  "confidence_score": 0.9,
+  "reason": "Alert 1 (ssrf) alert-unclear: User input 'host' flows to fetch ('connectHttpByHostname') after IP validation ('resolveHost

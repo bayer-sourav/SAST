@@ -1,0 +1,243 @@
+The user wants me to triage a CodeQL SSRF alert for the provided Java file.
+
+**Task:**
+1.  Analyze the provided Java code.
+2.  Assess the specific alert (`java/ssrf`).
+3.  Determine the label (TP, FP, BL, UNKNOWN) based on the analysis.
+4.  Output the result as a strict JSON object.
+
+**Analysis of the Code:**
+File: `src/main/java/org/owasp/benchmark/testcode/BenchmarkTest28490.java`
+
+Relevant methods:
+- `isNonPublicAddress(InetAddress addr)`: Checks if address is loopback, site-local, link-local, or any-local. Returns true if restricted.
+- `resolveHost(String host)`: Resolves hostname to InetAddress using `InetAddress.getByName(host)`.
+- `fetchHttpByHostname(String host)`: Opens URL stream using `new java.net.URL("http://" + host + "/api").openStream()`.
+- `connectHttpByHostname(String host)`: Connects to URL using `new java.net.URL("http://" + host).openConnection().connect()`.
+- `openUrlByHostname(String host)`: Opens URL stream using `new java.net.URL("https://" + host + "/health").openStream()`.
+
+Main Logic (`doPost`):
+1.  Get parameter `param` ("BenchmarkTest"). Default to "" if null.
+2.  Assign `host = param`.
+3.  Check `if (isNonPublicAddress(resolveHost(host))) return;`.
+    - This resolves the hostname immediately.
+    - It checks if the resulting IP is a "public" address (by negating the `isNonPublicAddress` check). Wait, let's look closer.
+    - `isNonPrivate` usually means checking against private ranges. Here `isNonPublicAddress` returns true if it IS private/local.
+    - The condition is `if (isNonPublicAddress(...)) return;`. So if the resolved IP is local/private, the function returns early.
+    - This implies we proceed ONLY IF the resolved IP is NOT local/private (i.e., it looks like a public IP).
+4.  `Thread.sleep(50);`
+5.  `connectHttpByHostname(host);` -> Calls `new java.net.URL("http://" + host).openConnection().connect();`.
+
+**SSRF Analysis:**
+- **Sink:** `connectHttpByHostname(host)` calls `URL.openConnection()`. The URL is constructed using `host`.
+- **Data Flow:** `request.getParameter("BenchmarkTest")` -> `host` -> `URL.openConnection()`.
+- **Mitigation:** There is a check `if (isNonPublicAddress(resolveHost(host))) return;`.
+    - This performs a DNS lookup (`resolveHost`) BEFORE making the connection.
+    - It verifies that the resolved IP address is NOT a private/local address.
+    - However, there is a known issue with SSRF protections involving DNS rebinding.
+    - The check happens at line 43: `if (isNonPublicAddress(resolveHost(host))) return;`.
+    - The actual connection happens at line 45: `connectHttpByHostname(host);`.
+    - Between these two lines, `host` is used directly in the URL construction.
+    - An attacker could provide a hostname that resolves to a private IP initially (triggering the block), OR they might exploit timing differences or DNS caching issues. But wait, the check passes if the IP is *not* non-public (i.e., it *is* public).
+    - Actually, looking at the logic:
+        - If `resolveHost(host)` returns a private IP -> `isNonPublicAddress` returns TRUE -> `return` (block).
+        - If `resolveHost(host)` returns a public IP -> `isNonPublicAddress` returns FALSE -> Continue execution.
+    - Then `connectHttpByHostname(host)` connects to `host`.
+    - Since `host` was verified to resolve to a public IP previously, the connection should go to a public IP.
+    - **However**, DNS rebinding attacks work by changing the DNS record between the time of verification and the time of connection. Or, the attacker provides a hostname that resolves to a public IP now, but the application trusts the initial check.
+    - More critically, standard SSRF patterns often flag "resolve then connect" as risky because DNS records can change.
+    - Also, simply resolving once isn't enough protection against certain SSRF vectors unless the connection also validates the IP (which it doesn't here, it just connects to the hostname again).
+    - Is this a True Positive (TP)?
+        - The code attempts to mitigate SSRF by validating the resolved IP before connecting.
+        - However, the validation relies on DNS resolution happening *now*.
+        - If an attacker knows how to manipulate DNS (e.g., DNS rebinding, or exploiting the fact that the browser/client might have cached a different entry, though this is server-side), they might bypass.
+        - Specifically, DNS rebinding: Attacker sets up a domain that resolves to a public IP (passing the check), but the target server has a firewall allowing traffic to that public IP range but blocking direct external requests to sensitive internal resources... wait, usually SSRF is about accessing internal services.
+        - If the check ensures the IP is public, the attack vector is typically to make the server think the destination is public while it's actually internal.
+        - With `resolveHost(host)` returning a public IP, the check passes. Then `connectHttpByHostname(host)` connects to `host`. If `host` resolves to the same public IP, the connection goes out.
+        - Can an attacker force the connection to go to an internal resource?
+        - Scenario: Attacker registers `evil.com` pointing to Public IP X. Server resolves `evil.com` -> X (Passes check). Connection made to `evil.com`.
+        - To hit internal service Y, `evil.com` must resolve to Internal IP Z.
+        - If DNS changes between check and connect:
+            1. Attacker updates DNS for `evil.com` to point to Internal IP Z.
+            2. Server resolves `evil.com` -> Z.
+            3. `isNonPublicAddress(Z)` returns TRUE (since Z is internal).
+            4. Function returns. Blocked.
+        - So DNS rebinding works against the *check*, preventing the connection.
+        - What about the reverse? Attacker makes `evil.com` resolve to Public IP X. Server resolves -> X. Passes check. Connects to `evil.com`.
+        - If the server connects to `evil.com`, it will likely follow the current DNS resolution. If DNS hasn't changed, it hits X.
+        - Is there a way to bypass the check?
+        - Some implementations of `InetAddress.getByName` might behave differently than subsequent connections depending on OS/DNS cache.
+        - But generally, "Resolve then Connect" is considered a weak mitigation because DNS records can change between the two operations (though usually, the second operation follows the first).
+        - However, there is a specific nuance: **DNS Rebinding Window**.
+        - If the check resolves to a public IP, but the connection uses the hostname, and the hostname resolves to something else later (unlikely if cached locally), or if the attacker exploits the difference in resolution behavior.
+        - Actually, the most common concern with this pattern is that the *connection* itself might perform a fresh DNS lookup. If the attacker can ensure the DNS record changes between the check and the connection such that the check sees Public but the connection sees Private?
+        - Wait, if the check sees Private, it returns early. So the check MUST see Public.
+        - If the connection sees Private, it tries to connect to Private.
+        - How can the connection see Private while the check saw Public?
+        - DNS TTLs. If the attacker updates DNS to point to Private IP, the check might fail (blocked). If the attacker updates DNS to point to Public IP, the check passes.
+        - Unless... the check uses a different mechanism or the connection ignores the previous resolution.
+        - In Java, `InetAddress.getByName` caches results sometimes, but `URL.openConnection()` triggers a new socket creation which involves DNS resolution.
+        - If the attacker manipulates the DNS server to return Public IP for the check, but the client machine (server running the app) has a stale cache or the attacker forces a refresh...
+        - Actually, the main risk flagged by CodeQL for this pattern is **DNS Rebinding**. Even if the check says "It's public", the connection might end up hitting an internal resource if the attacker can manipulate the DNS resolution during the short window or if the check is insufficiently robust (e.g. relying on localhost aliases).
+        - BUT, specifically, CodeQL's `java/ssrf` rule flags "Separate DNS resolution and outbound fetch".
+        - According to OWASP guidelines, verifying the IP address is necessary. Just verifying the hostname resolves to a non-private IP is good practice, but doing it separately from the connection allows for race conditions (DNS rebinding).
+        - Given the instruction: "**Borderline (BL) calibration** — when a reviewer needs context not in the snippet ... Apply **before** forcing **alert-TP** or **alert-FP**. Use **alert-unclear** ... when: 2. **DNS rebinding window** — Hostname is resolved in one step and a **separate** outbound HTTP/TCP request uses the hostname string. Without DNS TTL, resolver cache, and egress policy, label **alert-unclear**."
+        - This matches perfectly.
+        - Line 43: `resolveHost(host)`
+        - Line 45: `connectHttpByHostname(host)` (uses `host` string, triggering new DNS resolution potentially).
+        - The gap between resolution and connection creates a window where DNS could change, or the resolution mechanisms differ.
+        - Therefore, I should classify this alert as **alert-unclear** (BL) rather than TP, because proving exploitation requires knowledge of DNS TTL/cache policies not present in the code.
+        - Wait, let's re-read the BL criteria carefully.
+        - "Without DNS TTL, resolver cache, and egress policy, label **alert-unclear**."
+        - Yes. The code shows the separation. It does not show the TTL or cache status.
+        - While many security experts argue this is a real weakness (and thus TP), the instructions explicitly tell me to use **alert-unclear** for DNS rebinding windows where context is missing.
+        - Let's verify the "Resolved Sink Value" requirement.
+        - Sink: `connectHttpByHostname(host)`.
+        - Does `host` depend on user input? Yes (`param`).
+        - Is it mitigated? Partially (IP check).
+        - Is the mitigation sufficient? Instructions say: "If proving bypass requires deployment policy or environment facts not in the code, use **alert-unclear**, not **alert-TP** merely because bypass is theoretically possible."
+        - Proving the bypass (DNS rebinding) requires knowing if the DNS resolvers update fast enough or if the JVM caches aggressively. These are environment facts.
+        - Thus, **alert-unclear** is the correct classification per the provided policy.
+
+**Decision:**
+- Alert 1 (`ssrf`): **alert-unclear** due to DNS rebinding window (resolve then connect separated).
+- Case Level: Since no alert is TP, and at least one is unclear -> **BL**.
+
+**Wait, let me double check the "Resolved Sink Value" constraint.**
+- Step 3: Resolve sink value.
+- Sink: `connectHttpByHostname(host)`.
+- Path: `param` -> `host`.
+- Value: User controlled string.
+- Is it blocked? `if (isNonPublicAddress(resolveHost(host))) return;`.
+- If the check fails (returns true), we don't reach the sink.
+- If the check passes (returns false), we reach the sink.
+- On the path where we reach the sink, `host` is still user controlled.
+- The question is whether the mitigation prevents the vulnerability.
+- Policy says: "If proving bypass requires deployment policy or environment facts not in the code, use **alert-unclear**".
+- Bypass proof: Requires knowing if DNS TTL allows the record to change between check and connect.
+- Conclusion: Unclear.
+
+**Final Check:**
+- Rule ID: `java/ssrf`.
+- Message: "Separate DNS resolution and outbound fetch."
+- Evidence: Lines 43 and 45.
+- Reason: DNS rebinding window exists between resolution (L43) and connection (L45). Egress policy and DNS TTL unknown.
+- Label: BL.
+
+One detail: `isNonPublicAddress` checks `isLoopbackAddress() || ...`.
+If `resolveHost` returns a public IP, check passes.
+Then `connectHttpByHostname` opens connection.
+This is the classic "Verify IP then Connect" anti-pattern which is vulnerable to DNS rebinding.
+Since the instructions explicitly map this scenario to **BL** (Example 3 in few-shot is almost identical: `resolveHost` then `fetchHttpByHostname` labeled BL), I should align with that precedent.
+Example 3 (`BenchmarkTest26999`):
+- Pattern: `resolveHost` then `fetchHttpByHostname`.
+- Verdict: `alert-unclear`.
+- Reason: DNS rebinding and egress controls not visible.
+- My Case: Same pattern (`resolveHost` then `connectHttpByHostname`).
+- Verdict: Should be `alert-unclear` -> Case `BL`.
+
+Let's construct the JSON.
+Label: BL
+Confidence: medium
+Score: 0.55 (similar to example)
+Reason: Alert 1 alert-unclear: resolve-then-connect pattern — DNS rebinding and egress controls are not visible in code. Case BL.
+Evidence: Cite lines 43-45 showing the separation.
+
+Wait, looking at Example 3 again.
+Input:
+```java
+String host = param;
+if (isNonPublicAddress(resolveHost(host))) return;
+fetchHttpByHostname(host);
+```
+My Input:
+```java
+String host = param;
+if (isNonPublicAddress(resolveHost(host))) return;
+Thread.sleep(50);
+connectHttpByHostname(host);
+```
+Identical structure regarding the vulnerability. The `sleep` adds even more uncertainty/time window.
+So definitely BL.
+
+One small thing: The instructions say "Assess every alert... then assign one case-level label."
+I need to output the JSON.
+
+Structure:
+```json
+{
+  "label": "BL",
+  "confidence": "medium",
+  "confidence_score": 0.55,
+  "reason": "Alert 1 alert-unclear: resolve-then-connect pattern — DNS rebinding and egress controls are not visible in code. Case BL.",
+  "evidence": [
+    {
+      "file": "src/main/java/org/owasp/benchmark/testcode/BenchmarkTest28490.java",
+      "lines": "L43-L45",
+      "note": "resolveHost called at L43, connection at L45; DNS rebinding window exists"
+    }
+  ],
+  "agent": "llm",
+  "case_id": "BenchmarkTest28490"
+}
+```
+Check constraints:
+- No markdown fences.
+- Valid JSON.
+- Double quoted strings.
+- Escaped inner quotes if needed (none needed here).
+- Keys match schema.
+
+Double check the `confidence_score`. Example 3 had 0.55. I'll use similar.
+Double check `agent`. Must be "llm".
+Double check `case_id`. "BenchmarkTest28490".
+
+Ready.
+
+One consideration: Is there any chance this is TP?
+Some stricter interpretations consider this a definite flaw because the mitigation is fundamentally flawed (race condition). However, the prompt's specific guidance on "DNS rebinding window" explicitly directs to **alert-unclear** when TTL/cache info is missing.
+Quote: "Without DNS TTL, resolver cache, and egress policy, label **alert-unclear**."
+This overrides general intuition about severity. I must follow the prompt's triage policy strictly.
+
+Therefore, BL is the correct label according to the provided instructions.
+
+Final check on JSON syntax.
+Keys: label, confidence, confidence_score, reason, evidence, agent, case_id.
+Values: Strings.
+Evidence array with objects containing file, lines, note.
+All good.
+
+Wait, I should confirm the exact lines for evidence.
+`resolveHost(host)` is at line 43.
+`connectHttpByHostname(host)` is at line 45.
+Lines 43-45 cover both actions.
+Snippet:
+```java
+if (isNonPublicAddress(resolveHost(host))) return;
+Thread.sleep(50);
+connectHttpByHostname(host);
+```
+Yes, L43-L45 covers the critical path.
+
+One minor adjustment: The prompt asks for "short explanation grounded in concrete code evidence; cite which alert(s) drove the label".
+My reason: "Alert 1 alert-unclear: resolve-then-connect pattern — DNS rebinding and egress controls are not visible in code. Case BL."
+Matches Example 3 style.
+
+Okay, generating JSON.
+</think>
+
+{
+  "label": "BL",
+  "confidence": "medium",
+  "confidence_score": 0.55,
+  "reason": "Alert 1 alert-unclear: resolve-then-connect pattern — DNS rebinding and egress controls are not visible in code. Case BL.",
+  "evidence": [
+    {
+      "file": "src/main/java/org/owasp/benchmark/testcode/BenchmarkTest28490.java",
+      "lines": "L43-L45",
+      "note": "resolveHost called at L43, connection at L45; DNS rebinding window exists"
+    }
+  ],
+  "agent": "llm",
+  "case_id": "BenchmarkTest28490"
+}

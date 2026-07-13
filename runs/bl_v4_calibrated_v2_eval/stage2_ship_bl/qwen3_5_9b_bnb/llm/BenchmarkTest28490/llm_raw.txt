@@ -1,0 +1,189 @@
+The user wants me to triage a CodeQL SSRF alert for the provided Java file.
+
+**Task:**
+1.  Analyze the provided code and the specific alert.
+2.  Determine if the alert is True Positive (TP), False Positive (FP), Boundary/Likely (BL), or Unknown (UNKNOWN).
+3.  Output the result as a strict JSON object.
+
+**Analysis of the Code:**
+File: `src/main/java/org/owasp/benchmark/testcode/BenchmarkTest28490.java`
+
+Key methods:
+- `resolveHost(String host)`: Resolves a hostname to an InetAddress using `InetAddress.getByName(host)`.
+- `fetchHttpByHostname(String host)`: Opens a URL stream using `new java.net.URL("http://" + host + "/api").openStream()`.
+- `connectHttpByHostname(String host)`: Opens a connection using `new java.net.URL("http://" + host).openConnection().connect()`.
+- `openUrlByHostname(String host)`: Opens a URL stream using `new java.net.URL("https://" + host + "/health").openStream()`.
+
+Main Logic (`doPost`):
+1.  Gets `param` from request parameter "BenchmarkTest". Defaults to empty string if null.
+2.  Assigns `host = param`.
+3.  Calls `resolveHost(host)`. Stores result in `addr`.
+4.  Checks `isNonPublicAddress(addr)`. If true, returns early.
+5.  Calls `addr.getHostName()` (unused result).
+6.  Calls `openUrlByHostname(host)`.
+
+**Alert Details:**
+- Rule ID: `java/ssrf`
+- Message: "Separate DNS resolution and outbound fetch."
+- Sink Location: Line 45 (`openUrlByHostname(host)`).
+
+**Triage Steps:**
+
+1.  **Scope & Trace:** The alert flags a potential SSRF. The concern is typically that user input (`param`) flows into a network call without proper validation.
+2.  **Data Flow:**
+    - User Input -> `request.getParameter("BenchmarkTest")` -> `param`.
+    - `param` -> `host` (variable assignment).
+    - `host` -> `resolveHost(host)` (used for checking if address is non-public).
+    - `host` -> `openUrlByHostname(host)` (actual network call).
+3.  **Sink Expression:** `openUrlByHostname(host)` calls `new java.net.URL("https://" + host + "/health").openStream()`.
+4.  **Resolved Value:** The value passed to the URL constructor is `host`, which comes directly from `param` (user input).
+5.  **Mitigation Check:**
+    - There is a check: `if (isNonPublicAddress(addr)) return;`.
+    - `addr` is derived from `resolveHost(host)`.
+    - `isNonPublicAddress` checks `isLoopbackAddress()`, `isSiteLocalAddress()`, `isLinkLocalAddress()`, `isAnyLocalAddress()`.
+    - It effectively blocks requests targeting localhost, link-local, site-local, or any-local addresses.
+    - However, standard SSRF protections usually require blocking *internal* IPs (like 10.x.x.x, 192.168.x.x, 172.16.x.x - Site Local) AND loopbacks.
+    - Does `isNonPublicAddress` cover enough ground?
+        - `isLoopbackAddress`: 127.0.0.0/8 ::1
+        - `isSiteLocalAddress`: 10.0.0.0/8, 172.16.0.0/12, fc00::/7
+        - `isLinkLocalAddress`: 169.254.0.0/16, fe80::/10
+        - `isAnyLocalAddress`: 0.0.0.0 ::
+    - Missing checks often cited in SSRF contexts: Cloud metadata endpoints (169.254.169.254 is Link Local, so covered?), Internal services accessible via external interfaces.
+    - Crucially, the check happens *on the resolved IP*. If I provide a hostname like `localhost`, `resolveHost` resolves it to 127.0.0.1. `isNonPublicAddress` returns true. Request blocked.
+    - If I provide `127.0.0.1` directly as the string? `resolveHost` handles numeric strings too.
+    - Is there a way to bypass this?
+        - If the application runs behind a load balancer or proxy, the internal IP might differ. But we analyze based on the code logic.
+        - Can an attacker force the DNS resolution to point to an internal IP while appearing external? Yes, DNS spoofing/poisoning is outside the scope of the code analysis generally, unless the code explicitly trusts a specific DNS provider. Here it uses the system resolver.
+        - More importantly, the check relies on the OS resolving the hostname. If the attacker provides a hostname that resolves to an internal IP (which they might know how to manipulate or guess), the check passes.
+        - Wait, look closely at the condition: `if (isNonPublicAddress(addr)) return;`.
+        - If `addr` IS non-public (loopback/site/link/any), it RETURNS (blocks).
+        - So if `addr` is PUBLIC, execution continues to `openUrlByHostname(host)`.
+        - This means if the user supplies a hostname that resolves to a public IP, the check fails (returns false), allowing the request to proceed.
+        - Standard SSRF vectors involve accessing cloud metadata (often 169.254.169.254). That is a Link Local Address. `isLinkLocalAddress` covers that.
+        - Accessing local intranet resources (10.x.x.x)? Covered by `isSiteLocalAddress`.
+        - Accessing localhost? Covered by `isLoopbackAddress`.
+        - So, strictly speaking, the code attempts to mitigate SSRF by validating the resolved IP against known private ranges.
+        - However, CodeQL's `java/ssrf` rule specifically looks for "Separate DNS resolution and outbound fetch". This pattern is inherently risky because the validation happens on the *IP*, but the fetch happens on the *hostname*.
+        - Why is this flagged? Because even though the code validates the IP, it constructs the URL using the original `host` string.
+        - Scenario: Attacker provides `evil.com`. System resolves `evil.com` to `1.2.3.4` (public). `isNonPublicAddress` returns false. Fetch proceeds to `http://evil.com/api`. This is fine.
+        - Scenario: Attacker provides `127.0.0.1`. `resolveHost` gets 127.0.0.1. `isNonPublicAddress` returns true. Blocked.
+        - Scenario: Attacker provides `localdomain.local`. Resolves to 10.0.0.5. Blocked.
+        - Scenario: Attacker provides `metadata.google.internal`. Resolves to 169.254.169.254. Blocked.
+        - Is there a gap?
+            - Some environments have "Private" IPs that aren't caught by these standard checks (rare).
+            - IPv6 mapping issues?
+            - Most critically, the rule `java/ssrf` triggers on the pattern itself ("Separate DNS resolution..."). Even if there is a check, if the check isn't perfect or if the rule considers the separation itself suspicious without a stronger guarantee (like binding to a whitelist), it might flag it.
+            - BUT, my job is to determine if it's a real vulnerability (TP) or a false positive (FP).
+            - In many benchmark datasets (OWASP Benchmark), tests designed to demonstrate vulnerabilities often lack robust protection. Tests designed to demonstrate fixes often implement them correctly.
+            - Let's look at the OWASP Benchmark Test naming convention. Usually `BenchmarkTestXXXXX` implies part of the benchmark suite. Often these test cases are meant to be vulnerable to demonstrate detection capabilities, OR they are fixed versions.
+            - Looking at similar benchmarks (Example 1 was XSS, Example 2 was SQLi).
+            - In this specific file `BenchmarkTest28490`, let's evaluate the effectiveness of the check.
+            - The check `isNonPublicAddress` prevents access to Loopback, SiteLocal, LinkLocal, AnyLocal.
+            - These cover almost all standard private networks defined in RFC standards.
+            - However, SSRF attacks often target cloud metadata services. AWS EC2 metadata is at `169.254.169.254`. This is Link Local. `isLinkLocalAddress` catches it. Azure is `169.254.169.254`. GCE is `169.254.169.254`.
+            - What about `http://<ip>:<port>`? The code concatenates `"http://" + host + "/api"`. If host is an IP, it works.
+            - Is there a scenario where `resolveHost` succeeds but the resulting IP is not detected as non-public?
+            - Maybe if the machine has multiple NICs and the routing table allows reaching internal IPs via a public interface? The check `isNonPublicAddress` just checks the properties of the `InetAddress` object returned by the OS. It doesn't check reachability or routing.
+            - However, if the IP is truly "site local" (RFC 1918), it shouldn't be routable externally anyway.
+            - The main weakness in such implementations is often that `InetAddress.getByName` might resolve a hostname to something unexpected, or the definition of "non-public" is insufficient.
+            - But wait, looking at the code structure again.
+            - `String host = param;`
+            - `java.net.InetAddress addr = resolveHost(host);`
+            - `if (isNonPublicAddress(addr)) return;`
+            - `openUrlByHostname(host);`
+            - Note that `openUrlByHostname` uses `host` (the string), not `addr`.
+            - If `host` is a hostname that resolves to a public IP, it goes through.
+            - If `host` is a hostname that resolves to a private IP, it is blocked.
+            - This seems like a reasonable attempt at mitigation.
+            - However, CodeQL `java/ssrf` rule description says "Separate DNS resolution and outbound fetch". This rule generally assumes that relying on DNS resolution followed by fetching is dangerous because of DNS rebinding attacks.
+            - Even with the IP check, if the attacker knows the internal IP of a service (e.g., `10.0.0.5`), they can pass that IP directly as the string `host`.
+            - `resolveHost("10.0.0.5")` returns an InetAddress representing 10.0.0.5.
+            - `isNonPublicAddress` will identify 10.0.0.5 as SiteLocal.
+            - The check `if (isNonPublicAddress(addr)) return;` executes. Since it is non-public, it returns.
+            - So direct IP injection is also blocked by this logic.
+            - Are there edge cases?
+            - What if the attacker provides a hostname that resolves to a public IP, but the content served redirects to an internal resource? That's a redirect attack, not directly prevented here, but the initial fetch is to a public IP.
+            - What if the attacker provides a hostname that resolves to a public IP, but the server is configured to forward traffic?
+            - From a purely code-analysis perspective regarding the specific rule `java/ssrf`:
+            - The rule warns about the pattern. The presence of the check makes it less likely to be a high-confidence exploit, but does it make it a False Positive?
+            - Many SAST tools flag this pattern as SSRF regardless of the check because the check is considered potentially bypassable (e.g. via DNS rebinding if the check is done once and the fetch happens later, or if the check misses some private ranges).
+            - Specifically, the check is performed *once* on the resolved IP. Then the fetch happens using the *original hostname*.
+            - If the attacker performs a DNS rebinding attack:
+                1. Attacker sets up a domain `victim.com`.
+                2. Initially resolves to Public IP `A`.
+                3. App checks `A`, sees it's public, allows request.
+                4. App fetches `http://victim.com`.
+                5. Victim's browser/server resolves `victim.com` locally (client-side DNS caching?) to Private IP `B`.
+                6. The app connects to `B`.
+            - Wait, the code does `resolveHost(host)` immediately before the check. And `openUrlByHostname(host)` immediately after.
+            - If the attacker controls the DNS entry for `host`, they could set it to a public IP initially. The app resolves it, sees public, proceeds.
+            - But the actual connection is made to the hostname provided. The underlying TCP/IP stack will perform a lookup again during the connection phase (unless cached).
+            - If the attacker changes the DNS record between the time the app checked the IP and the time the socket connected, the connection could go to a private IP.
+            - This is the classic "DNS Rebinding" vector.
+            - Given the instruction: "**Borderline (BL) calibration — when a reviewer needs context not in the snippet** ... 2. **DNS rebinding window** — Hostname is resolved in one step and a **separate** outbound HTTP/TCP request uses the hostname string. Without DNS TTL, resolver cache, and egress policy, label **alert-unclear**."
+            - This matches perfectly.
+            - Step 1: `resolveHost(host)` -> `addr`.
+            - Step 2: `openUrlByHostname(host)` -> Uses `host` string.
+            - Between these two steps, the DNS resolution for `host` could change (TTL expiration, dynamic update).
+            - The check verifies the *initially resolved* IP. The fetch uses the *live* resolution of the hostname.
+            - Therefore, the mitigation is susceptible to DNS rebinding.
+            - According to the instructions: "Without DNS TTL, resolver cache, and egress policy, label **alert-unclear**."
+            - Also: "If the pattern is suggested but the **resolved sink value** is not established → **alert-unclear**." (Not applicable here, resolved value is clearly user input).
+            - "Do not upgrade to **alert-TP** only because user input reaches the sink when a non-trivial mitigation or trust boundary is in play — prove exploitable on the executed path **or** mark **alert-unclear**."
+            - The mitigation (IP check) is present but vulnerable to DNS rebinding. Proving exploitation requires knowing the DNS behavior/environment (TTL, caching).
+            - Thus, the alert should be labeled **alert-unclear**.
+            - Consequently, the case level label should be **BL**.
+
+Let's double check the "Resolved Sink Value" requirement.
+- Sink: `new java.net.URL("https://" + host + "/health").openStream()`
+- Variable: `host`.
+- Origin: `param` (User Input).
+- Path: `param` -> `host` -> `URL`.
+- Intermediate: `resolveHost(host)` is called, but `host` variable is not reassigned.
+- So `host` remains user controlled throughout.
+- The check `if (isNonPublicAddress(addr)) return;` guards the *execution path*, preventing the sink from being reached IF the IP is private.
+- But since DNS rebinding is possible (as per the BL calibration guidelines), the path is reachable under certain conditions (DNS manipulation).
+- Since I am instructed to label **alert-unclear** for DNS rebinding windows where TTL/cache info is missing, I should follow that.
+
+Wait, let's review the "Few-shot examples" for BL.
+- Example 3 (SSRF): "Alert 1 alert-unclear: resolve-then-fetch pattern — DNS rebinding and egress controls are not visible in code. Case BL."
+- My current case is almost identical to Example 3.
+- Example 3 had `resolveHost(host)` then `fetchHttpByHostname(host)`.
+- My case has `resolveHost(host)` then `openUrlByHostname(host)`.
+- Both exhibit the "Resolve then Fetch" pattern.
+- Both have a check on the resolved IP (`isNonPublicAddress`).
+- Example 3 didn't seem to have the explicit check in the snippet provided in the example description (it showed `if (isNonPublicAddress(resolveHost(host))) return;` in the note, wait, let me check Example 3 source).
+- Example 3 Source Excerpt:
+  ```java
+  String host = param;
+  if (isNonPublicAddress(resolveHost(host))) return;
+  fetchHttpByHostname(host);
+  ```
+- Wait, Example 3 source *does* have the check!
+- And Example 3 was labeled **BL**.
+- Reason: "Alert 1 alert-unclear: resolve-then-fetch pattern — DNS rebinding and egress controls are not visible in code. Case BL."
+- My case follows the exact same pattern.
+- Therefore, following the precedent of Example 3, this should be **BL**.
+
+Let's verify the code in my case again.
+Lines 40-45 roughly:
+```java
+String host = param;
+java.net.InetAddress addr = resolveHost(host);
+if (isNonPublicAddress(addr)) return;
+addr.getHostName();
+openUrlByHostname(host);
+```
+Yes, it matches the pattern of Example 3 exactly (Resolve -> Check -> Fetch).
+Since Example 3 was marked BL due to DNS rebinding uncertainty despite the check, I should mark this as BL as well.
+
+Confidence Score: High/Medium?
+Given the strong alignment with Example 3 (a few-shot training example), confidence should be high.
+However, the instruction says "Do not match by superficial similarity". I need to ensure the logic holds.
+Logic:
+1. User input `param` becomes `host`.
+2. `host` is used to resolve IP `addr`.
+3. `addr` is checked for privacy.
+4. `host` is used to fetch URL.
+5. Risk: DNS Rebinding. Attackers can change DNS records between check and fetch.
+6. Instruction: "Without DNS TTL, resolver cache, and egress policy, label

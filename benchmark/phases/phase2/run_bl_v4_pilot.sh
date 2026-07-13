@@ -42,7 +42,7 @@ echo "[2/4] Publish pilot corpus" | tee -a "$LOG"
 uv run python "$ROOT/benchmark/build_bl_v4_pilot_corpus.py" \
   --pilot-root "$DATASET/BenchmarkJava/borderline_pilot" 2>&1 | tee -a "$LOG"
 
-N="$(find "$CORPUS" -maxdepth 1 -name 'BLv4p*.json' | wc -l | tr -d ' ')"
+N="$(find "$CORPUS" -maxdepth 1 -name 'BenchmarkTest*.json' | wc -l | tr -d ' ')"
 echo "[pilot] $N synthetic cases in $CORPUS" | tee -a "$LOG"
 
 FORCE_ARGS=()

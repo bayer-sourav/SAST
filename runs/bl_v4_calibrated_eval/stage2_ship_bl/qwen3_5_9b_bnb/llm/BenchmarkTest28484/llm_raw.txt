@@ -1,0 +1,218 @@
+The user wants me to act as a security-oriented SAST triage assistant. I need to analyze the provided Java code and the SSRF alert to determine if it's a True Positive (TP), False Positive (FP), Borderline (BL), or Unknown (UNKNOWN).
+
+**Task Breakdown:**
+1.  **Analyze the Alert:**
+    *   **Rule ID:** `java/ssrf`
+    *   **Message:** "Separate DNS resolution and outbound fetch."
+    *   **Sink Location:** Line 29 (`new java.net.URL("https://" + name + "/health").openStream()`).
+    *   **Data Flow Path:** User Input -> `request.getParameter("BenchmarkTest")` -> `param` -> `name` -> `InetAddress.getByName(name)` AND `URL(...)` using `name`.
+
+2.  **Assess the Sink Expression:**
+    *   The sink is `new java.net.URL("https://" + name + "/health").openStream()`.
+    *   The URL constructed includes `name`.
+    *   `name` comes directly from `request.getParameter("BenchmarkTest")` assigned to `param`, then reassigned to `name`.
+    *   There is a check `if (isNonPublicAddress(addr)) return;` where `addr` is derived from `name` via `InetAddress.getByName(name)`.
+
+3.  **Determine Resolved Sink Value:**
+    *   Does the check `isNonPublicAddress(addr)` guarantee safety?
+    *   `isNonPublicAddress` checks `isLoopbackAddress()`, `isSiteLocalAddress()`, `isLinkLocalAddress()`, `isAnyLocalAddress()`.
+    *   It allows external addresses (public IPs, domain names resolving to them).
+    *   However, there is a known issue with SSRF protections based on IP address validation:
+        *   **IP Spoofing/Rebinding:** An attacker could provide a hostname that resolves to a local/internal IP initially, or leverage DNS rebinding attacks.
+        *   **Hostname Resolution Timing:** The code resolves `name` into an `InetAddress` object (`addr`). Then it calls `addr.getHostName()`. But crucially, the `URL` construction happens later using the original `name` string, not the resolved IP.
+        *   Wait, let's look closer at the code structure.
+        ```java
+        String name = param;
+        java.net.InetAddress addr = java.net.InetAddress.getByName(name);
+        if (isNonPublicAddress(addr)) return;
+        addr.getHostName(); // Unused result mostly
+        java.io.InputStream in = new java.net.URL("https://" + name + "/health").openStream();
+        ```
+    *   The protection relies on checking if the resolved IP address is non-public.
+    *   If `name` is a hostname like `evil.com`, `getByName` might resolve it to an IP. If that IP is public, the check passes.
+    *   If `name` is an IP address like `127.0.0.1`, the check fails.
+    *   **Problem:** DNS Rebinding. An attacker can register a domain that resolves to a public IP (passing the check) but then changes the DNS record to point to an internal resource (like `localhost` or `192.168.x.x`) *after* the initial DNS lookup performed by `InetAddress.getByName(name)`. Since the actual connection happens via `new java.net.URL("https://" + name + ...)` which performs a *second* DNS lookup, the attacker can exploit the time between the two lookups.
+    *   Also, simply passing a hostname that resolves to a public IP allows accessing that public service. While standard SSRF usually refers to accessing internal resources, accessing arbitrary public services via user control is often considered risky depending on definition, but specifically here, the concern is reaching internal systems.
+    *   Is the resolved sink value attacker-controlled? Yes, `name` is controlled by the user parameter.
+    *   Is there effective mitigation? The mitigation attempts to block direct IP access to localhost/private ranges. However, it does not prevent DNS rebinding or hostnames pointing to public IPs that might redirect traffic or have subdomains pointing elsewhere. More importantly, relying on `InetAddress.getByName` followed by connecting via the original string is vulnerable to DNS rebinding.
+    *   Furthermore, even if we ignore DNS rebinding nuances, allowing user-supplied hostnames to open streams is generally flagged as SSRF unless strict allowlisting or binding checks are done.
+    *   Let's evaluate the specific "Separate DNS resolution and outbound fetch" warning. This specific CodeQL rule triggers when there's a distinct call to resolve a name and then a subsequent network operation using that name.
+    *   In this code:
+        1.  `InetAddress addr = InetAddress.getByName(name);` (Resolution)
+        2.  `new java.net.URL("https://" + name + "/health").openStream();` (Fetch)
+    *   These are indeed separate operations.
+    *   The mitigation attempt (`isNonPublicAddress`) validates the *first* resolution.
+    *   As noted in the "Borderline (BL) calibration" section: "DNS rebinding window — Hostname is resolved in one step and a separate outbound HTTP/TCP request uses the hostname string. Without DNS TTL, resolver cache, and egress policy, label alert-unclear."
+    *   Here, the code explicitly separates the resolution (`getByName`) from the usage (`URL` constructor). Even though they happen sequentially in the same thread, the underlying OS/DNS resolvers might behave differently or the attacker can manipulate DNS records between these calls.
+    *   Specifically, `InetAddress.getByName` caches results sometimes, but `URL.openConnection` (internally called by `openStream`) will perform its own DNS resolution.
+    *   Therefore, the check `isNonPublicAddress(addr)` prevents immediate access to loopback/private IPs *as resolved at that moment*. But since the actual connection uses `name` again, if the DNS record changes between line 23 and line 29, the connection goes somewhere else.
+    *   Given the instruction: "**DNS rebinding window**... Without DNS TTL, resolver cache, and egress policy, label **alert-unclear**."
+    *   This fits perfectly. We don't know the DNS configuration or caching behavior outside the code snippet.
+    *   So, Alert 1 should likely be **alert-unclear**.
+
+4.  **Wait, let's reconsider the "Resolved Sink Value".**
+    *   The sink is the stream opened by the URL.
+    *   The URL string is `"https://" + name + "/health"`.
+    *   `name` is user input.
+    *   So the sink value is definitely dependent on user input.
+    *   Is it exploitable?
+    *   Standard SSRF definition: Accessing internal resources.
+    *   The code tries to mitigate internal access by checking the resolved IP against private ranges.
+    *   If the mitigation works (i.e., `name` resolves to a public IP), is it still an SSRF? Usually, SSRF implies reaching *internal* assets. If the user forces a request to a public asset, is that an SSRF? Often yes, in broader contexts (outbound requests to arbitrary hosts), but strictly speaking, SSRF vulnerabilities are about unauthorized access to internal networks.
+    *   However, the CodeQL rule `java/ssrf` specifically flags "Separate DNS resolution and outbound fetch". This suggests the tool considers the separation itself suspicious, implying potential for redirection to internal targets despite the check.
+    *   The "Borderline" instructions say: "If proving bypass requires deployment policy or environment facts not in the code, use alert-unclear". Proving that DNS rebinding isn't happening requires knowing DNS TTL/cache policies.
+    *   Therefore, **alert-unclear** seems appropriate for the specific mechanism described in the calibration guidelines regarding DNS rebinding windows.
+
+5.  **Let's check if there's a stronger argument for TP.**
+    *   Some interpretations argue that if the check `isNonPublicAddress` passes, the request is made to a public IP. If the goal is just preventing access to internal IPs, and the check ensures the *initial* resolution was public, maybe it's safe enough?
+    *   But wait, `InetAddress.getByName` resolves the hostname. If the attacker provides `example.com`, it resolves to `X.X.X.X`. Check passes. Connection opens to `example.com`. This is technically allowed by the code. Is this a vulnerability?
+    *   If the application shouldn't make outbound connections at all, this is a violation.
+    *   If the application is supposed to allow fetching health checks from trusted domains, but users can inject arbitrary ones, it's a vulnerability.
+    *   The benchmark test naming convention `BenchmarkTest28484` suggests this is part of the OWASP Benchmark suite.
+    *   Looking at similar benchmarks (e.g., BenchmarkTest26999 in the few-shot example), they often involve DNS rebinding scenarios labeled as BL.
+    *   However, looking closely at the code:
+        ```java
+        if (isNonPublicAddress(addr)) return;
+        ```
+        This returns early if the address IS non-public (loopback, site-local, link-local, any-local).
+        So it proceeds ONLY IF the address IS PUBLIC.
+        This means it explicitly allows public internet access.
+        Is allowing public internet access an SSRF vulnerability?
+        Strictly, SSRF is about accessing *internal* resources. If the app is designed to talk outwards, this might be intended functionality (fetching health checks).
+        BUT, the fact that it takes user input to decide WHERE to go makes it potentially dangerous if the user can force it to a malicious internal resource via DNS rebinding.
+        Or, if the intention is to restrict access to specific whitelisted URLs, this is a failure.
+        Without context on whether outbound requests are allowed, we assume standard web app constraints where user-controlled destination is risky.
+        
+        However, the most critical factor here is the **DNS Rebinding Window** guideline provided in the prompt instructions.
+        Instruction: "DNS rebinding window — Hostname is resolved in one step and a separate outbound HTTP/TCP request uses the hostname string. Without DNS TTL, resolver cache, and egress policy, label **alert-unclear**."
+        
+        The code clearly exhibits this pattern:
+        1. Resolve `name` to `addr`.
+        2. Validate `addr`.
+        3. Fetch using `name` (which triggers a NEW resolution).
+        
+        Because the verification happens on the resolved IP, but the connection happens on the hostname (triggering a second resolution), the gap allows for DNS rebinding.
+        According to the specific instructions for this task ("Borderline (BL) calibration"), this scenario maps to **alert-unclear**.
+        
+        Since there is only one alert, and it is unclear, the case level should be **BL**.
+
+6.  **Double Check Evidence:**
+    *   Lines involved:
+        *   `String name = param;` (User input capture)
+        *   `java.net.InetAddress addr = java.net.InetAddress.getByName(name);` (First resolution)
+        *   `if (isNonPublicAddress(addr)) return;` (Check)
+        *   `java.io.InputStream in = new java.net.URL("https://" + name + "/health").openStream();` (Second resolution/fetch)
+    *   Reasoning: The code resolves the hostname once to validate the IP, but connects using the original hostname string. This creates a window for DNS rebinding where the hostname could resolve to a different (potentially internal) IP during the actual connection phase. The code lacks visibility into DNS caching/policies required to confirm safety. Thus, alert-unclear.
+
+7.  **Final Decision:**
+    *   Alert Verdict: Unclear (due to DNS rebinding window).
+    *   Case Level: BL (Since no TP, and at least one Unclear).
+    *   Confidence: Medium (Standard interpretation of the rule vs the specific guidance).
+    *   Score: ~0.55 (Similar to Example 3).
+
+    Wait, I need to ensure I follow the "Resolved Sink Value" requirement.
+    Step 3 says: "Resolve sink value (mandatory)... Required when the sink reads from a list/map/dict... or a branch..."
+    Here, the sink is the `InputStream` created by `URL`. The value flowing into it is `name`.
+    The "Resolved Sink Value" is effectively `name` (the user input string).
+    Why is it unclear? Not because the value is unknown, but because the *mitigation effectiveness* is uncertain due to the timing difference between resolution and fetch.
+    Actually, the instruction says: "alert-unclear: genuine ambiguity (unresolved sink value, unproved structural FP, partial mitigation)."
+    And "DNS rebinding window... label alert-unclear".
+    So I classify the alert as Unclear.
+    
+    Wait, looking at the "Label definitions":
+    - TP: At least one alert is alert-TP.
+    - FP: Every alert is alert-FP.
+    - BL: No alert is alert-TP, and at least one is alert-unclear.
+    
+    My analysis leads to BL.
+
+    One nuance: Is this actually a TP?
+    Many SSRF scanners flag this as TP because the mitigation is flawed. The flaw is DNS rebinding.
+    However, the prompt explicitly gives me a guideline for handling DNS rebinding windows: "Without DNS TTL, resolver cache, and egress policy, label alert-unclear."
+    This overrides my general intuition that "it's probably a bug". I must follow the provided triage policy.
+    Policy: "DNS rebinding window... label alert-unclear."
+    So I must label the alert as Unclear.
+    Consequently, the case label is BL.
+
+    Let's verify the "Resolved Sink Value" note.
+    "Before any alert-FP or final verdict, state the resolved sink value... Walk the taken branch... What value does that produce?"
+    The sink is the URL string passed to `openStream`.
+    The value is `name`.
+    `name` is `param`.
+    `param` is `request.getParameter("BenchmarkTest")`.
+    So the resolved sink value is `request.getParameter("BenchmarkTest")`.
+    This is attacker-controlled.
+    However, the uncertainty lies in the *execution path safety*, not the value itself.
+    The instruction says: "alert-unclear: genuine ambiguity... partial mitigation."
+    So I will report the value is attacker-controlled but the mitigation status is unclear due to DNS rebinding.
+
+    Wait, re-reading the "Resolved Sink Value" section carefully:
+    "alert-FP only if you can name the resolved sink value as a literal constant or non-user string on that path."
+    "alert-TP when the resolved sink value still depends on user/attacker input on the executed path."
+    "If you cannot compute the resolved value -> alert-unclear".
+    
+    Okay, I CAN compute the resolved value. It is `name` (derived from user input).
+    So strictly following step 3, it looks like TP candidate.
+    BUT Step 5 says: "Mitigate on this path... Balanced rule: do not auto-label alert-FP because a sanitizer or encoder appears... prefer alert-TP."
+    AND the Calibration section says: "DNS rebinding window... label alert-unclear".
+    This calibration applies "Before forcing alert-TP or alert-FP".
+    So the priority order is:
+    1. Compute Value.
+    2. Check Structural FP.
+    3. Check Mitigation.
+    4. Apply Calibration (Unclear conditions).
+    
+    Since the calibration condition (DNS rebinding window) matches the code pattern exactly, I must apply `alert-unclear`.
+    This pushes the case to BL.
+
+    Structure of JSON:
+    - label: "BL"
+    - confidence: "medium"
+    - confidence_score: 0.55
+    - reason: Explain the DNS rebinding window causing the mitigation to be unverifiable.
+    - evidence: Cite the lines showing resolution and fetch.
+
+    Let's draft the reason.
+    "Alert 1 alert-unclear: Separate DNS resolution (`InetAddress.getByName`) and fetch (`URL.openStream`) create a DNS rebinding window. The mitigation checks the initial resolved IP, but the connection uses the original hostname string, allowing potential redirection to internal resources between lookups. Egress policy and DNS TTL details are not visible in code. Case BL: no alert-TP, at least one alert-unclear."
+
+    Double check the file path.
+    `src/main/java/org/owasp/benchmark/testcode/BenchmarkTest28484.java`
+    Lines:
+    - Param extraction: L23
+    - Name assignment: L24
+    - GetByName: L25
+    - Check: L26
+    - Fetch: L29
+    
+    Wait, looking at the raw input provided in the prompt:
+    ```java
+    String param = request.getParameter("BenchmarkTest");
+    if (param == null) param = "";
+    String name = param;
+    java.net.InetAddress addr = java.net.InetAddress.getByName(name);
+    if (isNonPublicAddress(addr)) return;
+    addr.getHostName();
+    java.io.InputStream in = new java.net.URL("https://" + name + "/health").openStream();
+    ```
+    Line numbers in the raw input snippet:
+    1 | package ...
+    2 | import ...
+    ...
+    17 | private static boolean isNonPublicAddress...
+    18 | ...
+    22 | ...
+    23 | protected void doPost...
+    24 | ...
+    25 | String param = request.getParameter("BenchmarkTest");
+    26 | if (param == null) param = "";
+    27 | String name = param;
+    28 | java.net.InetAddress addr = java.net.InetAddress.getByName(name);
+    29 | if (isNonPublicAddress(addr)) return;
+    30 | addr.getHostName();
+    31 | java.io.InputStream in = new java.net.URL("https://" + name + "/health").openStream();
+    
+    Wait, the provided snippet in the prompt has slightly different line numbering than the raw JSON location info.
+    Raw JSON location: `startLine: 29`.
+    Snippet provided in text:
+    Line 29 in the text snippet corresponds to `if (isNonPublicAddress(addr)) return;`.
+    Line

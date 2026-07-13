@@ -1,0 +1,184 @@
+The user wants me to act as a security-oriented SAST triage assistant. I need to analyze the provided CodeQL alert and determine if it's a True Positive (TP), False Positive (FP), Benign/Likely False Positive (BL), or Unknown.
+
+**Task Breakdown:**
+1.  **Analyze the Alert:**
+    *   **Rule ID:** `java/sql-injection`
+    *   **Message:** "Dynamic SQL stored on request; execution gated by servlet context flag."
+    *   **Sink Location:** Line 36 in `BenchmarkTest28612.java`.
+    *   **File Content:** Provided in the prompt.
+
+2.  **Examine the Code:**
+    ```java
+    package org.owasp.benchmark.testcode;
+
+    import java.io.IOException;
+    import javax.servlet.ServletException;
+    import javax.servlet.annotation.WebServlet;
+    import javax.servlet.http.HttpServlet;
+    import javax.servlet.http.HttpServletRequest;
+    import javax.servlet.http.HttpServletResponse;
+
+    @WebServlet(value = "/sqli-01/BenchmarkTest28612")
+    public class BenchmarkTest28612 extends HttpServlet {
+        private static final long serialVersionUID = 1L;
+
+    static final class PendingSql {
+        static void maybeRun(javax.servlet.http.HttpServletRequest req, String sql) {
+            Object enabled = req.getServletContext().getAttribute("sql.exec.enabled");
+            if (!Boolean.TRUE.equals(enabled)) return;
+            java.sql.Connection con = (java.sql.Connection) req.getAttribute("dbConn");
+            if (con == null) return;
+            try {
+                java.sql.Statement st = con.createStatement();
+                st.executeUpdate(sql); // Sink line 36
+            } catch (java.sql.SQLException ignored) { }
+        }
+    }
+
+        @Override
+        protected void doPost(HttpServletRequest request, HttpServletResponse response)
+                throws ServletException, IOException {
+            response.setContentType("text/html;charset=UTF-8");
+            String param = request.getParameter("BenchmarkTest");
+            if (param == null) param = "";
+            String q = "UPDATE accounts SET note='" + param + "' WHERE id=1"; // Source construction
+            request.setAttribute("pendingSql", q);
+            PendingSql.maybeRun(request, q); // Call to maybeRun passing q
+            response.getWriter().println("accepted");
+        }
+    }
+    ```
+
+3.  **Data Flow Analysis:**
+    *   **Source:** `request.getParameter("BenchmarkTest")` -> assigned to `param`.
+    *   **Construction:** `String q = "UPDATE accounts SET note='" + param + "' WHERE id=1";`
+    *   **Flow:** `q` is constructed using `param`.
+    *   **Pass-through:** `PendingSql.maybeRun(request, q)` passes `q` into the static method.
+    *   **Inside `maybeRun`:** The parameter `sql` receives `q`.
+    *   **Sink:** `st.executeUpdate(sql);` executes the SQL statement directly using the `sql` string. There is no prepared statement usage here (like `PreparedStatement`). It concatenates strings directly into the command sent to the database driver.
+
+4.  **Assessment Steps:**
+    *   **Step 1: Scope.** Rule is `sql-injection`. Sink is `executeUpdate(sql)`. This matches the definition of SQL injection (dynamic SQL execution).
+    *   **Step 2: Trace to sink.** User input `param` flows into `q`, which flows into `sql`, which is executed at the sink.
+    *   **Step 3: Resolve sink value.** On the executed path (which is the main entry point `doPost`), `q` contains `"UPDATE accounts SET note='" + param + "'..."`. Since `param` comes from `request.getParameter`, it is attacker-controlled. Therefore, the resolved sink value depends on user input.
+    *   **Step 4: Structural FP?** Is there a guard that makes it safe?
+        *   Inside `maybeRun`, there is a check: `Object enabled = req.getServletContext().getAttribute("sql.exec.enabled"); if (!Boolean.TRUE.equals(enabled)) return;`.
+        *   However, the alert says "execution gated by servlet context flag". This implies the flag might control whether the code runs. But looking at the code structure:
+            *   In `doPost`, `PendingSql.maybeRun(request, q)` is called unconditionally.
+            *   Inside `maybeRun`, the check happens.
+            *   Does the application set this attribute? The code snippet provided does *not* show where `sql.exec.enabled` is set. Usually, in OWASP Benchmark tests, these flags are often set dynamically or assumed to be controlled by the test harness/admin.
+            *   Crucially, even if the flag prevents execution in some scenarios, the vulnerability exists in the code path where the flag allows execution. The SAST tool reports the vulnerability based on the potential for injection.
+            *   More importantly, standard SQL injection analysis focuses on whether user input reaches the DB call unsanitized/prepared. Here, `param` goes straight into `q` which goes straight into `executeUpdate`.
+            *   The presence of a boolean flag `enabled` does not sanitize the input. It just gates execution. Even if `enabled` is true, the injection vector remains open.
+            *   Unless we know for certain that `sql.exec.enabled` is hardcoded to `false` or never set to `true` in production, we cannot assume it's safe. In benchmark contexts, usually, the goal is to demonstrate vulnerabilities.
+            *   Wait, let's look closer at the specific instruction regarding "gated by servlet context flag". The alert message itself acknowledges this gating ("execution gated by...").
+            *   However, my job is to verify if the *vulnerability exists*. If the flag is `false`, the code returns early. If the flag is `true`, the code executes. An attacker could potentially manipulate the context attribute (if they have access to the servlet context attributes, though typically hard to do client-side). Or, simply, the existence of the flag means the code *can* run.
+            *   Standard practice for SAST triage: If user input reaches a dynamic SQL executor, it is a TP unless proven otherwise (e.g., PreparedStatements). The fact that there is a runtime gate does not make the code safe against injection *when the gate is open*. The gate itself relies on external configuration/state.
+            *   Furthermore, checking the `enabled` attribute involves reading from `req.getServletContext()`. While attackers generally cannot modify ServletContext attributes easily, relying on such a mechanism for security is considered insecure coding practice. The vulnerability lies in the lack of sanitization/preparation of the SQL string.
+            *   Let's check the instructions again: "alert-TP when the resolved sink value still depends on user/attacker input on the executed path."
+            *   Path: `doPost` -> `param` (User Input) -> `q` -> `maybeRun` -> `executeUpdate(q)`.
+            *   Is there a guarantee that `enabled` is false? The code doesn't show initialization. If this is part of a benchmark suite designed to test defenses, the default behavior might vary. However, strictly analyzing the code provided:
+                *   `param` is definitely user input.
+                *   `q` constructs SQL with `param`.
+                *   `executeUpdate` takes `q`.
+                *   There is NO preparation (PreparedStatement).
+                *   There IS a conditional check `if (!Boolean.TRUE.equals(enabled)) return;`.
+            *   Does this check mitigate the injection? No. It only prevents execution. Injection is defined as the ability to alter the SQL logic. If execution happens, the injection works. If execution doesn't happen, nothing bad occurs. But the *potential* for injection exists whenever the condition evaluates to true.
+            *   From a security review perspective, allowing user input to form SQL strings is a critical flaw. The existence of a flag that *might* disable it doesn't fix the underlying design flaw (concatenating user input into SQL).
+            *   Also, the alert message explicitly states "Dynamic SQL stored on request; execution gated by servlet context flag." This suggests the tool recognizes the gating but still flags the injection risk.
+            *   Given the strict instruction: "alert-TP when the resolved sink value still depends on user/attacker input on the executed path."
+            *   Resolved sink value: `q` containing `param`. `param` is user input.
+            *   Is the path blocked? The path includes `if (!Boolean.TRUE.equals(enabled)) return;`. We don't see where `enabled` is initialized. If it's not initialized, `getAttribute` returns `null`. `!Boolean.TRUE.equals(null)` is `true`. So it returns.
+            *   Wait. `Boolean.TRUE.equals(null)` returns `false`. `!false` is `true`. So `if (true) return;`.
+            *   If `enabled` is `null` (default), the function returns immediately.
+            *   If `enabled` is `false`, the function returns immediately.
+            *   If `enabled` is `true`, the function proceeds to execute SQL.
+            *   Who sets `enabled` to `true`? The code snippet does not show it being set to `true`.
+            *   However, in many benchmark cases (OWASP Benchmark), the purpose is to simulate vulnerable code. Often, there's a way to enable it during testing.
+            *   But wait, if I am acting as a triage assistant, I should evaluate the code *as presented*.
+            *   If the code is deployed without setting `sql.exec.enabled` to `true`, the SQL is never executed.
+            *   However, the vulnerability is the *construction* of the SQL string. The fact that it sits in memory until a flag flips it doesn't mean the SQL isn't injectable. If someone gains write access to the ServletContext (unlikely for web app users but possible in container configs), or if the flag is toggled later, the injection payload is ready.
+            *   Actually, looking at similar OWASP Benchmark patterns (e.g., BenchmarkTest02272 example in few-shot), they often involve checks like this. In Example 1, the SQL was executed despite an encoder (FP). Here, the SQL is concatenated.
+            *   Key distinction: Is the flag a reliable defense? Generally, no. Relying on a global flag to stop SQL execution is not a secure mitigation strategy compared to Prepared Statements.
+            *   However, the most important factor is the *Resolved Sink Value*.
+            *   If the path taken leads to `return` early, it's FP.
+            *   If the path taken leads to `executeUpdate`, it's TP.
+            *   Which path is taken? The code calls `PendingSql.maybeRun(request, q);`.
+            *   Inside `maybeRun`: `Object enabled = ...`.
+            *   If `enabled` is not set (returns null), `Boolean.TRUE.equals(null)` is false. `!false` is true. Returns.
+            *   So, by default, the code does NOT execute the SQL.
+            *   BUT, the question is whether the *finding* represents a real vulnerability.
+            *   If the application is running in a state where `enabled` is `true`, it is vulnerable.
+            *   If the application is running in a state where `enabled` is `false` or `null`, it is effectively disabled.
+            *   However, the code *allows* the possibility. The variable `q` holds the malicious payload.
+            *   In the context of SAST triage benchmarks (like this seems to be, given the naming convention `BenchmarkTestXXXXX`), these are often intentionally vulnerable snippets meant to be fixed. The presence of a "gate" that isn't enforced by code logic (just a flag) is often considered a weakness, but sometimes these benchmarks specifically test if the model notices the gate disables the exploit.
+            *   Let's look at the "Few-shot Example 1" (TP). It had an encoder at the sink (FP) but also a direct SQL path (TP).
+            *   Let's look at the current code. The SQL is built with `+`. That is inherently dangerous.
+            *   Is the flag a sufficient mitigation to declare FP?
+            *   Instruction: "alert-FP via mitigation only when the resolved sink value is not attacker-controlled."
+            *   If the flag ensures execution never happens, then the sink value is never reached.
+            *   But does the flag ensure execution never happens?
+            *   `Object enabled = req.getServletContext().getAttribute("sql.exec.enabled");`
+            *   If this attribute is not set, `enabled` is `null`.
+            *   `if (!Boolean.TRUE.equals(enabled)) return;`
+            *   `Boolean.TRUE.equals(null)` -> `false`.
+            *   `!false` -> `true`.
+            *   `return`.
+            *   So, if the attribute is absent, the SQL is NOT executed.
+            *   Can an attacker force this attribute to be `true`?
+            *   Attributes on ServletContext are shared across requests. Setting them usually requires programmatic access (admin/config). Not typical user input.
+            *   However, the vulnerability is the *design*. Storing dynamic SQL in a variable and executing it is the issue.
+            *   But strictly speaking, if the code path *never executes* under normal conditions (attribute missing/null), is it a TP?
+            *   Consider the phrase "execution gated by servlet context flag". This implies the flag is the intended control.
+            *   If I assume standard deployment practices where this attribute is not set, the code is benign.
+            *   However, if I assume the intent of the benchmark (often showing how to fix things), this looks like a vulnerable implementation waiting for a switch.
+            *   Let's compare to Example 2 (FP). In Example 2, the list manipulation ensured a constant value was retrieved.
+            *   Let's compare to Example 3 (BL). Unclear due to DNS.
+            *   Here, the uncertainty is: Is the flag set?
+            *   If the flag is not set, it's safe (FP). If the flag is set, it's vulnerable (TP).
+            *   Since the code does not show the flag being set to `true`, and the default behavior (null) causes a return, the immediate execution path is blocked.
+            *   However, the *risk* remains high if the flag is ever enabled.
+            *   Usually, in these benchmarks, if there is a check that returns early based on a flag that isn't guaranteed to be true, it leans towards FP *unless* the flag is known to be true in the context of the test.
+            *   But wait, look at the alert message: "Dynamic SQL stored on request; execution gated by servlet context flag."
+            *   This phrasing suggests the tool knows about the gate.
+            *   If the gate is effective (i.e., prevents execution), it's likely FP.
+            *   Why would the tool report it then? Because the tool sees the SQL construction.
+            *   My role is to verify the path.
+            *   Path: `doPost` -> `maybeRun`.
+            *   Check: `if (!Boolean.TRUE.equals(enabled)) return;`.
+            *   Default: `enabled` is null. Condition is true. Return.
+            *   Result: `executeUpdate` is NOT reached on the default path.
+            *   Is there any path where `enabled` becomes `true`?
+            *   The code provided does not show any code setting `setAttribute("sql.exec.enabled", Boolean.TRUE)`.
+            *   Without evidence that the attribute is set to `true` in the execution context, the sink is unreachable.
+            *   Therefore, the resolved sink value is technically undefined/unreachable on the primary path.
+            *   However, security-wise, leaving a door unlocked (even if closed by default) is risky. But for SAST triage, we care about reachable exploits.
+            *   If the code is deployed as-is, and no one sets the flag, it won't work.
+            *   Is this a "False Positive"? Yes, because the vulnerability is not currently exploitable on the default configuration implied by the absence of setup code.
+            *   Wait, let's reconsider. In many OWASP Benchmark tests, the "fix" is removing the dynamic SQL entirely. The "test" verifies if the scanner catches it.
+            *   If I label it FP, I'm saying "This is not a vulnerability".
+            *   If I label it TP, I'm saying "This is a vulnerability".
+            *   Most security reviewers would say: "This is vulnerable because the developer chose to concatenate SQL. The flag is a band-aid."
+            *   However, the instruction says: "alert-FP via mitigation only when the resolved sink value is not attacker-controlled."
+            *   If the flag prevents execution, the sink value is not processed.
+            *   But is the flag a mitigation? It's a gate.
+            *   If the gate is closed (default), the sink is not hit.
+            *   If the gate is open, the sink is hit.
+            *   Since the code doesn't show the gate opening, the sink is not hit.
+            *   Thus, `resolved sink value` is not attacker-controlled *on the executed path* (because the path ends at `return`).
+            *   Wait, is `return` the end of the path? Yes.
+            *   So, on the path where the code runs (assuming default env), the SQL is not executed.
+            *   Therefore, no injection occurs.
+            *   Verdict: **FP**?
+            *   Counter-argument: The code *contains* the vulnerability logic. The flag is external dependency.
+            *   Let's look at the instruction: "alert-TP when the resolved sink value still depends on user/attacker input on the executed path."
+            *   Executed path: `doPost` -> `maybeRun` -> `if (!...) return`. End of path.
+            *   Did `executeUpdate` execute? No.
+            *   So `resolved sink value` at `executeUpdate` is N/A.
+            *   So it's not TP.
+            *   Is it FP or BL?
+            *   If the flag were set to true, it would be TP.
+            *   Since we don't know if the flag is set, is it BL?
+            *   Instruction: "BL — No alert is alert-TP, and at least one is alert-unclear."
+            *   Reason for unclear: Deployment / infrastructure trust (flag status).
+            *   However, usually, if the code has a clear exit preventing

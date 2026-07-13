@@ -1,0 +1,247 @@
+The user wants me to assess a CodeQL alert for SSRF (Server-Side Request Forgery) in the provided Java code.
+
+**Alert Details:**
+- Rule ID: `java/ssrf`
+- Message: "Separate DNS resolution and outbound fetch."
+- Sink Location: Line 44 (`connectHttpByHostname(host)` call site, though the actual URL construction happens inside `fetchHttpByHostname`). Wait, looking at the location info: `startLine: 44`. Let's look at the code around line 44.
+
+**Code Analysis:**
+```java
+        @Override
+        protected void doPost(HttpServletRequest request, HttpServletResponse response)
+                throws ServletException, IOException {
+            response.setContentType("text/html;charset=UTF-8");
+            String param = request.getParameter("BenchmarkTest");
+            if (param == null) param = "";
+String host = param;
+if (isNonPublicAddress(resolveHost(host))) return;
+Thread.sleep(50);
+connectHttpByHostname(host);
+    }
+}
+```
+
+Wait, I need to map the line numbers correctly based on the provided source. The provided source block starts with `package ...`.
+Let's count lines carefully.
+1: package...
+2: import...
+3: import...
+4: import...
+5: import...
+6: import...
+7: import...
+8: empty
+9: @WebServlet...
+10: public class BenchmarkTest28570...
+11: private static final long...
+12: empty
+13: private static boolean isNonPublicAddress...
+14: return addr.isLoopbackAddress...
+15: }
+16: empty
+17: private static java.net.InetAddress resolveHost...
+18: return java.net.InetAddress.getByName(host);
+19: }
+20: empty
+21: private void fetchHttpByHostname...
+22: new java.net.URL("http://" + host + "/api").openStream();
+23: }
+24: empty
+25: private void connectHttpByHostname...
+26: new java.net.URL("http://" + host).openConnection().connect();
+27: }
+28: empty
+29: private void openUrlByHostname...
+30: new java.net.URL("https://" + host + "/health").openStream();
+31: }
+32: empty
+33: @Override
+34: protected void doPost...
+35: response.setContentType...
+36: String param = request.getParameter("BenchmarkTest");
+37: if (param == null) param = "";
+38: String host = param;
+39: if (isNonPublicAddress(resolveHost(host))) return;
+40: Thread.sleep(50);
+41: connectHttpByHostname(host);
+42: }
+43: }
+
+The alert says sink is at Line 44. In the raw finding, the region is `startLine: 44, startColumn: 9, endLine: 44, endColumn: 40`.
+Looking at my manual counting, line 41 corresponds to `connectHttpByHostname(host);`.
+However, the provided source might have slightly different indentation or blank lines than standard formatting, or the line numbers in the finding refer to the specific artifact version.
+Regardless, the logic is clear:
+1. `host` comes from `request.getParameter("BenchmarkTest")` (User Input).
+2. `host` is assigned directly to `String host = param;` (Line 38 approx).
+3. There is a check: `if (isNonPublicAddress(resolveHost(host))) return;`.
+   - `resolveHost(host)` calls `InetAddress.getByName(host)`.
+   - `isNonPublicAddress` checks if the returned address is loopback, site-local, link-local, or any-local.
+   - If it IS non-public (i.e., safe/private/internal), it returns early.
+   - So if the address is PUBLIC (external/internet-facing), the condition `isNonPublicAddress(...)` evaluates to FALSE, and the code continues past the `if`.
+4. Then `connectHttpByHostname(host)` is called.
+   - Inside `connectHttpByHostname`, it constructs `new java.net.URL("http://" + host).openConnection().connect();`.
+   - This performs an outbound HTTP request using the potentially malicious `host`.
+
+**SSRF Logic Assessment:**
+- **Sink**: Outbound HTTP connection (`URL.openConnection()`).
+- **Tainted Data**: `host` derived from `request.getParameter`.
+- **Mitigation**: `if (isNonPublicAddress(resolveHost(host))) return;`.
+  - This check verifies if the resolved IP address is a local/private address.
+  - If the IP is private/local, the request is aborted.
+  - If the IP is public (which is dangerous for SSRF usually, as we want to prevent accessing internal resources), wait. Usually SSRF protection tries to ensure the target is NOT internal.
+  - Here, the logic is: IF the address is NON-PUBLIC (internal/private), RETURN (abort).
+  - Therefore, if the address IS PUBLIC (external), the code proceeds to make the connection.
+  - This seems like correct behavior for preventing SSRF against internal services (you don't want to hit localhost/site-local). However, SSRF vulnerabilities often arise when attackers can force the application to hit internal IPs (like `127.0.0.1`, `192.168.x.x`, `10.x.x.x`).
+  - By checking `!isNonPublicAddress(...)`, the code ensures that ONLY external addresses proceed.
+  - Wait, let's re-read the `isNonPublicAddress` implementation:
+    ```java
+    private static boolean isNonPublicAddress(java.net.InetAddress addr) {
+        return addr.isLoopbackAddress() || addr.isSiteLocalAddress()
+                || addr.isLinkLocalAddress || addr.isAnyLocalAddress();
+    }
+    ```
+    It returns true if the address is LOOPBACK, SITE_LOCAL, LINK_LOCAL, ANY_LOCAL. These are typically considered "unsafe" targets for SSRF prevention (preventing access to internal infrastructure).
+    The code says: `if (isNonPublicAddress(resolveHost(host))) return;`.
+    Meaning: If the resolved IP is one of these "bad" internal types, stop the request.
+    Otherwise (if it resolves to a public IP or IPv6 global unicast), continue to `connectHttpByHostname(host)`.
+
+    Is there a gap here?
+    Standard SSRF protections often also check for `isMulticastAddress`, `isBroadcastAddress`, etc. But primarily they want to prevent hitting internal networks.
+    Does this mitigate SSRF? Yes, it prevents hitting loopback, link-local, etc.
+    However, is it sufficient?
+    Attackers could potentially use DNS rebinding.
+    Scenario: Attacker provides `evil.com`.
+    Step 1: `resolveHost("evil.com")` -> Resolves to `1.2.3.4` (public).
+    Check `isNonPublicAddress(1.2.3.4)` -> Returns `false`.
+    Condition `if (false)` -> Skips return.
+    Proceeds to `connectHttpByHostname("evil.com")`.
+    Connection made to `1.2.3.4`. Safe so far.
+
+    Scenario 2: DNS Rebinding Window.
+    Attacker sets up `evil.com` to resolve to their victim's internal IP initially, OR relies on browser/server caching.
+    Actually, the classic SSRF attack vector involves resolving a domain that points to an internal IP.
+    If the attacker controls the DNS record for `evil.com` pointing to `127.0.0.1` (loopback).
+    `resolveHost("evil.com")` -> `127.0.0.1`.
+    `isNonPublicAddress(127.0.0.1)` -> `true`.
+    `if (true) return;`.
+    Request blocked. Good.
+
+    What about `localhost`? Same thing. Blocked.
+    What about `192.168.1.1`? `isSiteLocalAddress()` covers `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`.
+    So standard private ranges are covered.
+
+    **Is there a flaw?**
+    The alert message is "Separate DNS resolution and outbound fetch."
+    This refers to the fact that `resolveHost` is called once, then `connectHttpByHostname` is called later (potentially after some delay or just sequentially).
+    Between `resolveHost` and `connectHttpByHostname`, the `host` string itself is used in the URL construction.
+    `new java.net.URL("http://" + host).openConnection().connect();`
+    
+    The critical issue with SSRF is whether the *actual* destination reached during the fetch matches the *validated* destination.
+    Here, `host` is validated by resolving it to an IP and checking the IP type.
+    Then the fetch uses the original `host` string.
+    Since `URL` constructor will perform a fresh DNS lookup for `host` when connecting? Or does it reuse the cached one?
+    `java.net.URL` stores the host string. `openConnection()` triggers the connection.
+    The underlying socket creation will likely trigger a new DNS resolution if the system hasn't cached it, or it might use the cached entry.
+    Even if it uses the cached entry, DNS records can change between the validation step and the connection step (though less likely within milliseconds).
+    More importantly, DNS Rebinding attacks work by changing the DNS record *during* the process.
+    1. App validates `evil.com` -> resolves to Public IP X. Allowed.
+    2. Attacker changes DNS for `evil.com` -> resolves to Internal IP Y.
+    3. App connects to `evil.com`. Client-side TCP handshake goes to Y (because DNS changed).
+    4. Server sees traffic coming from App's IP, but targeting Y.
+    
+    This is the "DNS Rebinding Window".
+    The code has `Thread.sleep(50);` before calling `connectHttpByHostname`. This explicitly introduces a delay.
+    This delay increases the window for DNS rebinding.
+    During those 50ms, the attacker can update the DNS record.
+    Validation happened at T=0 (Resolved to Public).
+    Fetch happens at T=50 (Resolves to Private/Internal).
+    The check `isNonPublicAddress` was done on the initial resolution. It didn't validate the IP again right before the connection.
+    The connection uses the string `host`. `URL` opens a stream/connection. The OS/DNS library will resolve `host` again at connection time.
+    If the DNS record changed to point to an internal IP, the connection will go to the internal IP.
+    The previous check `isNonPublicAddress` is now stale.
+    
+    Therefore, despite the mitigation attempt (checking IP type), the separation of resolution and fetch combined with a deliberate sleep allows a DNS rebinding attack to bypass the check.
+    The `sleep` makes this very suspicious. Why would legitimate code sleep 50ms before making a request? Likely intentional to demonstrate the vulnerability or simply bad practice.
+    
+    Given the instruction:
+    "**Borderline (BL) calibration** — when a reviewer needs context not in the snippet"
+    "3. **Deployment / infrastructure trust** — User input stored in request attributes... without visible execution..."
+    "4. **Semi-trusted or partially-controlled input**..."
+    "Apply **BL calibration** before defaulting to **alert-TP**."
+    "When BL calibration applies (DNS rebinding split...) — prefer **alert-unclear** even if user input reaches the sink expression."
+    
+    Specifically, the instructions say:
+    "**DNS rebinding window** — Resolution may check that the resolved IP is non-public, but a **separate** outbound HTTP/TCP request uses the **hostname string** (not the resolved IP). That split creates a DNS rebinding window — IP checks at resolve time do **not** prove the later connection is safe. Without DNS TTL, resolver cache, same-connection vs new-connection fetch, and egress policy in the snippet, label **alert-unclear** — **not** **alert-TP** from hostname taint alone."
+    
+    This matches perfectly.
+    1. Resolve `host` -> Check IP type.
+    2. Sleep.
+    3. Connect using `host` string (fresh DNS lookup possible).
+    4. Gap exists.
+    
+    According to the guidelines provided in the prompt ("Inputs" section -> "Borderline (BL) calibration"):
+    "Without DNS TTL, resolver cache, same-connection vs new-connection fetch, and egress policy in the snippet, label **alert-unclear** — **not** **alert-TP** from hostname taint alone."
+    
+    Also, note the explicit `Thread.sleep(50)`. This confirms the intent to create a timing window. While this looks like a vulnerability demonstration (intentionally vulnerable), the question asks me to triage the alert.
+    If the code is intentionally vulnerable (benchmark test), should I label it TP?
+    Looking at the few-shot examples:
+    Example 3 (BL) had a similar pattern: `resolveHost` then `fetchHttpByHostname`. Reason: "resolve-then-fetch pattern — DNS rebinding and egress controls are not visible in code."
+    My current case is almost identical to Example 3, except Example 3 didn't have the sleep, but had the same structure.
+    Wait, Example 3 was labeled BL.
+    My case has `Thread.sleep(50)`. This strengthens the "window" aspect.
+    However, the guideline says: "Without DNS TTL... label alert-unclear".
+    So even if I know it's a benchmark test designed to fail, strictly following the triage policy for *this* task requires assessing the security posture based on available info.
+    The policy says: "If you cannot compute the resolved sink value... alert-unclear".
+    And specifically regarding DNS rebinding: "Without DNS TTL... label alert-unclear".
+    
+    So, is this TP or BL?
+    The guideline explicitly states: "That split creates a DNS rebinding window... label alert-unclear — not alert-TP from hostname taint alone."
+    This implies that even if user input reaches the sink, if the DNS rebinding window exists and isn't ruled out by evidence (cache, TTL, etc.), it should be BL.
+    Evidence in snippet: We see `Thread.sleep(50)`. We do NOT see DNS TTL settings or cache configuration. We assume worst-case scenario (DNS can change).
+    Thus, the verification of the IP address is invalidated by the subsequent connection using the hostname string.
+    Verdict: **BL**.
+    
+    Wait, let's double check if there's any other interpretation.
+    Some SAST tools flag this as TP because the check is insufficient.
+    But the specific instructions for *me* (the LLM triager) say:
+    "Apply **BL calibration** before defaulting to **alert-TP**. When BL calibration applies (DNS rebinding split...) — prefer **alert-unclear** even if user input reaches the sink expression."
+    This overrides the general "insufficient mitigation = TP" heuristic.
+    Since the DNS rebinding split is clearly present (Resolution -> Sleep -> Fetch using Hostname), and we lack info on DNS caching/TTL, the instruction mandates **alert-unclear**.
+    Consequently, since there is only 1 alert and it is unclear, the case level label is **BL**.
+    
+    Wait, let's verify if `connectHttpByHostname` does a fresh DNS lookup.
+    `new java.net.URL("http://" + host).openConnection().connect();`
+    Yes, `URL.openConnection()` initiates a connection. The JVM networking stack will resolve the hostname at that moment. Unless the OS caches the result from `InetAddress.getByName` earlier in the same thread/process, it's a potential race.
+    With `Thread.sleep(50)`, the chance of cache invalidation or DNS update is higher.
+    The instruction example 3 (BL) is extremely close to this.
+    Example 3: `resolveHost(host)` -> `isNonPublicAddress` -> `fetchHttpByHostname(host)`.
+    Result: BL.
+    My case: `resolveHost(host)` -> `isNonPublicAddress` -> `sleep` -> `connectHttpByHostname(host)`.
+    Result: Should be BL (even stronger reason for uncertainty/risk).
+    
+    One nuance: The `sleep` might indicate this is a known vulnerable benchmark intended to be fixed or analyzed. But my job is to triage the finding.
+    If the finding is technically accurate (it IS a vulnerability), why BL?
+    Because the *mitigation* (IP check) is theoretically sound but practically bypassable via DNS rebinding without proof of cache validity. The instructions tell me to treat this as BL when such splits occur without visibility into cache/TTL.
+    Instruction quote: "Without DNS TTL, resolver cache, same-connection vs new-connection fetch, and egress policy in the snippet, label **alert-unclear** — **not** **alert-TP** from hostname taint alone."
+    This is a strict directive for this task.
+    
+    So, Plan:
+    1. Assess Alert 1 (SSRF).
+    2. Acknowledge user input flows to sink.
+    3. Acknowledge mitigation (IP check).
+    4. Note the separation of resolution and fetch (DNS Rebinding Window).
+    5. Note the `Thread.sleep(50)` exacerbating the window.
+    6. Apply BL calibration rule: Without DNS cache/TTL info, label alert-unclear.
+    7. Case Level: BL (since no TP, and at least one Unclear).
+    
+    Confidence: Medium (due to the specific calibration rule overriding typical TP classification for incomplete mitigations).
+    
+    Wait, I should check if there are other factors.
+    `isNonPublicAddress` checks Loopback, SiteLocal, LinkLocal, AnyLocal.
+    It does NOT check Multicast or Broadcast.
+    But the main driver for BL here is the DNS Rebinding Split.
+    
+    Let's draft the JSON.
+    Label: BL
+    Reason: Alert 1 alert-unclear: DNS resolution and fetch separated by sleep; DNS rebinding window exists without visible cache/TTL guarantees.
+    Evidence: Lines showing resolve, sleep

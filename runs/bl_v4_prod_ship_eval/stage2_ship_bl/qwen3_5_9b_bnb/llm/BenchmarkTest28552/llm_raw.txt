@@ -1,0 +1,239 @@
+The user wants me to triage a CodeQL alert for SSRF (Server-Side Request Forgery).
+
+**Alert Details:**
+- Rule ID: `java/ssrf`
+- Message: "Separate DNS resolution and outbound fetch."
+- Sink Location: Line 43 in `BenchmarkTest28552.java`.
+
+**Task Analysis:**
+I need to follow the specific triage policy provided in the prompt. Let's break down the analysis for this specific alert.
+
+**Step 1: Scope & Trace to Sink Expression**
+- The alert is about SSRF.
+- The sink location is line 43. Looking at the code:
+  ```java
+  if (isNonPublicAddress(resolveHost(host))) return;
+  fetchHttpByHostname(host);
+  ```
+  Wait, let me look closer at the provided code block.
+  
+  Lines around 43:
+  ```java
+  private void fetchHttpByHostname(String host) throws java.io.IOException {
+      new java.net.URL("http://" + host + "/api").openStream();
+  }
+  ```
+  Actually, looking at the raw code provided in the input:
+  ```java
+  ...
+  private void fetchHttpByHostname(String host) throws java.io.IOException {
+      new java.net.URL("http://" + host + "/api").openStream();
+  }
+  ...
+  @Override
+  protected void doPost(...) {
+      ...
+      String host = param;
+      if (isNonPublicAddress(resolveHost(host))) return;
+      fetchHttpByHostname(host);
+  }
+  ```
+  
+  The alert says sink is at L43. In the provided snippet, `fetchHttpByHostname` starts around line 27-28 (based on indentation and structure). Let's count lines carefully based on the provided text.
+  
+  Provided Text Structure:
+  1. package...
+  2. imports...
+  3. @WebServlet...
+  4. public class...
+  5. private static final...
+  6. private static boolean isNonPublicAddress...
+  7. private static java.net.InetAddress resolveHost...
+  8. private void fetchHttpByHostname...
+  9. new java.net.URL("http://" + host + "/api").openStream();
+  10. private void connectHttpByHostname...
+  11. private void openUrlByHostname...
+  12. @Override
+  13. protected void doPost...
+  14. response.setContentType...
+  15. String param = request.getParameter("BenchmarkTest");
+  16. if (param == null) param = "";
+  17. String host = param;
+  18. if (isNonPublicAddress(resolveHost(host))) return;
+  19. fetchHttpByHostname(host);
+  20. }
+  21. }
+  
+  Wait, the line numbers in the alert say L43. The provided snippet might have been truncated or formatted differently than my manual counting suggests, OR the line numbers refer to the original file where there might be more content before this class definition. However, I must work with the provided source text.
+  
+  Regardless of exact line number mapping, the logic is clear:
+  1. `host` comes from `request.getParameter("BenchmarkTest")` (User Input).
+  2. `resolveHost(host)` resolves the hostname to an InetAddress.
+  3. `isNonPublicAddress(...)` checks if the resolved address is loopback/site/local/link-local/any-local. It returns true if it IS non-public (wait, let's check the logic).
+  
+  Logic Check:
+  ```java
+  private static boolean isNonPublicAddress(java.net.InetAddress addr) {
+      return addr.isLoopbackAddress() || addr.isSiteLocalAddress()
+              || addr.isLinkLocalAddress() || addr.isAnyLocalAddress();
+  }
+  ```
+  This method returns `true` if the address IS local/private/internal.
+  
+  Usage:
+  ```java
+  if (isNonPublicAddress(resolveHost(host))) return;
+  ```
+  So, IF the resolved address is local/private (i.e., NON-PUBLIC in terms of internet reachability), THEN RETURN (abort the request).
+  Conversely, if the address is NOT local/private (i.e., it is PUBLIC/EXTERNAL), the condition evaluates to FALSE, and the code proceeds to call `fetchHttpByHostname(host)`.
+  
+  This means the check allows traffic ONLY if the address is external/public. This seems like a standard SSRF prevention attempt (blocking localhost/127.0.0.1/etc.).
+  
+  However, the alert is specifically about "Separate DNS resolution and outbound fetch".
+  Why would this be flagged?
+  Usually, SSRF scanners flag cases where user input goes into a URL construction followed by a network call. Here we have:
+  1. Resolve DNS (`InetAddress.getByName(host)`).
+  2. Check if IP is internal.
+  3. Fetch using the HOSTNAME again (`new java.net.URL("http://" + host + "/api").openStream()`).
+  
+  The issue here is often related to DNS Rebinding attacks. Even though we resolve the hostname to an IP and check that IP against a whitelist/blacklist (here checking if it's NOT internal), the actual fetch happens using the **original hostname string**, not the resolved IP.
+  
+  Scenario:
+  1. Attacker provides `evil.com`.
+  2. Server resolves `evil.com` -> `1.2.3.4` (Internal IP).
+  3. `isNonPublicAddress` returns TRUE.
+  4. Function returns early. Safe.
+  
+  Scenario 2 (Rebinding):
+  1. Attacker provides `victim.com`.
+  2. Server resolves `victim.com` -> `1.2.3.4` (External IP).
+  3. `isNonPublicAddress` returns FALSE.
+  4. Code calls `fetchHttpByHostname(victim.com)`.
+  5. Inside `fetchHttpByHostname`, `new java.net.URL("http://" + victim.com + "/api").openStream()` is called.
+  6. Java's `URL.openStream()` typically performs a NEW DNS lookup for the hostname provided in the URL string.
+  
+  If the DNS record for `victim.com` changes between step 2 and step 6, pointing to an internal resource (like `localhost` or an internal service), the initial check passes (because initially it was external), but the actual fetch hits the internal resource.
+  
+  This is the classic "DNS Rebinding" SSRF vector. The check validates the IP at one point in time, but the fetch uses the hostname, allowing a subsequent DNS resolution to bypass the check.
+  
+  Is this considered a True Positive (TP)?
+  According to the policy:
+  - "DNS rebinding window — Resolution may check that the resolved IP is non-public, but a separate outbound HTTP/TCP request uses the hostname string (not the resolved IP). That split creates a DNS rebinding window — IP checks at resolve time do **not** prove the later connection is safe. Without DNS TTL, resolver cache, same-connection vs new-connection fetch, and egress policy in the snippet, label **alert-unclear** — **not** **alert-TP** from hostname taint alone."
+  
+  This matches perfectly with the "Borderline (BL) calibration" section in the instructions. Specifically point #2: "**DNS rebinding window** — Resolution may check that the resolved IP is non-public, but a **separate** outbound HTTP/TCP request uses the **hostname string** (not the resolved IP)... Without DNS TTL... label **alert-unclear**".
+  
+  Let's verify the code details again.
+  - `resolveHost(host)` is called once.
+  - `fetchHttpByHostname(host)` is called separately.
+  - Inside `fetchHttpByHostname`, `new java.net.URL("http://" + host + "/api").openStream()` constructs a URL using the hostname directly.
+  - `URL.openConnection()` or `openStream()` will perform a fresh DNS lookup for the hostname.
+  
+  Since the instruction explicitly states: "Without DNS TTL, resolver cache, same-connection vs new-connection fetch, and egress policy in the snippet, label **alert-unclear** — **not** **alert-TP** from hostname taint alone," I should classify this alert as **alert-unclear**.
+  
+  Consequently, since there is only one alert and it is unclear, the case level label should be **BL**.
+  
+  Wait, I need to check if there's any other factor.
+  Does the `isNonPublicAddress` logic cover enough? It covers Loopback, Site Local, Link Local, Any Local. It misses IPv6 mapped addresses potentially, but generally covers common internal ranges. But the main issue is the timing gap.
+  
+  Also, note the instruction: "Apply BL calibration **before** forcing alert-TP".
+  And: "When BL calibration applies (DNS rebinding split...), prefer alert-unclear even if user input reaches the sink expression."
+  
+  So, despite user input reaching the sink (the URL constructed for fetching), the presence of the DNS rebinding split makes it **alert-unclear**.
+  
+  Therefore:
+  - Alert Verdict: alert-unclear
+  - Case Level Label: BL
+  
+  Reasoning summary:
+  - The code attempts to mitigate SSRF by resolving the hostname to an IP and checking if it is a non-public address.
+  - However, the actual network fetch (`fetchHttpByHostname`) uses the original hostname string, triggering a new DNS resolution.
+  - This creates a DNS rebinding window where the IP could change between the validation check and the fetch.
+  - Per the triage policy regarding DNS rebinding windows, this should be labeled `alert-unclear` rather than `alert-TP` due to lack of visibility into DNS caching/TTL/network policies.
+  - With no other alerts, the case label is `BL`.
+  
+  Confidence: Medium (standard for these borderline cases).
+  
+  Evidence: Cite the lines showing the resolve check and the fetch call.
+  
+  Let's draft the JSON.
+  
+  One detail: The alert location is L43. In the provided snippet, the `doPost` method ends near the end. The line numbering in the snippet provided might differ from the alert's L43. However, I should reference the lines in the provided snippet that correspond to the logic described.
+  Looking at the snippet:
+  Line ~18: `if (isNonPublicAddress(resolveHost(host))) return;`
+  Line ~19: `fetchHttpByHostname(host);`
+  Line ~28: `new java.net.URL("http://" + host + "/api").openStream();`
+  
+  I will reference the lines in the provided text that demonstrate the logic.
+  
+  Double check the "Resolved Sink Value" requirement.
+  - Sink expression: `new java.net.URL("http://" + host + "/api").openStream()`
+  - Resolved value: The URL constructed includes `host`. `host` is derived from `request.getParameter("BenchmarkTest")`.
+  - So the sink value depends on user input.
+  - BUT, the policy says for DNS rebinding: "Without DNS TTL... label alert-unclear".
+  - So I don't force TP just because user input reaches the sink. I apply the BL calibration.
+  
+  Final decision:
+  Label: BL
+  Reason: Alert 1 alert-unclear: DNS rebinding window detected. Hostname validated against IP at resolve time, but fetch uses hostname string causing potential new DNS resolution. Policy requires alert-unclear for such splits without visibility into caching/policies.
+  
+  Wait, I need to make sure I am following the "Evidence" format correctly.
+  `"evidence"` must include at least one item when label is TP, FP, or BL.
+  Format: `{ "file": "...", "lines": "Lx-Ly", "note": "..." }`
+  
+  I'll map the lines from the provided snippet roughly.
+  Line 17: `String host = param;`
+  Line 18: `if (isNonPublicAddress(resolveHost(host))) return;`
+  Line 19: `fetchHttpByHostname(host);`
+  Line 28: `new java.net.URL("http://" + host + "/api").openStream();`
+  
+  I'll group them appropriately.
+  
+  Wait, I see the instruction: "OUTPUT the JSON result only, with no extra text. You may reason internally first."
+  I am currently reasoning internally. Now I generate the JSON.
+  
+  One nuance: The example 3 (BL) had confidence score 0.55. I'll set something reasonable like 0.6 or 0.5.
+  
+  Let's refine the reason text to be concise and accurate.
+  "Alert 1 alert-unclear: DNS rebinding window. Validation resolves hostname to IP and checks locality, but fetch uses hostname string triggering new DNS resolution. Policy mandates alert-unclear for this split without visibility into TTL/cache."
+  
+  Wait, I need to ensure I don't violate the "Do NOT duplicate the JSON" rule. Just output the JSON.
+  
+  Wait, looking at the instruction again: "Set "agent" to "llm"".
+  Okay.
+  
+  One more check on the "Resolved Sink Value" part of the instructions.
+  Step 3: "Resolve sink value (mandatory)".
+  Step 4: "Structural FP only with proved resolved value".
+  Step 5: "Mitigate on this path".
+  
+  My plan:
+  1. Acknowledge sink value depends on user input (`host`).
+  2. Note the mitigation (IP check).
+  3. Apply BL calibration (DNS rebinding).
+  4. Conclude alert-unclear.
+  
+  This aligns with the "Few-shot examples" where BL is chosen for DNS rebinding scenarios (Example 3).
+  
+  Ready to construct JSON.
+</think>
+
+{
+  "label": "BL",
+  "confidence": "medium",
+  "confidence_score": 0.6,
+  "reason": "Alert 1 alert-unclear: DNS rebinding window detected. While the code resolves the hostname to an IP and checks if it is non-public (internal), the actual fetch uses the original hostname string ('http://' + host). This triggers a new DNS resolution during the fetch, creating a window where the IP could change to an internal address between validation and usage. Per policy, this split without visibility into DNS TTL/cache warrants alert-unclear.",
+  "evidence": [
+    {
+      "file": "src/main/java/org/owasp/benchmark/testcode/BenchmarkTest28552.java",
+      "lines": "L17-L19",
+      "note": "Validation resolves host to IP and checks locality, returning early if internal."
+    },
+    {
+      "file": "src/main/java/org/owasp/benchmark/testcode/BenchmarkTest28552.java",
+      "lines": "L28",
+      "note": "Fetch uses hostname string directly, enabling potential DNS rebinding bypass."
+    }
+  ],
+  "agent": "llm",
+  "case_id": "BenchmarkTest28552"
+}

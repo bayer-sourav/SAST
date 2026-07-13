@@ -1,0 +1,232 @@
+The user wants me to triage a specific SAST finding related to SSRF (Server-Side Request Forgery).
+
+**Task Breakdown:**
+1.  **Analyze the Input:** I have one alert (`java/ssrf`) pointing to line 45 of `BenchmarkTest28495.java`. The message says "Separate DNS resolution and outbound fetch."
+2.  **Examine the Code:**
+    ```java
+    private void fetchHttpByHostname(String host) throws java.io.IOException {
+        new java.net.URL("http://" + host + "/api").openStream();
+    }
+
+    private void connectHttpByHostname(String host) throws java.io.IOException {
+        new java.net.URL("http://" + host).openConnection().connect();
+    }
+
+    private void openUrlByHostname(String host) throws java.io.IOException {
+        new java.net.URL("https://" + host + "/health").openStream();
+    }
+
+        @Override
+        protected void doPost(HttpServletRequest request, HttpServletResponse response)
+                throws ServletException, IOException {
+            response.setContentType("text/html;charset=UTF-8");
+            String param = request.getParameter("BenchmarkTest");
+            if (param == null) param = "";
+    String host = param;
+    java.net.InetAddress addr = resolveHost(host);
+    if (isNonPublicAddress(addr)) return;
+    addr.getHostName();
+    openUrlByHostname(host);
+    }
+    ```
+    Line numbers in the raw file might differ slightly from my mental map, but let's look at the structure.
+    - `param` comes from `request.getParameter("BenchmarkTest")`.
+    - `host` is assigned directly from `param`.
+    - `resolveHost(host)` resolves the hostname to an InetAddress.
+    - `isNonPublicAddress(addr)` checks if the resolved address is loopback, site-local, link-local, or any-local.
+    - If it passes the check (i.e., is NOT non-public), the code continues.
+    - Then `openUrlByHostname(host)` is called.
+    - Inside `openUrlByHostname`, it constructs a URL using the original `host` string: `"https://" + host + "/health"` and opens a stream.
+
+3.  **Assess the Alert:**
+    - **Rule:** `java/ssrf`
+    - **Message:** "Separate DNS resolution and outbound fetch."
+    - **Sink Location:** Line 45 (likely inside `openUrlByHostname` or the call to it). Looking at the provided code block, line 45 corresponds roughly to `openUrlByHostname(host);` based on indentation and typical benchmark test structures, or potentially the construction inside the helper. Let's verify line counts.
+        - Lines 1-10: Imports & Class def start.
+        - Lines 12-14: `serialVersionUID`.
+        - Lines 16-20: `isNonPublicAddress`.
+        - Lines 22-25: `resolveHost`.
+        - Lines 27-30: `fetchHttpByHostname`.
+        - Lines 32-35: `connectHttpByHostname`.
+        - Lines 37-40: `openUrlByHostname`.
+        - Lines 42-50: `doPost` method.
+        - Inside `doPost`:
+            - `response.setContentType...`
+            - `String param = ...`
+            - `if (param == null)...`
+            - `String host = param;`
+            - `java.net.InetAddress addr = resolveHost(host);`
+            - `if (isNonPublicAddress(addr)) return;`
+            - `addr.getHostName();`
+            - `openUrlByHostname(host);` -> This looks like the sink location mentioned in the alert (L45).
+
+    - **Data Flow:**
+        1.  Source: `request.getParameter("BenchmarkTest")` (User Input).
+        2.  Variable: `host` (assigned directly from `param`).
+        3.  Check: `resolveHost(host)` converts `host` to `InetAddress`.
+        4.  Validation: `isNonPrivateAddress(addr)` checks if the resolved IP is private/local.
+        5.  Sink: `openUrlByHostname(host)` uses the *original* `host` string to construct a URL and make an HTTP request.
+
+    - **Analysis of Vulnerability:**
+        - The validation happens on the *resolved IP address*.
+        - The actual request is made using the *original hostname string*.
+        - **Scenario:** An attacker provides a hostname that resolves to a public IP (passing `isNonPublicAddress`) but has a CNAME record that redirects to an internal resource, OR they provide a hostname that triggers DNS rebinding.
+        - However, the classic SSRF vector here is often DNS rebinding or simply relying on the fact that while the IP was checked, the hostname lookup happened again implicitly during the URL parsing/connection establishment. Wait, `new java.net.URL(...).openStream()` will perform a DNS lookup again.
+        - More critically, there is a known issue with Java's `URL.openConnection()` behavior regarding DNS caching and timing. But specifically, the alert is about "Separate DNS resolution".
+        - In this code:
+            1. `resolveHost(host)` -> Resolves `host` to `addr`. Checks `addr`.
+            2. `openUrlByHostname(host)` -> Constructs URL with `host`. `URL.openStream()` performs a *second* DNS resolution.
+        - Is this exploitable? Yes. Between the first resolution (for checking) and the second resolution (for fetching), the DNS records could change (DNS rebinding attack). Or, the initial check might pass for a public IP, but the target intended by the attacker is an internal service reachable via a different mechanism or the attacker manipulates the DNS resolution of the *second* lookup differently than the first (though usually, OS caches help).
+        - Actually, the most direct SSRF vector here is simply that the check validates the *IP*, but the request goes to the *Name*. If the Name resolves to a Public IP (which allows the check to pass), but the application intends to restrict access to internal services, allowing *any* public IP is risky if the goal is preventing external access. But wait, `isNonPublicAddress` returns true for loopback/site/link/any local. So if it returns false (meaning it IS public/global), the code proceeds.
+        - The intent seems to be "Only allow requests to non-private IPs"? No, `isNonPublicAddress` returns true if it IS non-public. The condition is `if (isNonPublicAddress(addr)) return;`. So if the address IS non-public (loopback, etc.), it returns early (blocks). It proceeds ONLY IF the address IS PUBLIC (global/internet-routable).
+        - Why would we want to force traffic to public internet addresses? Usually, SSRF protections aim to *prevent* accessing internal resources. Blocking loopback/internal makes sense. Allowing global addresses means anything resolvable to a global IP is allowed.
+        - The vulnerability lies in the separation of the two DNS resolutions.
+            - Resolution 1: Used for validation.
+            - Resolution 2: Used for fetching.
+        - Attack Vector: DNS Rebinding. Attacker sets up a domain that resolves to a public IP initially (allowing the check to pass). Then changes the DNS record to point to an internal IP (like localhost or 192.168.x.x) just before the second resolution occurs in `openUrlByHostname`. Since the client-side browser or the server's DNS cache isn't guaranteed to persist between these calls (especially if the JVM restarts or cache expires), the second resolution might hit the internal IP.
+        - Even simpler: The check ensures the IP is public. If the attacker knows an internal service is accessible via a hostname that resolves to a public IP (e.g., a DMZ proxy), they can reach it. But typically SSRF is about reaching things *behind* the firewall.
+        - The standard interpretation of this specific CodeQL alert ("Separate DNS resolution and outbound fetch") is that the validation relies on the result of a DNS lookup performed earlier, but the actual operation uses a fresh lookup. This creates a race condition window where the IP address associated with the hostname can change between the check and the action.
+        - Given the strict instruction: "If the resolved sink value is attacker-controlled and BL calibration does not apply, count alert-TP."
+        - Does the sink value depend on attacker input? Yes, `host` comes from `param`.
+        - Is there a proven mitigation? The check `isNonPublicAddress` prevents immediate access to loopback/private IPs. However, it does not prevent access to internal IPs reachable via DNS rebinding or if the attacker controls the DNS resolution of the second lookup.
+        - According to the "BL calibration" section:
+            - "DNS rebinding window — Resolution may check that the resolved IP is non-public, but a separate outbound HTTP/TCP request uses the hostname string (not the resolved IP). That split creates a DNS rebinding window — IP checks at resolve time do not prove the later connection is safe. Without DNS TTL, resolver cache, same-connection vs new-connection fetch, and egress policy in the snippet, label alert-unclear — not alert-TP from hostname taint alone."
+        - This matches perfectly. The code explicitly separates `resolveHost` (check) from `openUrlByHostname` (use). The alert message itself highlights this: "Separate DNS resolution and outbound fetch."
+        - Therefore, per the instructions, this should be labeled **alert-unclear** (supporting case **BL**), not **alert-TP**, because the snippet lacks visibility into DNS TTL/cache/policy which determines exploitability.
+        - Wait, looking closely at the example cases provided in the prompt:
+            - Example 3 (`BenchmarkTest26999`) had the exact same pattern: `resolveHost` then `fetchHttpByHostname`. The verdict was **alert-unclear** leading to case **BL**. Reason: "DNS rebinding and egress controls are not visible in code."
+            - My current case (`BenchmarkTest28495`) follows the exact same pattern: `resolveHost` then `openUrlByHostname`.
+            - The difference is minor (method names), but the logic is identical.
+            - Logic:
+                1. Resolve `host` to `addr`.
+                2. Check `addr` (public vs private).
+                3. Fetch using `host` (triggers new resolution).
+            - Conclusion: This falls squarely under the "DNS rebinding window" BL calibration rule.
+            - Verdict for Alert 1: **alert-unclear**.
+            - Case Level Label: Since there is only 1 alert and it is unclear, the case label is **BL**.
+
+4.  **Drafting the Response:**
+    - **Label**: BL
+    - **Confidence**: Medium (standard for BL cases involving DNS/network assumptions).
+    - **Score**: ~0.55 (similar to Example 3).
+    - **Reason**: Alert 1 alert-unclear: Separate DNS resolution (validate IP) and fetch (use hostname) creates a DNS rebinding window. Egress/DNS cache policies not visible. Matches BL calibration criteria.
+    - **Evidence**: Cite the lines showing `resolveHost` and `openUrlByHostname`.
+
+5.  **Refining Evidence:**
+    - Need to identify the specific lines in the provided snippet.
+    - `resolveHost(host)` is around line 25 (based on visual estimation of the provided text block).
+    - `openUrlByHostname(host)` is around line 45 (as indicated by the alert).
+    - The snippet provided starts with imports.
+    - Let's count lines carefully from the provided text block.
+    - 1: package...
+    - 2: empty
+    - 3: import java.io...
+    - 4: import javax.servlet...
+    - 5: import javax.servlet.annotation...
+    - 6: import javax.servlet.http...
+    - 7: import javax.servlet.http...
+    - 8: empty
+    - 9: @WebServlet...
+    - 10: public class...
+    - 11: private static final...
+    - 12: empty
+    - 13: private static boolean...
+    - 14: return addr...
+    - 15: }
+    - 16: empty
+    - 17: private static java.net.InetAddress...
+    - 18: return java.net.InetAddress...
+    - 19: }
+    - 20: empty
+    - 21: private void fetchHttpByHostname...
+    - 22: new java.net.URL...
+    - 23: }
+    - 24: empty
+    - 25: private void connectHttpByHostname...
+    - 26: new java.net.URL...
+    - 27: }
+    - 28: empty
+    - 29: private void openUrlByHostname...
+    - 30: new java.net.URL...
+    - 31: }
+    - 32: empty
+    - 33: @Override
+    - 34: protected void doPost...
+    - 35: throws ServletException, IOException {
+    - 36: response.setContentType...
+    - 37: String param = request.getParameter...
+    - 38: if (param == null) param = "";
+    - 39: String host = param;
+    - 40: java.net.InetAddress addr = resolveHost(host);
+    - 41: if (isNonPublicAddress(addr)) return;
+    - 42: addr.getHostName();
+    - 43: openUrlByHostname(host);
+    - 44: }
+    - 45: }
+    
+    Wait, the alert says line 45. In the provided text block, line 45 is the closing brace of the class. The `openUrlByHostname(host)` call is likely line 43 in this specific formatting. However, the alert metadata says `startLine: 45`. Sometimes line numbering includes comments or differs slightly. Regardless, the logic is clearly identified by the method calls. I will reference the lines containing the critical logic (`resolveHost` and `openUrlByHostname`).
+    Based on the text provided:
+    `java.net.InetAddress addr = resolveHost(host);` is near the end of the method body.
+    `openUrlByHostname(host);` is immediately following.
+    I'll quote the relevant section in evidence.
+
+    Wait, I need to check the line numbers in the provided "File" content versus the alert.
+    The alert says `startLine: 45`.
+    In the provided text:
+    Line 43: `openUrlByHostname(host);`
+    Line 44: `}`
+    Line 45: `}`
+    Maybe the alert considers the class closing brace or there's a discrepancy. I will refer to the logical lines.
+    Actually, looking at the provided text block again:
+    Line 39: `String host = param;`
+    Line 40: `java.net.InetAddress addr = resolveHost(host);`
+    Line 41: `if (isNonPublicAddress(addr)) return;`
+    Line 42: `addr.getHostName();`
+    Line 43: `openUrlByHostname(host);`
+    Line 44: `}`
+    Line 45: `}`
+    Okay, the alert points to line 45. This might be the class close, or the tool counts differently. I will reference the lines surrounding the vulnerable logic (L39-L43).
+    Wait, the alert says `startLine: 45`. In many IDEs, the physical location might align differently. I will use the range covering the logic.
+    Actually, I should stick to the provided text's line numbers.
+    Line 40: `resolveHost`
+    Line 43: `openUrlByHostname`
+    These are the key lines.
+
+    **Decision:**
+    - Alert 1: **alert-unclear** (due to DNS rebinding window / lack of cache info).
+    - Case Label: **BL** (because no TP, and at least one unclear).
+    - Confidence: medium.
+
+    **Double Check against Policy:**
+    - "DNS rebinding window — Resolution may check that the resolved IP is non-public, but a separate outbound HTTP/TCP request uses the hostname string (not the resolved IP). That split creates a DNS rebinding window — IP checks at resolve time do not prove the later connection is safe. Without DNS TTL, resolver cache, same-connection vs new-connection fetch, and egress policy in the snippet, label alert-unclear — not alert-TP from hostname taint alone."
+    - This matches the scenario exactly.
+    - "Case BL when: no alert-TP, and at least one alert-unclear..."
+    - Correct.
+
+    **Constructing JSON:**
+    - `label`: "BL"
+    - `confidence`: "medium"
+    - `confidence_score`: 0.55
+    - `reason`: "Alert 1 alert-unclear: Separate DNS resolution (validate IP) and fetch (use hostname) creates a DNS rebinding window. Egress/DNS cache policies not visible in code. Matches BL calibration criteria for DNS rebinding splits."
+    - `evidence`: List the lines showing the resolve and fetch.
+
+    One detail: The prompt asks for `agent` to be "llm".
+    And `case_id` is `BenchmarkTest28495`.
+
+    Final check on JSON syntax. Ensure escaping is correct.
+</think>
+
+{
+  "label": "BL",
+  "confidence": "medium",
+  "confidence_score": 0.55,
+  "reason": "Alert 1 alert-unclear: Separate DNS resolution (validate IP) and fetch (use hostname) creates a DNS rebinding window. Egress/DNS cache policies not visible in code. Matches BL calibration criteria for DNS rebinding splits.",
+  "evidence": [
+    {
+      "file": "src/main/java/org/owasp/benchmark/testcode/BenchmarkTest28495.java",
+      "lines": "L40-L43",
+      "note": "resolveHost(host) validates IP, but openUrlByHostname(host) performs new DNS lookup on original hostname string"
+    }
+  ],
+  "agent": "llm",
+  "case

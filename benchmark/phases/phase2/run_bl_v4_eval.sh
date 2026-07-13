@@ -20,15 +20,16 @@ export HF_HOME="${PHASE2_HF_HOME:-${HOME}/.cache/huggingface}"
 export PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-expandable_segments:True}"
 
 PROFILE="qwen3_5_9b_bnb"
-PROMPT="${SAST_PROMPT_VERSION:-v7-ship-bl}"
-FS_CONFIG="${SAST_FEWSHOT_CONFIG:-v2_3shot_tp_fp_bl}"
-FEWSHOT=3
+PROMPT="${SAST_PROMPT_VERSION:-v8-ship-bl}"
+FS_CONFIG="${SAST_FEWSHOT_CONFIG:-v2_4shot_tp_fp_bl2}"
+FEWSHOT="${BL_V4_FEWSHOT:-4}"
 FORCE="${BL_V4_FORCE_RERUN:-0}"
 SKIP_REBUILD="${BL_V4_SKIP_REBUILD:-0}"
 
-CORPUS="benchmark/corpora/phase2_bl_test"
-RUNS="runs/bl_v4_eval/stage2_ship_bl"
-LOG="$ROOT/runs/bl_v4_eval/eval_ship_bl.log"
+CORPUS="${BL_V4_CORPUS:-benchmark/corpora/phase2_bl_test}"
+RUNS="${BL_V4_RUNS_ROOT:-runs/bl_v4_eval/stage2_ship_bl}"
+REVIEW_DIR="${BL_V4_REVIEW_DIR:-runs/bl_v4_eval}"
+LOG="$ROOT/$REVIEW_DIR/eval_ship_bl.log"
 mkdir -p "$(dirname "$LOG")" "$RUNS"
 
 echo "=== BL v4 full eval (phase2_bl_test + $PROMPT) $(date -Iseconds) ===" | tee "$LOG"
@@ -68,7 +69,7 @@ uv run python "$ROOT/benchmark/analyze_bl_v4_pilot.py" \
   --corpus "$CORPUS" \
   --runs "$RUNS" \
   --profile "$PROFILE" \
-  --json-out "$ROOT/runs/bl_v4_eval/review_ship_bl.json" \
-  --html-out "$ROOT/runs/bl_v4_eval/REVIEW_SHIP_BL.html" 2>&1 | tee -a "$LOG"
+  --json-out "$ROOT/$REVIEW_DIR/review_ship_bl.json" \
+  --html-out "$ROOT/$REVIEW_DIR/REVIEW_SHIP_BL.html" 2>&1 | tee -a "$LOG"
 
-echo "Done. Open runs/bl_v4_eval/REVIEW_SHIP_BL.html" | tee -a "$LOG"
+echo "Done. Open $REVIEW_DIR/REVIEW_SHIP_BL.html" | tee -a "$LOG"

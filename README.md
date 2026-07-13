@@ -85,6 +85,13 @@ Cutting Security Alert Noise with SLM — see [benchmark/README.md](benchmark/RE
     - timeslot for recurring meeting
 
 ---
+## Advisory triage (Phase 1)
+
+Deployment and CodeQL SARIF triage live in the separate **SAST-Integration** repo (not this repo).
+
+Clone the **SAST-Integration** repo (sibling to this repo). See its `README.md`.
+
+---
 ## Deploying and Running Qwen3 Inference via Unsloth on AWS EC2
 
 This document provides a comprehensive guide for setting up an isolated GPU environment on AWS EC2, connecting to it securely via Cursor/VS Code, and running optimized inference using Unsloth on original Qwen3 model sizes.
