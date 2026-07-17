@@ -45,12 +45,11 @@ def build_split_corpus(
         track_dir = out_root / cls
         track_dir.mkdir(parents=True, exist_ok=True)
         keep_ids = {row["case_id"] for row in entries}
-        if case_ids is not None:
-            for stale in track_dir.glob("*.json"):
-                if stale.name == "corpus_manifest.json":
-                    continue
-                if stale.stem not in keep_ids:
-                    stale.unlink()
+        for stale in track_dir.glob("*.json"):
+            if stale.name == "corpus_manifest.json":
+                continue
+            if stale.stem not in keep_ids:
+                stale.unlink()
         for row in entries:
             bundle = (dataset / row["bundle"]).resolve()
             out_path = track_dir / f"{row['case_id']}.json"

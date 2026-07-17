@@ -72,6 +72,24 @@ def _system_prompt() -> str:
     return _SYSTEM_PROMPT
 
 
+_SHORT_THINKING_APPENDIX = """
+---
+Latency constraint (thinking on): keep internal reasoning concise (roughly ≤400 words).
+Focus on sink reachability and sanitizers only. Then emit the final JSON object immediately.
+Do not ramble or restate the entire file.
+"""
+
+
+def _maybe_append_short_thinking(task_text: str) -> str:
+    """Opt-in shorter CoT (env SAST_SHORT_THINKING=1) for latency experiments."""
+    flag = os.environ.get("SAST_SHORT_THINKING", "").strip().lower()
+    if flag not in ("1", "true", "yes", "on"):
+        return task_text
+    if "Latency constraint (thinking on)" in task_text:
+        return task_text
+    return task_text.rstrip() + "\n" + _SHORT_THINKING_APPENDIX
+
+
 def prepare_triage_messages(
     *,
     case_path: Path,
@@ -146,7 +164,7 @@ def prepare_triage_messages(
             )
         task_sec = time.perf_counter() - t_task_start
 
-    task_text = task_path.read_text(encoding="utf-8")
+    task_text = _maybe_append_short_thinking(task_path.read_text(encoding="utf-8"))
     system_text = _system_prompt()
     messages: list[dict[str, str]] = [
         {"role": "system", "content": system_text},
@@ -157,6 +175,8 @@ def prepare_triage_messages(
         "few_shot": few_shot,
         "few_shot_config": str(few_shot_config) if few_shot_config else None,
         "prompt_version": prompt_version,
+        "short_thinking": os.environ.get("SAST_SHORT_THINKING", "").strip().lower()
+        in ("1", "true", "yes", "on"),
         "task_prompt_tag": task_prompt_tag(
             few_shot=few_shot,
             layout_version=layout_version,

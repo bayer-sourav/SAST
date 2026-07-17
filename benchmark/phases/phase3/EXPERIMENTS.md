@@ -140,6 +140,52 @@ Train/serve alignment **validated** (epoch 6 = val pick without fs0 rerank corre
 
 ---
 
+## Phase 3C blv4 — BL synthetic refresh confirm (complete — NOT ship)
+
+| Field | Value |
+|-------|-------|
+| **Run ID** | `3c-blv4-001` |
+| **Status** | Complete — **gates NOT met** (do not ship) |
+| **Manifest** | `stage3c_blv4/MANIFEST.json` |
+| **Adapter** | `runs/phase3/stage3c_blv4/lora/best` (epoch 10, CSS 0.848) |
+| **Protocol** | `runs/phase3/stage3c_blv4/CONFIRM_PROTOCOL.md` |
+
+### Hypothesis
+
+Same frozen 3C recipe on **current** BL train (`curated_v4_calibrated_v3` / `BenchmarkTest28xxx`) should confirm original 3C metrics after retiring `BLSynthetic*`.
+
+### Result
+
+**Rejected.** Refreshing BL train collapsed VDR; FPRR stayed decent. Worse than original 3C and 3B ship on SRS/VDR.
+
+| Metric | blv4 | Original 3C | 3B ship | Stage 2 | Δ vs S2 |
+|--------|------|-------------|---------|---------|---------|
+| SRS | **88.1%** | 89.9% | 89.9% | 92.5% | −4.4pp |
+| VDR | **72.5%** | 86.3% | 90.3% | 92.5% | −20.0pp |
+| FPRR | **76.5%** | 78.3% | 66.2% | 73.5% | +3.0pp |
+| TP→FP | **40** | 27 | 17 | 14 | +26 |
+| Missing | 0 (after gap-fill) | 6 | 13 | 0 | |
+
+### Gates
+
+| Gate | Target | Result |
+|------|--------|--------|
+| Beat Stage 2 SRS | > 92.5% | FAIL |
+| FPRR ≥ Stage 2 | ≥ 73.5% | PASS |
+| VDR floor | ≥ 90% | FAIL |
+
+### Artifacts
+
+- `runs/phase3/stage3c_blv4/summaries/PHASE3C_BLV4_TEST_REPORT.md`
+- `runs/phase3/stage3c_blv4/summaries/confusion_matrix_comparison.json`
+- `benchmark/phases/phase3/report_phase3c_blv4_test.py`
+
+### Decision
+
+Keep **original 3C** as historical ship-aligned row; use **3B ep4 fs0** for Integration latency interim; do not promote blv4.
+
+---
+
 ## Phase 3D — VDR recovery + constrained CSS (planned)
 
 | Field | Value |
@@ -172,6 +218,7 @@ SRS ≥ 92.5% · VDR ≥ 90% · FPRR ≥ 73.5% · TP→FP ≤ 17
 | 2025-06 | CSS for early stopping, not loss | Loss ~0.03 in 3A while VDR failed |
 | 2025-06 | CoT + fs3 in training | Match eval ship config |
 | 2025-06 | LoRA rank sweep 16/32/64 (L40S) | 32 primary; 64 CoT; skip 128 |
+| 2026-07-16 | Reject 3C blv4 confirm | VDR 72.5% / SRS 88.1% on refreshed BL; keep 3B ep4 for Integration latency |
 | 2025-06 | Re-eval all CSS-eligible on val before test | Confirm best checkpoint; test run once only |
 | 2025-06 | 3C: fs0_off train + json_only + ship val CSS | Close 3B FPRR gap; fix train/serve mismatch |
 | 2025-06 | 3C: reuse 3B teacher cache | Avoid 1500-case re-inference |

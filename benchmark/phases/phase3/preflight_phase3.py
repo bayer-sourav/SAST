@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -201,10 +202,16 @@ def main() -> None:
         manifest = load_manifest(_sast / "benchmark/phases/phase3/stage3b/MANIFEST.json")
         preflight_3b(manifest)
     elif args.stage == "3c":
-        manifest = load_manifest(_sast / "benchmark/phases/phase3/stage3c/MANIFEST.json")
+        env_m = os.environ.get("PHASE3_MANIFEST") or os.environ.get("PHASE3B_MANIFEST")
+        manifest = load_manifest(
+            Path(env_m) if env_m else _sast / "benchmark/phases/phase3/stage3c/MANIFEST.json"
+        )
         preflight_3c(manifest)
     elif args.stage == "3d":
-        manifest = load_manifest(_sast / "benchmark/phases/phase3/stage3d/MANIFEST.json")
+        env_m = os.environ.get("PHASE3_MANIFEST") or os.environ.get("PHASE3B_MANIFEST")
+        manifest = load_manifest(
+            Path(env_m) if env_m else _sast / "benchmark/phases/phase3/stage3d/MANIFEST.json"
+        )
         preflight_3d(manifest)
     else:
         manifest = json.loads((_sast / "benchmark/phases/phase3/MANIFEST.json").read_text(encoding="utf-8"))

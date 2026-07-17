@@ -17,21 +17,22 @@ source "$ROOT/benchmark/phase2_cell_env.sh"
 MANIFEST="${PHASE3B_MANIFEST:-$ROOT/benchmark/phases/phase3/stage3b/MANIFEST.json}"
 STAGE="${PHASE3_STAGE:-3a}"
 
-if [[ "$STAGE" == "3d" ]]; then
+if [[ "$STAGE" == "3c" ]]; then
+  MANIFEST="${PHASE3_MANIFEST:-$ROOT/benchmark/phases/phase3/stage3c/MANIFEST.json}"
+  ROOT3C="${PHASE3C_ROOT:-$ROOT/runs/phase3/stage3c}"
+  LOG_DIR="${ROOT3C}/logs"
+  SUM_DIR="${ROOT3C}/summaries"
+  EVAL_ROOT="${PHASE3_EVAL_ROOT:-${ROOT3C}/eval}"
+  LORA="${SAST_LORA_ADAPTER:-${ROOT3C}/lora/best}"
+  PROMPT_VERSION="${PHASE3_PROMPT_VERSION:-v7-ship}"
+  export QWEN_INFER_BACKEND=vllm
+  export SAST_REQUIRE_VLLM=1
+elif [[ "$STAGE" == "3d" ]]; then
   MANIFEST="${PHASE3_MANIFEST:-$ROOT/benchmark/phases/phase3/stage3d/MANIFEST.json}"
   LOG_DIR="runs/phase3/stage3d/logs"
   SUM_DIR="runs/phase3/stage3d/summaries"
   EVAL_ROOT="${PHASE3_EVAL_ROOT:-runs/phase3/stage3a/eval}"
   LORA="${SAST_LORA_ADAPTER:-runs/phase3/stage3d/lora/best}"
-  PROMPT_VERSION="${PHASE3_PROMPT_VERSION:-v7-ship}"
-  export QWEN_INFER_BACKEND=vllm
-  export SAST_REQUIRE_VLLM=1
-elif [[ "$STAGE" == "3c" ]]; then
-  MANIFEST="${PHASE3_MANIFEST:-$ROOT/benchmark/phases/phase3/stage3c/MANIFEST.json}"
-  LOG_DIR="runs/phase3/stage3c/logs"
-  SUM_DIR="runs/phase3/stage3c/summaries"
-  EVAL_ROOT="runs/phase3/stage3c/eval"
-  LORA="${SAST_LORA_ADAPTER:-runs/phase3/stage3c/lora/best}"
   PROMPT_VERSION="${PHASE3_PROMPT_VERSION:-v7-ship}"
   export QWEN_INFER_BACKEND=vllm
   export SAST_REQUIRE_VLLM=1

@@ -115,9 +115,64 @@ PHASE3_BAND = (5, "Phase 3 LoRA", "cat-phase3")
 PHASE3B_BAND = (6, "Phase 3B LoRA", "cat-phase3b")
 PHASE3C_BAND = (7, "Phase 3C LoRA", "cat-phase3c")
 PHASE3D_BAND = (8, "Phase 3D LoRA", "cat-phase3d")
+BL_V4_BAND = (9, "BL v4 / lang-agnostic ship", "cat-bl-v4")
 PHASE3_SUM = _SAST / "runs/phase3/stage3a/summaries"
 PHASE3_EVAL = _SAST / "runs/phase3/stage3a/eval"
 CONFUSION_JSON = OUT_DIR / "benchmark_confusion_comparison.json"
+
+PROD_SHIP_EVALS: tuple[dict, ...] = (
+    {
+        "id": "v7_langagnostic_fs3",
+        "label": "Qwen3.5-9B · v7-balanced-langagnostic fs3",
+        "eval_root": _SAST / "runs/v7_balanced_langagnostic_fs3_eval",
+        "note": "Lang-agnostic v7-balanced (no BL calibration rules) · thinking on · fs3 · v2_3shot_tp_2fp.",
+    },
+    {
+        "id": "v8_ship_bl_fs4",
+        "label": "Qwen3.5-9B · v8-ship-bl fs4",
+        "eval_root": _SAST / "runs/bl_v4_prod_ship_eval",
+        "note": "Lang-agnostic + BL calibration · v8-ship-bl · 4-shot v2_4shot_tp_fp_bl2 · thinking on · vLLM.",
+    },
+)
+
+BL_V4_FULL_EVALS: tuple[dict, ...] = (
+    {
+        "run_dir": _SAST / "runs/bl_v4_eval",
+        "label": "v7-ship-bl · 3-shot",
+        "corpus_tier": "mixed v4 (pre-calibration)",
+        "note": "Baseline BL prompt on legacy BLv4* case IDs; model over-calls TP (120/200).",
+    },
+    {
+        "run_dir": _SAST / "runs/bl_v4_synthetic_eval",
+        "label": "v7-ship-bl · 3-shot",
+        "corpus_tier": "curated_v4_tight",
+        "note": "Tight synthetic tier; heavy TP bias (154/200).",
+    },
+    {
+        "run_dir": _SAST / "runs/bl_v4_calibrated_eval",
+        "label": "v7-ship-bl · 3-shot",
+        "corpus_tier": "curated_v4_calibrated (v1)",
+        "note": "First calibrated templates regressed vs bl_v4_eval (7% BL); template bugs pushed TP.",
+    },
+    {
+        "run_dir": _SAST / "runs/bl_v4_calibrated_v2_eval",
+        "label": "v7-ship-bl · 4-shot",
+        "corpus_tier": "curated_v4_calibrated_v2",
+        "note": "4-shot BL exemplars (+13pp vs v1); still below 35% gate.",
+    },
+    {
+        "run_dir": _SAST / "runs/bl_v4_calibrated_v3_eval",
+        "label": "v7-ship-bl · 4-shot",
+        "corpus_tier": "curated_v4_calibrated_v3",
+        "note": "Best v7-ship-bl run (27.5% BL); deployment_trust category still weak (6%).",
+    },
+    {
+        "run_dir": _SAST / "runs/bl_v4_prod_ship_eval",
+        "label": "v8-ship-bl · 4-shot",
+        "corpus_tier": "curated_v4_calibrated_v3",
+        "note": "Ship candidate: passes BL gates (41.5% overall, 54% dns_rebinding).",
+    },
+)
 
 CONFUSION_COMPARISONS: tuple[dict, ...] = (
     {
@@ -772,6 +827,196 @@ def _load_phase3a_row() -> dict | None:
     )
 
 
+def _row_from_merged_600(cfg: dict) -> dict | None:
+    """600-case prod ship row from summaries/merged_600.json."""
+    sum_dir = cfg["eval_root"] / "summaries"
+    merged_path = sum_dir / "merged_600.json"
+    if not merged_path.is_file():
+        return None
+    data = json.loads(merged_path.read_text(encoding="utf-8"))
+    m = data.get("merged") or {}
+    fp_t = data.get("fp_track") or {}
+    tp_t = data.get("tp_track") or {}
+    band_order, category, row_class = BL_V4_BAND
+    fp_ev = int(fp_t.get("evaluated", 0))
+    tp_ev = int(tp_t.get("evaluated", 0))
+    acc = (
+        (int(fp_t.get("correct", 0)) + int(tp_t.get("correct", 0))) / (fp_ev + tp_ev)
+        if (fp_ev + tp_ev)
+        else 0.0
+    )
+    return _finalize_row(
+        {
+            "model": cfg["label"],
+            "profile": data.get("profile", "qwen3_5_9b_bnb"),
+            "category": category,
+            "row_class": row_class,
+            "band_order": band_order,
+            "thinking": "on",
+            "fewshot": 4 if "v8" in cfg["id"] else 3,
+            "source": str(cfg["eval_root"].relative_to(_SAST)),
+            "phase": "BL v4 prod ship",
+            "vdr": float(m.get("vdr", 0.0)),
+            "fprr": float(m.get("fprr", 0.0)),
+            "macro_f1": float(m.get("macro_f1", 0.0)),
+            "srs": float(m.get("srs", 0.0)),
+            "critical": _critical(tp_t),
+            "accuracy": acc,
+            "test_n": PHASE2_TEST_N,
+            "bl_rate_on_bl_gold": m.get("bl_rate_on_bl_gold"),
+            "note": cfg.get("note", ""),
+        }
+    )
+
+
+def _load_prod_ship_rows() -> list[dict]:
+    rows: list[dict] = []
+    for cfg in PROD_SHIP_EVALS:
+        row = _row_from_merged_600(cfg)
+        if row:
+            rows.append(row)
+    return rows
+
+
+def _confusion_from_merged_600(cfg: dict) -> dict | None:
+    sum_dir = cfg["eval_root"] / "summaries"
+    merged_path = sum_dir / "merged_600.json"
+    if not merged_path.is_file():
+        return None
+    data = json.loads(merged_path.read_text(encoding="utf-8"))
+    fp_t = data.get("fp_track") or {}
+    tp_t = data.get("tp_track") or {}
+    bl_t = data.get("bl_track") or {}
+    m = data.get("merged") or {}
+    matrix: dict[str, dict[str, int]] = {g: {} for g in ("TP", "FP", "BL")}
+    missing_by_gold: dict[str, int] = {}
+    for gold, track in (("FP", fp_t), ("TP", tp_t), ("BL", bl_t)):
+        dist = track.get("distribution") or {}
+        missing_by_gold[gold] = int(dist.get("(missing)", 0) or track.get("missing", 0))
+        for pred, count in dist.items():
+            if pred in ("(missing)",):
+                continue
+            p = str(pred).upper()
+            if p not in ("TP", "FP", "BL"):
+                # UNKNOWN / other labels count as missing for the 3×3 matrix
+                missing_by_gold[gold] = missing_by_gold.get(gold, 0) + int(count)
+                continue
+            matrix[gold][p] = matrix[gold].get(p, 0) + int(count)
+    evaluated = sum(
+        sum(matrix[g].values()) + missing_by_gold.get(g, 0) for g in ("TP", "FP", "BL")
+    )
+    correct = sum(matrix[g].get(g, 0) for g in ("TP", "FP", "BL"))
+    band_order, category, row_class = BL_V4_BAND
+    return {
+        "id": cfg["id"],
+        "label": cfg["label"],
+        "tier": _assign_tier(
+            {
+                "vdr": m.get("vdr", 0.0),
+                "fprr": m.get("fprr", 0.0),
+                "macro_f1": m.get("macro_f1", 0.0),
+                "srs": m.get("srs", 0.0),
+                "critical": _critical(tp_t),
+                "test_n": PHASE2_TEST_N,
+            }
+        ),
+        "category": category,
+        "row_class": row_class,
+        "note": cfg.get("note", ""),
+        "matrix": matrix,
+        "missing_by_gold": missing_by_gold,
+        "n_cases": PHASE2_TEST_N,
+        "evaluated": evaluated,
+        "missing": PHASE2_TEST_N - evaluated,
+        "correct": correct,
+        "critical_tp_fp": int(matrix["TP"].get("FP", 0)),
+        "high_bl_fp": int(matrix["BL"].get("FP", 0)),
+        "fp_tp": int(matrix["FP"].get("TP", 0)),
+        "fprr": float(m.get("fprr", 0.0)),
+        "vdr": float(m.get("vdr", 0.0)),
+        "srs": float(m.get("srs", 0.0)),
+        "diagonal": {g: int(matrix[g].get(g, 0)) for g in ("TP", "FP", "BL")},
+    }
+
+
+def _load_prod_ship_confusion_rows() -> list[dict]:
+    return [row for cfg in PROD_SHIP_EVALS if (row := _confusion_from_merged_600(cfg))]
+
+
+def _load_bl_v4_calibration_reports() -> list[dict]:
+    rows: list[dict] = []
+    for cfg in BL_V4_FULL_EVALS:
+        json_path = cfg["run_dir"] / "review_ship_bl.json"
+        if not json_path.is_file():
+            continue
+        report = json.loads(json_path.read_text(encoding="utf-8"))
+        gates = report.get("gates") or {}
+        rows.append(
+            {
+                "run_dir": str(cfg["run_dir"].relative_to(_SAST)),
+                "label": cfg["label"],
+                "corpus_tier": cfg["corpus_tier"],
+                "note": cfg["note"],
+                "bl_rate": float(report.get("bl_rate", 0.0)),
+                "gates_pass": bool(report.get("pilot_pass")),
+                "gates": gates,
+                "distribution": report.get("distribution") or {},
+                "by_category_bl_rate": report.get("by_category_bl_rate") or {},
+                "evaluated": int(report.get("evaluated", 0)),
+                "missing": int(report.get("missing", 0)),
+            }
+        )
+    return rows
+
+
+def _build_bl_calibration_section(bl_rows: list[dict]) -> str:
+    if not bl_rows:
+        return ""
+
+    head = (
+        "<tr><th>Run</th><th>Prompt / fs</th><th>Corpus tier</th><th>BL rate</th>"
+        "<th>BL</th><th>TP</th><th>FP</th><th>Gates</th><th>Notes</th></tr>"
+    )
+    body_rows = []
+    for r in bl_rows:
+        dist = r["distribution"]
+        gate_ok = "PASS" if r["gates_pass"] else "FAIL"
+        gate_cls = "tier-EXCELLENT" if r["gates_pass"] else "tier-FAIL"
+        cats = ", ".join(
+            f"{html.escape(k)}={v * 100:.0f}%"
+            for k, v in sorted((r.get("by_category_bl_rate") or {}).items())
+        )
+        note = html.escape(r["note"])
+        if cats:
+            note += f" <span style='color:#666'>[{cats}]</span>"
+        cells = [
+            f'<code>{html.escape(r["run_dir"])}</code>',
+            html.escape(r["label"]),
+            html.escape(r["corpus_tier"]),
+            f"{r['bl_rate'] * 100:.1f}%",
+            str(dist.get("BL", 0)),
+            str(dist.get("TP", 0)),
+            str(dist.get("FP", 0)),
+            f'<td class="{gate_cls}" style="text-align:center">{gate_ok}</td>',
+            note,
+        ]
+        tds = "".join(
+            c if c.startswith("<td") else f"<td>{c}</td>" for c in cells
+        )
+        body_rows.append(f'<tr class="cat-bl-v4">{tds}</tr>')
+
+    return f"""<section>
+<h2>Borderline v4 — BL calibration eval (200-case BL test, not pilot)</h2>
+<p class="subtitle">Gold label = <b>BL</b> on all 200 cases · Model = Qwen3.5-9B · vLLM · thinking on.
+Gates: overall BL rate ≥ 35% · <code>dns_rebinding</code> BL rate ≥ 50% · missing ≤ 5%.
+Pilot runs (40-case synthetic) excluded. Markdown: <code>benchmark/phases/phase2/BL_V4.md</code>.</p>
+<table>
+<thead>{head}</thead>
+<tbody>{"".join(body_rows)}</tbody>
+</table>
+</section>"""
+
+
 def _confusion_matrix_html(cm: dict) -> str:
     matrix = cm.get("matrix") or {}
     missing = cm.get("missing_by_gold") or {}
@@ -860,8 +1105,8 @@ def _build_confusion_section(comparisons: list[dict]) -> str:
         )
 
     return f"""<section>
-<h2>Confusion matrices — Stage 2 GOOD · Phase 2 MINIMUM · Phase 3A–3D</h2>
-<p class="subtitle">Full 3×3 gold × predicted over 600 cases (200 FP + 200 TP + 200 BL). Phase 3B rows span teacher-matched (ep{train_ep}) and ship fs0_off (ep{ship_ep} rerank). Phase 3C: ship-aligned distill (ep{phase3c_ep}, fs0_off). Phase 3D: constrained CSS pick (ep{phase3d_ep}, fs0_off, 600/600). Diagonal = correct; shaded cells = high-penalty misclassifications. <b>BL-gold:</b> ship models rarely predict BL — BL→TP is SRS-free; BL→FP is penalized.</p>
+<h2>Confusion matrices — Stage 2 GOOD · Phase 2 MINIMUM · Phase 3A–3D · BL v4 ship</h2>
+<p class="subtitle">Full 3×3 gold × predicted over 600 cases (200 FP + 200 TP + 200 BL). Phase 3B rows span teacher-matched (ep{train_ep}) and ship fs0_off (ep{ship_ep} rerank). Phase 3C: ship-aligned distill (ep{phase3c_ep}, fs0_off) plus blv4 BL-refresh confirm (NOT ship). Phase 3D: constrained CSS pick (ep{phase3d_ep}, fs0_off, 600/600). <b>BL v4 ship</b> rows: lang-agnostic v7 and v8-ship-bl prod eval. Diagonal = correct; shaded cells = high-penalty misclassifications. <b>BL-gold:</b> Stage 2 rarely predicts BL (BL→TP is SRS-free); v8-ship-bl emits BL on 83/200 BL-gold cases.</p>
 <table>
 <thead><tr>{summary_head}</tr></thead>
 <tbody>{"".join(summary_rows)}</tbody>
@@ -870,7 +1115,12 @@ def _build_confusion_section(comparisons: list[dict]) -> str:
 </section>"""
 
 
-def _build_html(experiments: list[dict], ops: list[dict], comparisons: list[dict]) -> str:
+def _build_html(
+    experiments: list[dict],
+    ops: list[dict],
+    comparisons: list[dict],
+    bl_calibration: list[dict],
+) -> str:
     generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
     exp_cols = [
@@ -963,6 +1213,7 @@ tr.cat-phase3 {{ background: #fce4ec; }}
 tr.cat-phase3b {{ background: #f3e5f5; }}
 tr.cat-phase3c {{ background: #e8eaf6; }}
 tr.cat-phase3d {{ background: #e0f2f1; }}
+tr.cat-bl-v4 {{ background: #e8f5e9; }}
 .note {{ background: #fff8e1; padding: 8px 12px; border-radius: 4px; margin-bottom: 1rem; }}
 .cm-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1.25rem; margin-top: 1rem; }}
 .cm-block h3 {{ font-size: 0.95rem; margin: 0 0 0.25rem; color: #1e3a5f; }}
@@ -987,7 +1238,7 @@ td.cm-warn {{ background: #fff9c4; }}
 
 <section>
 <h1>Phase 2 Benchmark Results — All Models &amp; Approaches</h1>
-<p class="subtitle">Test set · baselines n=27 (PoC reference) · LLM rows 600-case Phase 2 test (200 FP + 200 TP + 200 BL) · Baseline → Zero-shot → Few-shot → Few-shot (CoT) → Stage 2 ship → Phase 3A/3B/3C/3D LoRA · Tier = PoC success gates (four metrics + hard gates; CRITICAL limit scales with total test size)</p>
+<p class="subtitle">Test set · baselines n=27 (PoC reference) · LLM rows 600-case Phase 2 test (200 FP + 200 TP + 200 BL) · Baseline → Zero-shot → Few-shot → Few-shot (CoT) → Stage 2 ship → Phase 3A/3B/3C/3D LoRA → <b>BL v4 lang-agnostic ship</b> · Tier = PoC success gates (four metrics + hard gates; CRITICAL limit scales with total test size)</p>
 <table>
 <thead><tr>{exp_thead}</tr></thead>
 <tbody>{"".join(exp_trs)}</tbody>
@@ -995,6 +1246,8 @@ td.cm-warn {{ background: #fff9c4; }}
 </section>
 
 {_build_confusion_section(comparisons)}
+
+{_build_bl_calibration_section(bl_calibration)}
 
 <section>
 <h2>Operational Stats — Timing &amp; Tokens</h2>
@@ -1059,10 +1312,13 @@ td.cm-warn {{ background: #fff9c4; }}
 <dd>Teacher distillation on 1500 train cases · LoRA r=32 · training CSS pick epoch 6 (fs3+CoT val) · ship rerank epoch 4 (fs0_off val). Test rows: <b>fs3 CoT</b>, <b>fs0 direct</b>, and <b>fs0 ship (rerank)</b>. Reports: <code>reports/phase3b/</code> · HTML: <code>runs/phase3/stage3b/benchmark/PHASE3B_BENCHMARK.html</code>.</dd>
 
 <dt>Phase 3C LoRA</dt>
-<dd>Ship-aligned retrain: json_only targets · fs0_off train prompts · fs0_off val CSS · v7-ship · epoch 6 pick · test SRS 89.9% (gap-fill). Reports: <code>reports/phase3c/</code> · BL analysis: <code>PHASE3C_BL_ANALYSIS.md</code>.</dd>
+<dd>Ship-aligned retrain: json_only targets · fs0_off train prompts · fs0_off val CSS · v7-ship · epoch 6 pick · test SRS 89.9% (gap-fill). Reports: <code>reports/phase3c/</code> · BL analysis: <code>PHASE3C_BL_ANALYSIS.md</code>. <b>blv4 confirm</b> (Jul 2026, refreshed BL synthetics): SRS 88.1% · VDR 72.5% · FPRR 76.5% — <b>NOT ship</b>. Report: <code>runs/phase3/stage3c_blv4/summaries/PHASE3C_BLV4_TEST_REPORT.md</code>.</dd>
 
 <dt>Phase 3D LoRA</dt>
 <dd>Constrained CSS retrain: hard-neg + BL export · fs0_off · v7-balanced test · checkpoint-850 (epoch 6) · full 600/600 after compact JSON gap-fill · test SRS 88.0%. Val CSS 0.845 at pick. Reports: <code>runs/phase3/stage3d/summaries/</code>.</dd>
+
+<dt>BL v4 / lang-agnostic ship (July 2026)</dt>
+<dd><b>v7-balanced-langagnostic</b> — language-neutral v7 procedure (fs3, thinking on); 600-case SRS 84.4%, BL rate 4%. <b>v8-ship-bl</b> — lang-agnostic + BL calibration rules + 4-shot <code>v2_4shot_tp_fp_bl2</code>; 600-case SRS 86.1%, BL rate 41.5% (passes BL gates on 200-case BL test). Tradeoff: VDR −17.9pp vs Stage 2 (43 TP→FP vs 14). Full calibration progression table below. Markdown: <code>benchmark/phases/phase2/BL_V4.md</code>.</dd>
 
 <dt>CSS (Phase 3B–3D checkpoint selection)</dt>
 <dd><code>CSS = 0.35·SRS + 0.35·VDR + 0.20·FPRR + 0.10·Macro-F1</code> on validation; disqualified if VDR &lt; 0.75. Used for epoch pick only — not the final ship gate (test SRS is).</dd>
@@ -1082,18 +1338,22 @@ def main() -> None:
     phase3b_rows = _load_phase3b_rows()
     phase3c_rows = _load_phase3c_rows()
     phase3d_rows = _load_phase3d_rows()
+    prod_ship_rows = _load_prod_ship_rows()
+    bl_calibration = _load_bl_v4_calibration_reports()
     experiment_parts = baselines + _load_phase2_matrix_rows() + _load_stage2_ship_rows()
     if phase3_row:
         experiment_parts.append(phase3_row)
     experiment_parts.extend(phase3b_rows)
     experiment_parts.extend(phase3c_rows)
     experiment_parts.extend(phase3d_rows)
+    experiment_parts.extend(prod_ship_rows)
     experiments = _sort_experiments(experiment_parts)
     comparisons = (
         _load_confusion_comparisons()
         + _load_phase3b_confusion_rows()
         + _load_phase3c_confusion_rows()
         + _load_phase3d_confusion_rows()
+        + _load_prod_ship_confusion_rows()
     )
     ops = _load_ops_rows()
 
@@ -1108,6 +1368,7 @@ def main() -> None:
             + (f" + Phase 3B LoRA ({len(phase3b_rows)} cells)" if phase3b_rows else "")
             + (f" + Phase 3C LoRA ({len(phase3c_rows)} cells)" if phase3c_rows else "")
             + (f" + Phase 3D LoRA ({len(phase3d_rows)} cells)" if phase3d_rows else "")
+            + (f" + BL v4 prod ship ({len(prod_ship_rows)} cells)" if prod_ship_rows else "")
             + "."
         ),
         "baselines": baselines,
@@ -1132,6 +1393,8 @@ def main() -> None:
         "phase3b_rows": len(phase3b_rows),
         "phase3c_rows": len(phase3c_rows),
         "phase3d_rows": len(phase3d_rows),
+        "prod_ship_rows": len(prod_ship_rows),
+        "bl_v4_calibration_runs": len(bl_calibration),
         "confusion_comparisons": len(comparisons),
     }
 
@@ -1139,7 +1402,9 @@ def main() -> None:
     OPS_JSON.write_text(json.dumps(ops_doc, indent=2), encoding="utf-8")
     META_JSON.write_text(json.dumps(meta, indent=2), encoding="utf-8")
     CONFUSION_JSON.write_text(json.dumps(comparisons, indent=2), encoding="utf-8")
-    HTML_OUT.write_text(_build_html(experiments, ops, comparisons), encoding="utf-8")
+    HTML_OUT.write_text(
+        _build_html(experiments, ops, comparisons, bl_calibration), encoding="utf-8"
+    )
 
     from collections import Counter
     tiers = Counter(r["tier"] for r in experiments)
@@ -1147,7 +1412,8 @@ def main() -> None:
     print(f"Experiment rows: {len(experiments)} ({len(baselines)} baseline + matrix + stage2 ship"
           f"{'' if not phase3_row else ' + phase3a'}"
           f"{'' if not phase3b_rows else f' + phase3b×{len(phase3b_rows)}'}"
-          f"{'' if not phase3c_rows else f' + phase3c×{len(phase3c_rows)}'})")
+          f"{'' if not phase3c_rows else f' + phase3c×{len(phase3c_rows)}'}"
+          f"{'' if not prod_ship_rows else f' + bl_v4×{len(prod_ship_rows)}'})")
     print(f"Confusion comparisons: {len(comparisons)}")
     print(f"Tiers: {dict(sorted(tiers.items()))}")
     print(f"Ops rows: {len(ops)}")

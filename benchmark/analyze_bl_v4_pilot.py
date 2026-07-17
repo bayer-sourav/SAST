@@ -94,7 +94,7 @@ def analyze(*, corpus_dir: Path, runs_root: Path, profile: str) -> dict:
     }
 
 
-def write_html(report: dict, path: Path) -> None:
+def write_html(report: dict, path: Path, *, title: str = "BL v4 — ship inference review") -> None:
     rows_html = []
     for r in report["rows"]:
         cls = "pass" if r["correct_bl"] else "fail"
@@ -119,8 +119,8 @@ table {{ border-collapse: collapse; width: 100%; font-size: 13px; }}
 th, td {{ border: 1px solid #ddd; padding: 6px 8px; vertical-align: top; }}
 th {{ background: #f3f4f6; }}
 </style></head><body>
-<h1>BL v4 Pilot — Stage 2 GOOD inference review</h1>
-<p><b>Pilot pass:</b> {'YES' if report['pilot_pass'] else 'NO'} ·
+<h1>{html.escape(title)}</h1>
+<p><b>Gates pass:</b> {'YES' if report['pilot_pass'] else 'NO'} ·
 <b>BL rate:</b> {report['bl_rate']*100:.1f}% ({report['distribution'].get('BL',0)}/{report['evaluated']}) ·
 <b>Missing:</b> {report['missing']}</p>
 <h2>Automated gates</h2><ul>{gate_lines}</ul>
@@ -139,6 +139,7 @@ def main() -> None:
     ap.add_argument("--profile", default="qwen3_5_9b_bnb")
     ap.add_argument("--json-out", type=Path, default=_sast / "runs" / "bl_v4_pilot" / "pilot_review.json")
     ap.add_argument("--html-out", type=Path, default=_sast / "runs" / "bl_v4_pilot" / "PILOT_REVIEW.html")
+    ap.add_argument("--title", default="BL v4 — ship inference review")
     args = ap.parse_args()
 
     report = analyze(
@@ -148,7 +149,7 @@ def main() -> None:
     )
     args.json_out.parent.mkdir(parents=True, exist_ok=True)
     args.json_out.write_text(json.dumps(report, indent=2), encoding="utf-8")
-    write_html(report, args.html_out.expanduser().resolve())
+    write_html(report, args.html_out.expanduser().resolve(), title=args.title)
     summary = {
         "pilot_pass": report["pilot_pass"],
         "bl_rate": report["bl_rate"],

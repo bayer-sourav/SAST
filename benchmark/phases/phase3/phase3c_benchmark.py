@@ -11,6 +11,9 @@ _SAST = Path(__file__).resolve().parents[3]
 PHASE3C_SUM = _SAST / "runs/phase3/stage3c/summaries"
 PHASE3C_EVAL = _SAST / "runs/phase3/stage3c/eval"
 PHASE3C_RERANK = PHASE3C_SUM / "css_rerank_best.json"
+PHASE3C_BLV4_SUM = _SAST / "runs/phase3/stage3c_blv4/summaries"
+PHASE3C_BLV4_EVAL = _SAST / "runs/phase3/stage3c_blv4/eval"
+PHASE3C_BLV4_RERANK = PHASE3C_BLV4_SUM / "css_rerank_best.json"
 PHASE2_TEST_N = 600
 PROFILE = "qwen3_5_9b_bnb"
 BEST_EPOCH_DEFAULT = 6
@@ -20,12 +23,35 @@ PHASE3C_TEST_CELLS: tuple[dict[str, Any], ...] = (
         "id": "phase3c_fs0_off",
         "label": "Phase 3C LoRA · epoch {epoch} · fs0 ship",
         "eval_root": PHASE3C_EVAL,
+        "sum_dir": PHASE3C_SUM,
+        "rerank_path": PHASE3C_RERANK,
         "sum_suffix": "",
         "thinking": "off",
         "fewshot": 0,
         "category": "Phase 3C LoRA (ship-aligned)",
         "epoch_source": "rerank",
-        "note": "Ship-aligned distill: json_only targets · fs0_off train+val CSS · v7-ship · gap-fill test (6 missing).",
+        "source_stem": "phase3/stage3c",
+        "confusion_key": "phase3c",
+        "note": "Original 3C (retired BLSynthetic* train): json_only · fs0_off · v7-ship · epoch 6 · SRS 89.9% after gap-fill.",
+    },
+    {
+        "id": "phase3c_blv4_fs0_off",
+        "label": "Phase 3C blv4 LoRA · epoch {epoch} · fs0 confirm",
+        "eval_root": PHASE3C_BLV4_EVAL,
+        "sum_dir": PHASE3C_BLV4_SUM,
+        "rerank_path": PHASE3C_BLV4_RERANK,
+        "sum_suffix": "",
+        "thinking": "off",
+        "fewshot": 0,
+        "category": "Phase 3C LoRA (BL v4 confirm)",
+        "epoch_source": "rerank",
+        "source_stem": "phase3/stage3c_blv4",
+        "confusion_key": "blv4",
+        "note": (
+            "Confirmatory 3C on curated_v4 BL synthetics (BenchmarkTest28xxx). "
+            "Gates NOT met: SRS 88.1% · VDR 72.5% · FPRR 76.5% (600/600). "
+            "Do not ship — VDR collapsed vs original 3C / Stage 2."
+        ),
     },
 )
 
@@ -36,10 +62,11 @@ def _row_key(profile: str = PROFILE) -> str:
     return _model_row_name(profile)
 
 
-def load_rerank_best() -> dict[str, Any]:
-    if not PHASE3C_RERANK.is_file():
+def load_rerank_best(rerank_path: Path | None = None) -> dict[str, Any]:
+    path = rerank_path or PHASE3C_RERANK
+    if not path.is_file():
         return {"epoch": BEST_EPOCH_DEFAULT, "metrics": {}}
-    doc = json.loads(PHASE3C_RERANK.read_text(encoding="utf-8"))
+    doc = json.loads(path.read_text(encoding="utf-8"))
     best = doc.get("best") or {}
     return {
         "epoch": int(best.get("epoch") or BEST_EPOCH_DEFAULT),
@@ -51,7 +78,7 @@ def load_rerank_best() -> dict[str, Any]:
 
 def load_cell_epoch(cell: dict[str, Any]) -> int:
     if cell.get("epoch_source") == "rerank":
-        return load_rerank_best()["epoch"]
+        return load_rerank_best(cell.get("rerank_path"))["epoch"]
     return int(cell.get("epoch") or BEST_EPOCH_DEFAULT)
 
 
@@ -60,10 +87,11 @@ def load_test_cell_metrics(cell: dict[str, Any]) -> dict[str, Any] | None:
     from benchmark.srs import compute_srs
     from benchmark.summarize_triage import macro_f1_from_track_f1s
 
+    sum_dir = Path(cell.get("sum_dir") or PHASE3C_SUM)
     suffix = cell["sum_suffix"]
-    fp_path = PHASE3C_SUM / f"comparison_fp_phase3a{suffix}.json"
-    tp_path = PHASE3C_SUM / f"comparison_tp_phase3a{suffix}.json"
-    bl_path = PHASE3C_SUM / f"comparison_bl_phase3a{suffix}.json"
+    fp_path = sum_dir / f"comparison_fp_phase3a{suffix}.json"
+    tp_path = sum_dir / f"comparison_tp_phase3a{suffix}.json"
+    bl_path = sum_dir / f"comparison_bl_phase3a{suffix}.json"
     if not fp_path.is_file() or not tp_path.is_file():
         return None
 
@@ -84,6 +112,14 @@ def load_test_cell_metrics(cell: dict[str, Any]) -> dict[str, Any] | None:
         thinking=cell["thinking"],
         fewshot=int(cell["fewshot"]),
     )
+    # Prefer live eval; fall back to archived summary when eval trees were cleaned.
+    if int(cm.get("n_cases") or 0) == 0:
+        cm_path = sum_dir / "confusion_matrix_comparison.json"
+        key = cell.get("confusion_key")
+        if key and cm_path.is_file():
+            archived = json.loads(cm_path.read_text(encoding="utf-8")).get(key) or {}
+            if archived:
+                cm = archived
     srs = compute_srs(fp_m, tp_m, bl_m or None, test_n=PHASE2_TEST_N)
     macro = macro_f1_from_track_f1s(
         float(fp_m.get("f1") or 0),
@@ -128,6 +164,7 @@ def experiment_row_from_cell(m: dict[str, Any]) -> dict[str, Any]:
     correct = int(fp_t.get("correct") or 0) + int(tp_t.get("correct") or 0)
     denom = int(fp_t.get("evaluated") or 0) + int(tp_t.get("evaluated") or 0)
     accuracy = correct / denom if denom else 0.0
+    stem = m.get("source_stem") or "phase3/stage3c"
     return {
         "model": m["label"],
         "profile": m["profile"],
@@ -136,7 +173,7 @@ def experiment_row_from_cell(m: dict[str, Any]) -> dict[str, Any]:
         "band_order": 7,
         "thinking": m["thinking"],
         "fewshot": m["fewshot"],
-        "source": f"phase3/stage3c/epoch-{m['epoch']}",
+        "source": f"{stem}/epoch-{m['epoch']}",
         "phase": "Phase 3C",
         "epoch": m["epoch"],
         "vdr": m["vdr"],

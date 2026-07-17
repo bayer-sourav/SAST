@@ -215,7 +215,56 @@ Success criterion for Phase 3A: beat Stage 2 ship config on held-out 600-case te
 | Original study plan | `docs/EXPERIMENT_PLAN.md` |
 | **Phase 1 closure** | `runs/phase1/PHASE1_COMPLETE.md` |
 | Demo (uses Stage 3 smoke cache) | `demo/README.md` |
+| **Borderline v4 BL calibration (post-closure)** | `benchmark/phases/phase2/BL_V4.md` |
+| **v8-ship-bl Phase 1 (stopped)** | `runs/phase2/v8_phase1/PHASE1_STOPPED.md` · plan `benchmark/phases/phase2/v8_phase1/PLAN.md` |
+| v8-ship-bl 600-case vs Stage 2 | `runs/bl_v4_prod_ship_eval/COMPARE_VS_STAGE2.md` |
 
 ---
 
-*Phase 2 closed after Stage 3 and post-Stage-2 probes. All raw run outputs under `runs/phase2/` and `runs/smoke/`.*
+## 10. Post-closure — Borderline v4 BL calibration (July 2026)
+
+After Phase 2 closed on Java-specific **v7-balanced**, we ran a **BL-focused eval track** on the v4 borderline test corpus (200 BL-gold cases) and a **600-case prod-ship** comparison with language-agnostic prompts.
+
+**Full tables and notes:** [`benchmark/phases/phase2/BL_V4.md`](../../benchmark/phases/phase2/BL_V4.md)
+
+### Headline (200-case BL test, not pilot)
+
+| Config | BL rate | Gates |
+|--------|--------:|-------|
+| `v7-ship-bl` + 3-shot, pre-calibration | 18.5% | FAIL |
+| `v7-ship-bl` + 3-shot, calibrated v1 templates | 7.0% | FAIL (template regression) |
+| `v7-ship-bl` + 4-shot, calibrated v3 | 27.5% | FAIL |
+| **`v8-ship-bl` + 4-shot, calibrated v3** | **41.5%** | **PASS** |
+
+### 600-case merged (FP + TP + BL)
+
+| Config | SRS* | FPRR | VDR | BL rate |
+|--------|-----:|-----:|----:|--------:|
+| Stage 2 `v7-balanced` fs3 | 92.5% | 73.5% | 92.5% | 0.0% |
+| `v7-balanced-langagnostic` fs3 | 84.4% | 67.0% | 72.4% | 4.0% |
+| **`v8-ship-bl` fs4** | **86.1%** | 67.5% | 74.6% | **41.5%** |
+
+\*Asymmetric-penalty SRS over all 600 cases (see `benchmark/srs.py`).
+
+**Implications for next work:** Prompt-only **v8-ship-bl** is the best lang-agnostic + BL path found so far, but **VDR (−17.9pp vs Stage 2)** is the binding constraint for holistic improvement. Phase 3 LoRA did not beat Stage 2 on TP/FP; combining v8 BL calibration with VDR recovery (prompt, few-shot, or preference tuning) is the agreed frontier — not reverting to Java-only v7 for multi-language ship.
+
+---
+
+## 11. v8-ship-bl roadmap — Phase 1 stopped (July 2026)
+
+Phase 2 is **closed for prompt-only Java v7**. Phase 1 prompt ablations for **lang-agnostic v8-ship-bl** were started, then **stopped** to avoid further tuning on the held-out 600-case test.
+
+**Closure:** [`runs/phase2/v8_phase1/PHASE1_STOPPED.md`](v8_phase1/PHASE1_STOPPED.md) · **Plan:** [`benchmark/phases/phase2/v8_phase1/PLAN.md`](../../benchmark/phases/phase2/v8_phase1/PLAN.md)
+
+| Phase | Status | Notes |
+|-------|--------|-------|
+| **1 — Prompt ablations** | **Stopped** | 1A smoke (no passer); 1B exploratory `8C-think-off` only; ship stays think-on v8 |
+| 2 — Integration | Not started | Was gated on Phase 1; optional later without more test peeks |
+| 3 — Training | Deferred | Needs train/val; not more 600-case prompt cells |
+| 4 — Multi-language | Deferred | When corpora exist |
+
+**Ship record (unchanged):** `v8-ship-bl` · fs4 · thinking ON · VDR 74.6% · FPRR 67.5% · SRS 86.1% · BL 41.5% · TP→FP 43.
+
+---
+
+*Phase 2 closed after Stage 3 and post-Stage-2 probes. BL v4 calibration evals (July 2026) extend the record in `BL_V4.md`. Raw outputs under `runs/phase2/`, `runs/bl_v4_*`, and `runs/smoke/`.*

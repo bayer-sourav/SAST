@@ -1,5 +1,23 @@
 Cutting Security Alert Noise with SLM — see [benchmark/README.md](benchmark/README.md) for RQ1 CodeQL-only runs (local Qwen + optional OpenHands).
 
+## Current experiments (v8-ship-bl roadmap)
+
+**Phase 1 stopped** (July 2026): no more prompt ablations on the held-out 600-case test. Ship remains **`v8-ship-bl` fs4 thinking ON**. Closure: [`runs/phase2/v8_phase1/PHASE1_STOPPED.md`](runs/phase2/v8_phase1/PHASE1_STOPPED.md) · plan: [`benchmark/phases/phase2/v8_phase1/PLAN.md`](benchmark/phases/phase2/v8_phase1/PLAN.md).
+
+**Phase 3C BL refresh (complete, gates NOT met):** confirmatory re-train on `curated_v4` BL synthetics failed VDR/SRS gates (SRS 88.1%, VDR 72.5%). Do **not** ship blv4. Report: [`PHASE3C_BLV4_TEST_REPORT.md`](runs/phase3/stage3c_blv4/summaries/PHASE3C_BLV4_TEST_REPORT.md).
+
+**Integration interim (latency):** prefer **Phase 3B ep4 fs0** (`lora/best_fs0_off`, think off) over Stage 2 think-on for production latency — plan in SAST-Integration.
+
+| Phase | Status | Doc |
+|-------|--------|-----|
+| **1** | **Stopped** (1A smoke + 1B exploratory 8C only) | [`PHASE1_STOPPED.md`](runs/phase2/v8_phase1/PHASE1_STOPPED.md) |
+| **3C BL refresh** | **Complete — NOT ship** | [`PHASE3C_BLV4_TEST_REPORT.md`](runs/phase3/stage3c_blv4/summaries/PHASE3C_BLV4_TEST_REPORT.md) |
+| 2 | Integration: 3B ep4 fs0 candidate | SAST-Integration |
+| 3+ | Deferred | Plan §3–4 |
+
+Results leaderboard: [`runs/phase2/phase2_benchmark_tables/BENCHMARK_RESULTS.html`](runs/phase2/phase2_benchmark_tables/BENCHMARK_RESULTS.html) · BL calibration: [`benchmark/phases/phase2/BL_V4.md`](benchmark/phases/phase2/BL_V4.md)
+
+---
 ## Report
 - Paper: https://arxiv.org/pdf/2601.22952v1
     - Summary:
