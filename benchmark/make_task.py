@@ -206,6 +206,64 @@ def _render_source_section(
     return f"### File\n{src_text}"
 
 
+def build_csf_user_message(case: dict[str, Any], repo_root: Path) -> str:
+    """CSF findings-analyzer user message: rule line + numbered snippets (no raw SARIF)."""
+    meta = case.get("metadata") if isinstance(case.get("metadata"), dict) else {}
+    file_path = case.get("file") or meta.get("location_path") or "?"
+    filename = Path(str(file_path)).name or str(file_path)
+    start = meta.get("start_line")
+    end = meta.get("end_line", start)
+    if start is None:
+        start = "?"
+    if end is None:
+        end = start
+    vulnerability = (
+        (meta.get("rule_description") or "").strip()
+        or (meta.get("rule_id") or "").strip()
+        or "?"
+    )
+    cid = stable_case_id(case)
+    lines = [
+        f"CodeQL reported a finding on line {start} through {end} of {filename}, "
+        f"reported vulnerability is : {vulnerability}.",
+        "",
+    ]
+    snippets = case.get("code_snippets")
+    if isinstance(snippets, list) and snippets:
+        step = 0
+        for snip in snippets:
+            if not isinstance(snip, dict):
+                continue
+            step += 1
+            rel = snip.get("file") or file_path or "?"
+            s_line = snip.get("start_line")
+            try:
+                s_i = int(s_line) if s_line is not None else None
+            except (TypeError, ValueError):
+                s_i = None
+            loc = f"{rel} (Line {s_i})" if s_i is not None else str(rel)
+            text = snip.get("text")
+            if not isinstance(text, str) or not text.strip():
+                text = _read_line_range(
+                    repo_root,
+                    str(rel),
+                    snip.get("start_line"),
+                    snip.get("end_line"),
+                )
+            lines.append(f"Step {step}: {loc}")
+            if text.strip():
+                lines.append(text.rstrip())
+            lines.append("")
+    else:
+        lines.append("(No code flow or snippets available for this finding.)")
+        lines.append("")
+
+    lines.append(f"case_id: `{cid}`")
+    lines.append('Set JSON fields `case_id` to that value and `agent` to `"llm"`.')
+    return "\n".join(lines).strip("\n")
+
+
+
 def _read_line_range(
     repo_root: Path,
     rel_path: str,
@@ -234,7 +292,17 @@ def build_task_markdown(
     few_shot_config: str | Path | None = None,
     prompt_version: str | None = None,
 ) -> str:
+    from benchmark.prompt_versions import is_csf_style_prompt
+
     cid = stable_case_id(case)
+    # CSF layout: thin user evidence only (procedure lives in the system message).
+    if is_csf_style_prompt(prompt_version):
+        user_body = build_csf_user_message(case, repo_root)
+        return (
+            f"{TASK_TITLE_MARKER} ({task_prompt_tag(few_shot=0, prompt_version=prompt_version)})\n\n"
+            f"{user_body}\n"
+        )
+
     tool = case.get("tool", "unknown-tool")
     tool_list = [tool] if isinstance(tool, str) else (tool or [])
     file_path = case.get("file")

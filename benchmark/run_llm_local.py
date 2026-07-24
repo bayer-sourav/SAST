@@ -67,8 +67,16 @@ def _ensure_paths(sast_root: Path) -> None:
         sys.path.insert(0, str(sast_root))
 
 
-def _system_prompt() -> str:
-    """JSON/output rules only; few-shot exemplars live in task.md (see make_task --few-shot)."""
+def _system_prompt(*, prompt_version: str | None = None) -> str:
+    """Default: JSON rules only. csf-analyzer: full CSF procedure (+ JSON schema) as system."""
+    from benchmark.prompt_versions import build_task_procedure, is_csf_style_prompt
+    from benchmark.make_task import DEFAULT_OUTPUT_SCHEMA
+
+    if is_csf_style_prompt(prompt_version):
+        return build_task_procedure(
+            prompt_version=prompt_version,
+            output_schema=DEFAULT_OUTPUT_SCHEMA,
+        )
     return _SYSTEM_PROMPT
 
 
@@ -112,6 +120,13 @@ def prepare_triage_messages(
     from benchmark.few_shot import layout_tag_from_config  # noqa: E402
 
     case_id = stable_case_id(case)
+    from benchmark.prompt_versions import is_csf_style_prompt  # noqa: E402
+
+    # CSF prompt embeds few-shots in the system procedure; skip task.md exemplars.
+    if is_csf_style_prompt(prompt_version):
+        few_shot = 0
+        few_shot_config = None
+
     layout_version = layout_tag_from_config(few_shot_config) if few_shot > 0 else None
     effective_scan_root = case.get("scan_root") or scan_root
     repo_root = _repo.resolve_benchmark_java_root(sast_root, case, repo, case_path=case_path)
@@ -165,7 +180,7 @@ def prepare_triage_messages(
         task_sec = time.perf_counter() - t_task_start
 
     task_text = _maybe_append_short_thinking(task_path.read_text(encoding="utf-8"))
-    system_text = _system_prompt()
+    system_text = _system_prompt(prompt_version=prompt_version)
     messages: list[dict[str, str]] = [
         {"role": "system", "content": system_text},
         {"role": "user", "content": task_text},
