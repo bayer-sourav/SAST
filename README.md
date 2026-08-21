@@ -17,6 +17,8 @@ Cutting Security Alert Noise with SLM — see [benchmark/README.md](benchmark/RE
 
 Results leaderboard: [`runs/phase2/phase2_benchmark_tables/BENCHMARK_RESULTS.html`](runs/phase2/phase2_benchmark_tables/BENCHMARK_RESULTS.html) · BL calibration: [`benchmark/phases/phase2/BL_V4.md`](benchmark/phases/phase2/BL_V4.md)
 
+**Qwen3.8-27B FP8 (Aug 2026, NOT ship):** same `v7-balanced` fs3 stack as Stage 2; L40S used FP8 not NVFP4. 600-case SRS 87.0% / FPRR 77.3% / VDR 81.9% vs 9B ship 83.0 / 73.5 / 92.5. Report: [`PROD_SHIP_600_REPORT.md`](runs/qwen38_27b_nvfp4_v7/full_600/PROD_SHIP_600_REPORT.md).
+
 ---
 ## Report
 - Paper: https://arxiv.org/pdf/2601.22952v1

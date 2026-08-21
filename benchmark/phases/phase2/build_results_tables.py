@@ -116,6 +116,7 @@ PHASE3B_BAND = (6, "Phase 3B LoRA", "cat-phase3b")
 PHASE3C_BAND = (7, "Phase 3C LoRA", "cat-phase3c")
 PHASE3D_BAND = (8, "Phase 3D LoRA", "cat-phase3d")
 BL_V4_BAND = (9, "BL v4 / lang-agnostic ship", "cat-bl-v4")
+QWEN38_BAND = (10, "Qwen3.8 scale-up", "cat-qwen38")
 PHASE3_SUM = _SAST / "runs/phase3/stage3a/summaries"
 PHASE3_EVAL = _SAST / "runs/phase3/stage3a/eval"
 CONFUSION_JSON = OUT_DIR / "benchmark_confusion_comparison.json"
@@ -132,6 +133,19 @@ PROD_SHIP_EVALS: tuple[dict, ...] = (
         "label": "Qwen3.5-9B · v8-ship-bl fs4",
         "eval_root": _SAST / "runs/bl_v4_prod_ship_eval",
         "note": "Lang-agnostic + BL calibration · v8-ship-bl · 4-shot v2_4shot_tp_fp_bl2 · thinking on · vLLM.",
+    },
+    {
+        "id": "qwen38_27b_fp8_v7_fs3",
+        "label": "Qwen3.8-27B FP8 · v7-balanced fs3",
+        "eval_root": _SAST / "runs/qwen38_27b_nvfp4_v7/full_600",
+        "note": (
+            "Same Stage 2 prompt stack (v7-balanced · think ON · v2_3shot_tp_2fp). "
+            "L40S cannot run NVFP4 (needs Blackwell); served Qwen/Qwen3.8-27B-FP8 via vLLM 0.27. "
+            "SRS +4pp vs Stage 2 9B ship; VDR −10.6pp (35 TP→FP). NOT a ship replacement."
+        ),
+        "band": QWEN38_BAND,
+        "fewshot": 3,
+        "phase": "Qwen3.8 scale-up (Aug 2026)",
     },
 )
 
@@ -837,7 +851,7 @@ def _row_from_merged_600(cfg: dict) -> dict | None:
     m = data.get("merged") or {}
     fp_t = data.get("fp_track") or {}
     tp_t = data.get("tp_track") or {}
-    band_order, category, row_class = BL_V4_BAND
+    band_order, category, row_class = cfg.get("band") or BL_V4_BAND
     fp_ev = int(fp_t.get("evaluated", 0))
     tp_ev = int(tp_t.get("evaluated", 0))
     acc = (
@@ -853,9 +867,9 @@ def _row_from_merged_600(cfg: dict) -> dict | None:
             "row_class": row_class,
             "band_order": band_order,
             "thinking": "on",
-            "fewshot": 4 if "v8" in cfg["id"] else 3,
+            "fewshot": int(cfg.get("fewshot") or (4 if "v8" in cfg["id"] else 3)),
             "source": str(cfg["eval_root"].relative_to(_SAST)),
-            "phase": "BL v4 prod ship",
+            "phase": cfg.get("phase") or "BL v4 prod ship",
             "vdr": float(m.get("vdr", 0.0)),
             "fprr": float(m.get("fprr", 0.0)),
             "macro_f1": float(m.get("macro_f1", 0.0)),
@@ -906,7 +920,7 @@ def _confusion_from_merged_600(cfg: dict) -> dict | None:
         sum(matrix[g].values()) + missing_by_gold.get(g, 0) for g in ("TP", "FP", "BL")
     )
     correct = sum(matrix[g].get(g, 0) for g in ("TP", "FP", "BL"))
-    band_order, category, row_class = BL_V4_BAND
+    band_order, category, row_class = cfg.get("band") or BL_V4_BAND
     return {
         "id": cfg["id"],
         "label": cfg["label"],
@@ -1105,8 +1119,8 @@ def _build_confusion_section(comparisons: list[dict]) -> str:
         )
 
     return f"""<section>
-<h2>Confusion matrices — Stage 2 GOOD · Phase 2 MINIMUM · Phase 3A–3D · BL v4 ship</h2>
-<p class="subtitle">Full 3×3 gold × predicted over 600 cases (200 FP + 200 TP + 200 BL). Phase 3B rows span teacher-matched (ep{train_ep}) and ship fs0_off (ep{ship_ep} rerank). Phase 3C: ship-aligned distill (ep{phase3c_ep}, fs0_off) plus blv4 BL-refresh confirm (NOT ship). Phase 3D: constrained CSS pick (ep{phase3d_ep}, fs0_off, 600/600). <b>BL v4 ship</b> rows: lang-agnostic v7 and v8-ship-bl prod eval. Diagonal = correct; shaded cells = high-penalty misclassifications. <b>BL-gold:</b> Stage 2 rarely predicts BL (BL→TP is SRS-free); v8-ship-bl emits BL on 83/200 BL-gold cases.</p>
+<h2>Confusion matrices — Stage 2 GOOD · Phase 2 MINIMUM · Phase 3A–3D · BL v4 ship · Qwen3.8</h2>
+<p class="subtitle">Full 3×3 gold × predicted over 600 cases (200 FP + 200 TP + 200 BL). Phase 3B rows span teacher-matched (ep{train_ep}) and ship fs0_off (ep{ship_ep} rerank). Phase 3C: ship-aligned distill (ep{phase3c_ep}, fs0_off) plus blv4 BL-refresh confirm (NOT ship). Phase 3D: constrained CSS pick (ep{phase3d_ep}, fs0_off, 600/600). <b>BL v4 ship</b> rows: lang-agnostic v7 and v8-ship-bl prod eval. <b>Qwen3.8-27B FP8</b> is the same v7-balanced fs3 stack as Stage 2 (NOT ship: VDR 81.9%). Diagonal = correct; shaded cells = high-penalty misclassifications. <b>BL-gold:</b> Stage 2 rarely predicts BL (BL→TP is SRS-free); v8-ship-bl emits BL on 83/200 BL-gold cases.</p>
 <table>
 <thead><tr>{summary_head}</tr></thead>
 <tbody>{"".join(summary_rows)}</tbody>
@@ -1214,6 +1228,7 @@ tr.cat-phase3b {{ background: #f3e5f5; }}
 tr.cat-phase3c {{ background: #e8eaf6; }}
 tr.cat-phase3d {{ background: #e0f2f1; }}
 tr.cat-bl-v4 {{ background: #e8f5e9; }}
+tr.cat-qwen38 {{ background: #fff3e0; }}
 .note {{ background: #fff8e1; padding: 8px 12px; border-radius: 4px; margin-bottom: 1rem; }}
 .cm-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1.25rem; margin-top: 1rem; }}
 .cm-block h3 {{ font-size: 0.95rem; margin: 0 0 0.25rem; color: #1e3a5f; }}
@@ -1238,7 +1253,7 @@ td.cm-warn {{ background: #fff9c4; }}
 
 <section>
 <h1>Phase 2 Benchmark Results — All Models &amp; Approaches</h1>
-<p class="subtitle">Test set · baselines n=27 (PoC reference) · LLM rows 600-case Phase 2 test (200 FP + 200 TP + 200 BL) · Baseline → Zero-shot → Few-shot → Few-shot (CoT) → Stage 2 ship → Phase 3A/3B/3C/3D LoRA → <b>BL v4 lang-agnostic ship</b> · Tier = PoC success gates (four metrics + hard gates; CRITICAL limit scales with total test size)</p>
+<p class="subtitle">Test set · baselines n=27 (PoC reference) · LLM rows 600-case Phase 2 test (200 FP + 200 TP + 200 BL) · Baseline → Zero-shot → Few-shot → Few-shot (CoT) → Stage 2 ship → Phase 3A/3B/3C/3D LoRA → BL v4 lang-agnostic ship → <b>Qwen3.8-27B FP8</b> · Tier = PoC success gates (four metrics + hard gates; CRITICAL limit scales with total test size)</p>
 <table>
 <thead><tr>{exp_thead}</tr></thead>
 <tbody>{"".join(exp_trs)}</tbody>
@@ -1320,6 +1335,9 @@ td.cm-warn {{ background: #fff9c4; }}
 <dt>BL v4 / lang-agnostic ship (July 2026)</dt>
 <dd><b>v7-balanced-langagnostic</b> — language-neutral v7 procedure (fs3, thinking on); 600-case SRS 84.4%, BL rate 4%. <b>v8-ship-bl</b> — lang-agnostic + BL calibration rules + 4-shot <code>v2_4shot_tp_fp_bl2</code>; 600-case SRS 86.1%, BL rate 41.5% (passes BL gates on 200-case BL test). Tradeoff: VDR −17.9pp vs Stage 2 (43 TP→FP vs 14). Full calibration progression table below. Markdown: <code>benchmark/phases/phase2/BL_V4.md</code>.</dd>
 
+<dt>Qwen3.8-27B FP8 (August 2026)</dt>
+<dd>Scale-up of the Stage 2 prompt stack (<code>v7-balanced</code> · thinking on · fs3 · <code>v2_3shot_tp_2fp</code>) on Qwen3.8-27B. NVFP4 is Blackwell-only; this L40S eval used <code>Qwen/Qwen3.8-27B-FP8</code> via vLLM 0.27. 600-case: SRS 87.0% · FPRR 77.3% · VDR 81.9% · 35 TP→FP. Higher SRS than the 9B ship (83.0%) but VDR −10.6pp — <b>not a ship replacement</b>. Report: <code>runs/qwen38_27b_nvfp4_v7/full_600/PROD_SHIP_600_REPORT.md</code>.</dd>
+
 <dt>CSS (Phase 3B–3D checkpoint selection)</dt>
 <dd><code>CSS = 0.35·SRS + 0.35·VDR + 0.20·FPRR + 0.10·Macro-F1</code> on validation; disqualified if VDR &lt; 0.75. Used for epoch pick only — not the final ship gate (test SRS is).</dd>
 
@@ -1368,7 +1386,7 @@ def main() -> None:
             + (f" + Phase 3B LoRA ({len(phase3b_rows)} cells)" if phase3b_rows else "")
             + (f" + Phase 3C LoRA ({len(phase3c_rows)} cells)" if phase3c_rows else "")
             + (f" + Phase 3D LoRA ({len(phase3d_rows)} cells)" if phase3d_rows else "")
-            + (f" + BL v4 prod ship ({len(prod_ship_rows)} cells)" if prod_ship_rows else "")
+            + (f" + prod/scale-up ship ({len(prod_ship_rows)} cells)" if prod_ship_rows else "")
             + "."
         ),
         "baselines": baselines,
@@ -1413,7 +1431,7 @@ def main() -> None:
           f"{'' if not phase3_row else ' + phase3a'}"
           f"{'' if not phase3b_rows else f' + phase3b×{len(phase3b_rows)}'}"
           f"{'' if not phase3c_rows else f' + phase3c×{len(phase3c_rows)}'}"
-          f"{'' if not prod_ship_rows else f' + bl_v4×{len(prod_ship_rows)}'})")
+          f"{'' if not prod_ship_rows else f' + prod/scale-up×{len(prod_ship_rows)}'})")
     print(f"Confusion comparisons: {len(comparisons)}")
     print(f"Tiers: {dict(sorted(tiers.items()))}")
     print(f"Ops rows: {len(ops)}")

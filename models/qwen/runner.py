@@ -7,6 +7,7 @@ Menu profiles (see main.py):
   qwen3_14b_bnb — Qwen3-14B (Unsloth bnb-4bit hub + HF instruct fallback).
   qwen3_5_9b_bnb — Qwen3.5-9B (Unsloth 4-bit hub id + HF fallback).
   qwen3_6_27b_bnb — Qwen3.6-27B (Unsloth 4-bit hub id + HF fallback).
+  qwen3_8_27b_nvfp4 — Qwen3.8-27B; vLLM NVFP4 on Blackwell, else Unsloth 4-bit.
   qwen3_6_35b_a3b_bnb — Qwen3.6-35B-A3B MoE (Unsloth 4-bit hub id + HF fallback).
   qwen3_coder_30b_bnb — Qwen3-Coder-30B-A3B; uses Amazon Bedrock when configured
     (``OPENAI_BASE_URL`` / ``AWS_BEARER_TOKEN_BEDROCK``), else local Unsloth/HF.
@@ -56,6 +57,7 @@ QWEN3_PROFILES = frozenset(
         "qwen3_5_4b_bnb",
         "qwen3_5_9b_bnb",
         "qwen3_6_27b_bnb",
+        "qwen3_8_27b_nvfp4",
         "qwen3_6_35b_a3b_bnb",
         "qwen3_coder_30b_bnb",
         "qwen3_next_80b_bnb",
@@ -290,6 +292,11 @@ def _resolve_ids(profile: str) -> tuple[str, str]:
         u = os.environ.get("QWEN3_6_27B_UNSLOTH_MODEL_ID", "unsloth/Qwen3.6-27B")
         h = os.environ.get("QWEN3_6_27B_HF_MODEL_ID", "Qwen/Qwen3.6-27B")
         return u, h
+    if profile == "qwen3_8_27b_nvfp4":
+        # NVFP4 checkpoint is vLLM-only (Blackwell). Unsloth path uses the BF16 hub id + 4-bit.
+        u = os.environ.get("QWEN3_8_27B_UNSLOTH_MODEL_ID", "unsloth/Qwen3.8-27B")
+        h = os.environ.get("QWEN3_8_27B_HF_MODEL_ID", "Qwen/Qwen3.8-27B")
+        return u, h
     if profile == "qwen3_6_35b_a3b_bnb":
         u = os.environ.get("QWEN3_6_35B_A3B_UNSLOTH_MODEL_ID", "unsloth/Qwen3.6-35B-A3B")
         h = os.environ.get("QWEN3_6_35B_A3B_HF_MODEL_ID", "Qwen/Qwen3.6-35B-A3B")
@@ -414,6 +421,12 @@ def _load_unsloth(*, use_4bit: bool, unsloth_model_id: str) -> tuple[Any, Any]:
         raise ImportError(f"Unsloth not usable on this device: {exc}") from exc
 
     log_gpu_status("Qwen Unsloth")
+    if _ACTIVE_PROFILE == "qwen3_8_27b_nvfp4":
+        print(
+            "[Qwen] qwen3_8_27b_nvfp4: NVFP4 needs Blackwell + vLLM; "
+            f"loading Unsloth 4-bit {unsloth_model_id!r} on this GPU",
+            flush=True,
+        )
     ml = unsloth_model_id.lower()
     if "coder" in ml or "30b" in ml or "27b" in ml or "35b" in ml:
         max_seq = int(os.environ.get("QWEN_CODER_MAX_SEQ_LEN", "4096"))
@@ -790,6 +803,8 @@ def generate_from_chat_messages(
             print("[Qwen] Check disk space, HF_TOKEN / huggingface-cli login, and hub cache.")
         if "register_constant" in err or "_pytree" in err:
             print("[Qwen] PyTorch / Unsloth version mismatch is common; try pinned torch or HF-only.")
+        if profile == "qwen3_8_27b_nvfp4":
+            raise
 
     if tools:
         return _hf_generate_with_template(

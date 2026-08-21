@@ -16,7 +16,10 @@ _VLLM_MODEL_DEFAULTS: dict[str, str] = {
     "qwen3_14b_bnb": "Qwen/Qwen3-14B",
     "qwen3_4b_bnb": "Qwen/Qwen3-4B-Instruct-2507",
     "2_5_7b": "Qwen/Qwen2.5-7B-Instruct",
+    "qwen3_8_27b_nvfp4": "unsloth/Qwen3.8-27B-NVFP4",
 }
+
+NVFP4_PROFILES = frozenset({"qwen3_8_27b_nvfp4"})
 
 
 def infer_backend() -> str:
@@ -24,23 +27,44 @@ def infer_backend() -> str:
     return os.environ.get("QWEN_INFER_BACKEND", "unsloth").strip().lower()
 
 
+def gpu_supports_nvfp4() -> bool:
+    """NVFP4 kernels need Blackwell (compute capability >= 10.0)."""
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return False
+        major, _minor = torch.cuda.get_device_capability(0)
+        return major >= 10
+    except Exception:
+        return False
+
+
+def _is_nvfp4_model(model_id: str) -> bool:
+    return "nvfp4" in model_id.lower()
+
+
 def should_use_vllm(profile: str) -> bool:
+    if profile in ("qwen3_coder_30b_bnb", "qwen3_next_80b_bnb"):
+        return False
     if infer_backend() not in ("vllm", "1", "true", "yes"):
         return False
-    if profile in ("qwen3_coder_30b_bnb", "qwen3_next_80b_bnb"):
+    # Gate on the resolved checkpoint, not the profile name: an NVFP4 build needs
+    # Blackwell, but the same profile pointed at FP8/INT4 runs fine on Ada.
+    if _is_nvfp4_model(_vllm_model_id(profile)) and not gpu_supports_nvfp4():
         return False
     return True
 
 
 def _vllm_model_id(profile: str) -> str:
-    env_global = os.environ.get("QWEN_VLLM_MODEL_ID", "").strip()
-    if env_global:
-        return env_global
     env_profile = os.environ.get(f"QWEN_{profile.upper()}_VLLM_MODEL_ID", "").strip()
     if env_profile:
         return env_profile
     if profile in _VLLM_MODEL_DEFAULTS:
         return _VLLM_MODEL_DEFAULTS[profile]
+    env_global = os.environ.get("QWEN_VLLM_MODEL_ID", "").strip()
+    if env_global:
+        return env_global
     raise ValueError(
         f"No vLLM model id for profile {profile!r}; set QWEN_VLLM_MODEL_ID or "
         f"QWEN_{profile.upper()}_VLLM_MODEL_ID"
@@ -143,7 +167,8 @@ def _get_vllm(profile: str) -> Any:
     model_id = _vllm_model_id(profile)
     max_len = int(os.environ.get("QWEN_VLLM_MAX_MODEL_LEN", os.environ.get("QWEN_MAX_SEQ_LEN", "16384")))
     gpu_util = float(os.environ.get("QWEN_VLLM_GPU_MEMORY_UTILIZATION", "0.90"))
-    dtype = os.environ.get("QWEN_VLLM_DTYPE", "bfloat16")
+    dtype_default = "auto" if profile in NVFP4_PROFILES else "bfloat16"
+    dtype = os.environ.get("QWEN_VLLM_DTYPE", dtype_default)
 
     llm_kw: dict[str, Any] = {
         "model": model_id,
@@ -152,6 +177,11 @@ def _get_vllm(profile: str) -> Any:
         "gpu_memory_utilization": gpu_util,
         "trust_remote_code": True,
     }
+    kv_dtype = os.environ.get("QWEN_VLLM_KV_CACHE_DTYPE", "").strip()
+    if not kv_dtype and profile in NVFP4_PROFILES:
+        kv_dtype = "fp8"
+    if kv_dtype:
+        llm_kw["kv_cache_dtype"] = kv_dtype
     lora_path = os.environ.get("QWEN_VLLM_LORA_PATH", "").strip() or os.environ.get(
         "SAST_LORA_ADAPTER", ""
     ).strip()
@@ -226,7 +256,7 @@ def _is_merged_vllm_model(model_id: str) -> bool:
 def _vllm_tokenizer_id(model_id: str, profile: str) -> str | None:
     """Use hub tokenizer for merged exports (full Qwen3_5Config lives on base id)."""
     env_tok = os.environ.get("QWEN_VLLM_TOKENIZER_ID", "").strip()
-    if env_tok:
+    if env_tok and profile not in NVFP4_PROFILES:
         return env_tok
     if _is_merged_vllm_model(model_id):
         return _tokenizer_model_id(model_id, profile)
@@ -254,7 +284,7 @@ def _vllm_tokenizer_slack() -> int:
 def _tokenizer_model_id(model_id: str, profile: str) -> str:
     """Merged LoRA dirs ship Qwen3_5TextConfig; vLLM tokenizer needs full Qwen3_5Config."""
     env_tok = os.environ.get("QWEN_VLLM_TOKENIZER_ID", "").strip()
-    if env_tok:
+    if env_tok and profile not in NVFP4_PROFILES:
         return env_tok
     try:
         from pathlib import Path
@@ -283,6 +313,8 @@ def _vllm_language_model_only(model_id: str) -> bool:
         return True
     if env in ("0", "false", "no"):
         return False
+    if "Qwen3.8" in model_id or "qwen3.8" in model_id.lower():
+        return True
     return _is_merged_vllm_model(model_id)
 
 

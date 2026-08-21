@@ -10,6 +10,8 @@ Output: runs/smoke/large_qwen_stage2_v7/thinking_on/fewshot_3/v7-balanced/<profi
 
 Env:
   LARGE_QWEN_SMOKE_PROFILES — comma-separated profile subset
+  LARGE_QWEN_SMOKE_OUT — output root (default: runs/smoke/large_qwen_stage2_v7)
+  LARGE_QWEN_SMOKE_SLICE — slice JSON (default: /tmp then repo copy)
   LARGE_QWEN_FORCE=1 — delete stale artifacts and re-run
 """
 
@@ -26,8 +28,12 @@ sys.path.insert(0, str(SAST))
 sys.path.insert(0, str(SAST / "benchmark"))
 os.chdir(SAST)
 
-SLICE = Path("/tmp/smoke_slice_cases.json")
-OUT = SAST / "runs/smoke/large_qwen_stage2_v7"
+_DEFAULT_SLICE = Path("/tmp/smoke_slice_cases.json")
+_REPO_SLICE = SAST / "benchmark/phases/phase2/smoke_slice_cases.json"
+SLICE = Path(os.environ.get("LARGE_QWEN_SMOKE_SLICE", str(_DEFAULT_SLICE)))
+if not SLICE.is_file():
+    SLICE = _REPO_SLICE
+OUT = Path(os.environ.get("LARGE_QWEN_SMOKE_OUT", str(SAST / "runs/smoke/large_qwen_stage2_v7")))
 FEWSHOT = 3
 FEWSHOT_CONFIG = "v2_3shot_tp_2fp"
 PROMPT_VERSION = "v7-balanced"

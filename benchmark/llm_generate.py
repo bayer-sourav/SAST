@@ -13,6 +13,7 @@ QWEN_PROFILES = frozenset(
         "qwen3_5_4b_bnb",
         "qwen3_5_9b_bnb",
         "qwen3_6_27b_bnb",
+        "qwen3_8_27b_nvfp4",
         "qwen3_6_35b_a3b_bnb",
         "qwen3_coder_30b_bnb",
         "qwen3_next_80b_bnb",
