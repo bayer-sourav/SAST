@@ -1,8 +1,8 @@
-# Cutting SAST Noise with Small Language Models
+# Cutting SAST Noise with Local Small Language Models
 
 **Supplementary material** for the workshop paper:
 
-> *Cutting SAST Noise with Small Language Models: Prompting, Thinking, Distillation, and Deployment*
+> *Cutting SAST Noise with Local Small Language Models: Prompting, Thinking, Distillation, and Deployment*
 
 <!-- Public artifact: [github.com/bayer-sourav/SAST](https://github.com/bayer-sourav/SAST) -->
 
