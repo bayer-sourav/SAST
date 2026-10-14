@@ -1,8 +1,8 @@
-# Cutting SAST Noise with Local Small Language Models
+# Reducing SAST False Positives with Local Language Models
 
 **Supplementary material** for the workshop paper:
 
-> *Cutting SAST Noise with Local Small Language Models: Prompting, Thinking, Distillation, and Deployment*
+> *Reducing SAST False Positives with Local Language Models: An Empirical Study*
 
 <!-- Public artifact: [github.com/bayer-sourav/SAST](https://github.com/bayer-sourav/SAST) -->
 
@@ -60,9 +60,9 @@ Numbers come from existing `runs/` JSON / HTML tables. Do not re-tune on the hol
 
 ```bibtex
 @inproceedings{verma2027sastslm,
-  title={Cutting SAST Noise with Small Language Models: Prompting, Thinking, Distillation, and Deployment},
-  author={Verma, Sourav and Mohammadi, Sadegh},
-  booktitle={ICSE Workshops},
+  title={Reducing SAST False Positives with Local Language Models: An Empirical Study},
+  author={Verma, Sourav and Arabshian, Knarig and Mohammadi, Sadegh},
+  booktitle={ICSE Workshops - LLM4Code},
   year={2027},
   note={Supplementary: https://github.com/bayer-sourav/SAST}
 }
